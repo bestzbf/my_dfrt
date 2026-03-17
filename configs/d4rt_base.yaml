@@ -1,0 +1,39 @@
+# D4RT Base Configuration
+# Default configuration for training D4RT with ViT-Base encoder
+
+# Model Configuration
+encoder: base
+decoder_depth: 6
+img_size: 256
+num_frames: 48
+patch_size: 9  # Local RGB patch size
+
+# Training Configuration
+batch_size: 1
+num_queries: 256
+steps: 500000
+lr: 1.0e-4
+min_lr: 1.0e-6
+warmup_steps: 2500
+weight_decay: 0.03
+grad_clip: 10.0
+amp: true
+
+# Loss Weights
+lambda_3d: 1.0
+lambda_2d: 0.1
+lambda_vis: 0.1
+lambda_disp: 0.1
+lambda_normal: 0.5
+lambda_conf: 0.2
+
+# Data Configuration
+dataset: video
+num_workers: 4
+
+# Checkpointing
+save_freq: 10000
+log_freq: 100
+
+# Random Seed
+seed: 42

@@ -9,9 +9,26 @@ fi
 STAGE="$1"
 shift || true
 
+resolve_python_bin() {
+  if [[ -n "${PYTHON_BIN:-}" ]]; then
+    printf '%s\n' "$PYTHON_BIN"
+    return 0
+  fi
+
+  local resolved_python
+  resolved_python="$(type -P python || true)"
+  if [[ -n "$resolved_python" ]]; then
+    printf '%s\n' "$resolved_python"
+    return 0
+  fi
+
+  printf 'python\n'
+  return 0
+}
+
 DATA_ROOT="${DATA_ROOT:-/16t/e/d4rt/PointOdyssey}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/pointodyssey_curriculum}"
-PYTHON_BIN="${PYTHON_BIN:-python}"
+PYTHON_BIN="$(resolve_python_bin)"
 BASE_CONFIG="${BASE_CONFIG:-configs/d4rt_pointodyssey_curriculum_base.yaml}"
 
 case "$STAGE" in
@@ -110,6 +127,8 @@ printf 'Running stage %s
 ' "$STAGE"
 printf 'Output dir: %s
 ' "$OUTPUT_DIR"
+printf 'Python bin: %s
+' "$PYTHON_BIN"
 printf 'Command: '
 printf '%q ' "${CMD[@]}"
 printf '

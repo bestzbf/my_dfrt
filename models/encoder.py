@@ -1,6 +1,7 @@
 """D4RT Encoder: Video encoder using timm ViT backbone with local/global attention."""
 
 import math
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -677,6 +678,19 @@ class D4RTEncoder(nn.Module):
         if not VIDEOMAE_AVAILABLE:
             print("transformers not available, skipping VideoMAE weight loading")
             return
+
+        looks_like_local_path = (
+            os.path.isabs(model_name)
+            or model_name.startswith(".")
+            or os.path.sep in model_name
+        )
+        if looks_like_local_path and not os.path.exists(model_name):
+            raise FileNotFoundError(
+                "VideoMAE checkpoint path does not exist: "
+                f"{model_name}. "
+                "Pass a valid local directory or a Hugging Face repo id such as "
+                "'MCG-NJU/videomae-base'."
+            )
 
         print(f"Loading VideoMAE weights for custom encoder init: {model_name}")
         backbone = VideoMAEModel.from_pretrained(model_name)

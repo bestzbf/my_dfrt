@@ -358,6 +358,7 @@ def main():
         img_size=ckpt_args.get("img_size", 256),
         num_queries=args.num_queries, # Sparse queries
         use_augs=False,
+        deterministic_sampling=True,
         verbose=True,
         sequence_name=resolved_sequence,
         strides=[1], # Force stride 1

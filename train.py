@@ -5,12 +5,14 @@ import argparse
 import json
 import math
 import os
+import random
 import subprocess
 import sys
 import time
 from contextlib import nullcontext
 from pathlib import Path
 
+import numpy as np
 import torch
 import torch.distributed as dist
 import yaml
@@ -481,7 +483,7 @@ def _sequence_for_split(args, split):
     return None
 
 
-def build_dataset(args, split, use_augs, verbose):
+def build_dataset(args, split, use_augs, verbose, deterministic_sampling):
     precompute_local_patches = (
         not args.disable_precompute_local_patches
         and args.patch_provider not in {"sampled_resized", "sampled_highres"}
@@ -494,6 +496,7 @@ def build_dataset(args, split, use_augs, verbose):
         num_queries=args.num_queries,
         patch_size=args.patch_size,
         use_augs=use_augs,
+        deterministic_sampling=deterministic_sampling,
         verbose=verbose,
         sequence_name=_sequence_for_split(args, split),
         query_mode=args.query_mode,
@@ -590,6 +593,7 @@ def create_dataloaders(args, rank, world_size):
         split=args.train_split,
         use_augs=not args.disable_train_augs,
         verbose=is_main,
+        deterministic_sampling=False,
     )
 
     if len(train_dataset) == 0:
@@ -628,6 +632,7 @@ def create_dataloaders(args, rank, world_size):
             split=args.val_split,
             use_augs=False,
             verbose=is_main,
+            deterministic_sampling=True,
         )
         if len(val_dataset) > 0:
             val_loader = DataLoader(
@@ -1163,6 +1168,8 @@ def main():
             print("AMP requested without CUDA. Disabling AMP.")
         args.amp = False
 
+    random.seed(args.seed + rank)
+    np.random.seed(args.seed + rank)
     torch.manual_seed(args.seed + rank)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(args.seed + rank)

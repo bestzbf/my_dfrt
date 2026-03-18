@@ -1,0 +1,508 @@
+下面我按“**数据从哪来 -> 怎么处理 -> target 怎么生成**”这条线，把整个 `PointOdysseyDataset` 讲完整。你可以对照这两个核心位置一起看：
+
+- 单样本主流程在 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L680)
+- `targets` 生成逻辑在 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L426)
+
+**先看原始输入数据是什么**
+每个序列目录里，代码假设至少有这些内容：
+
+- `anno.npz`
+- `rgbs/`
+- `depths/`
+- `normals/`
+
+`anno.npz` 里主要读取这些数组 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L693)：
+
+- `trajs_2d`: `(T, N, 2)`
+  含义是每一帧、每个点的 2D 轨迹位置。这里的 `T` 是总帧数，`N` 是轨迹点数。
+- `trajs_3d`: `(T, N, 3)`
+  含义是每一帧、每个点在**世界坐标系**下的 3D 位置。
+- `intrinsics`: `(T, 3, 3)`
+  每一帧相机内参。
+- `valids`: `(T, N)`
+  该点在该帧有没有定义。
+- `visibs`: `(T, N)`，如果没有就退化成 `valids`
+  该点在该帧是否可见。
+- `extrinsics`: `(T, 4, 4)`
+  代码把它当成 `world -> camera` 的变换矩阵来用。
+
+另外，图像文件是按帧去读的：
+
+- RGB 从 `rgbs/*.jpg` 或 `*.png` 读 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L723)
+- depth 从 `depths/*.png` 或 `*.npy` 读 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L727)
+- normal 从 `normals/*.jpg/*.png/*.npy` 读 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L731)
+
+**1. `__getitem__` 的第一步：先选一段 clip**
+入口在 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L680)。
+
+当你取 `dataset[index]` 时，代码不是把整个序列都送出去，而是：
+
+- 先定位到这个序列目录 `seq_path`
+- 从 `anno.npz` 里读完整标注
+- 再从完整序列中，采样出长度为 `S` 的一个 clip
+
+这里有两个随机量：
+
+- `stride`：帧间隔，由 `_sample_stride()` 采样 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L234)
+- `t_start`：起始帧 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L711)
+
+然后构造：
+
+```python
+frame_indices = [t_start + i * stride for i in range(self.S)]
+```
+
+所以后面整个样本只围绕这 `S` 帧展开。
+
+你可以把它理解成：
+
+- 原始序列是 `(T, ...)`
+- 当前样本只截出一个子序列 `(S, ...)`
+
+**2. 第二步：把这段 clip 对应的 RGB / depth / normal / 标注都读出来**
+先把选中的帧号映射到具体文件路径 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L741)，然后逐帧读入：
+
+- `rgb_frames`: 长度 `S` 的列表，每个元素是 `(H, W, 3)`，范围 `[0,1]` 的 float32 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L745)
+- `depth_frames`: 长度 `S` 的列表，每个元素是 `(H, W)` 的 float32 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L746)
+- `normal_frames`: 长度 `S` 的列表，每个元素是 `(H, W, 3)` 的 float32 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L747)
+
+同时从标注数组里切出同样这些帧：
+
+- `clip_trajs_2d = trajs_2d[frame_indices]` -> `(S, N, 2)` [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L757)
+- `clip_world_3d = trajs_3d[frame_indices]` -> `(S, N, 3)` [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L758)
+- `clip_intrinsics = intrinsics[frame_indices]` -> `(S, 3, 3)` [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L759)
+- `clip_valid = valids[frame_indices]` -> `(S, N)` [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L760)
+- `clip_vis = visibilities[frame_indices]` -> `(S, N)` [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L761)
+- `clip_extrinsics = extrinsics[frame_indices]` -> `(S, 4, 4)` [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L762)
+
+到这里为止，所有东西都还是“**原始分辨率**”上的。
+
+**3. 第三步：可选做静态场景退化**
+如果设置了 `static_scene_frame_idx`，代码会把整个 clip 退化成“同一帧重复 `S` 次”的静态场景版本 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L629)。
+
+具体做法是：
+
+- 选出一个 anchor 帧
+- RGB、depth、normal 都复制这同一帧
+- `clip_trajs_2d`、`clip_world_3d`、`clip_intrinsics`、`clip_valid`、`clip_vis`、`clip_extrinsics` 也都复制这同一帧
+
+这样整个 clip 时间上不再变化，方便做某些消融实验。
+
+**4. 第四步：对整段 clip 做 crop 和增强**
+先根据第一帧的大小决定一个 crop 窗口 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L790)：
+
+```python
+x0, y0, crop_w, crop_h = self._sample_crop(original_h, original_w, py_rng)
+```
+
+然后对所有帧的 RGB / depth / normal 都做同样的 crop [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L793)：
+
+- `rgb_frames[i] = frame[y0:y0+crop_h, x0:x0+crop_w]`
+- `depth_frames[i] = ...`
+- `normal_frames[i] = ...`
+
+接着 RGB 可能做颜色增强 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L796)，包括：
+
+- 亮度
+- 对比度
+- 饱和度
+- hue
+- 灰度化
+- 模糊
+
+重要的是：**2D 轨迹点也要跟着 crop 变坐标**。所以这里会做：
+
+```python
+clip_trajs_2d = crop_points_2d(clip_trajs_2d, x0=x0, y0=y0)
+```
+
+见 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L798)
+
+也就是说，原来点坐标是在原图里，现在变成“在 crop 图里的像素坐标”。
+
+然后代码会重新判断这些点是否还在 crop 内 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L799)，并把 `clip_vis` 乘上这个 in-bounds mask：
+
+```python
+clip_vis = clip_vis * in_bounds.astype(np.float32)
+```
+
+这一步非常关键，含义是：
+
+- 原来点虽然在原图里可见
+- 但 crop 以后可能被裁掉了
+- 被裁掉的点，后面就不能再当作当前 crop 内的可见点来监督
+
+**5. 第五步：更新相机内参**
+因为图像被 crop 了，主点位置会变；因为后面还要 resize 到正方形，焦距和主点还要再缩放。
+
+所以代码构造了三套内参 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L806)：
+
+- `intrinsics_original`
+  选出来这段 clip 的原始内参
+- `intrinsics_crop`
+  只做 crop 后的内参
+- `intrinsics`
+  crop 后再 resize 到 `img_size x img_size` 的内参
+
+这三套内参都放进 sample 里，便于后续使用。
+
+**6. 第六步：把视频 resize 成网络输入**
+网络的主输入 `video` 是固定分辨率正方形张量 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L823)：
+
+- `resized_video`: `(S, 3, img_size, img_size)`
+- `resized_depths`: `(S, 1, img_size, img_size)`
+- `resized_normals`: `(S, 3, img_size, img_size)`
+
+其中：
+
+- RGB 用双线性插值
+- depth 用最近邻
+- normal 用双线性
+
+见 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L827)
+
+这时有一个很重要的区分：
+
+- `clip_trajs_2d` 还在 **crop 后、resize 前** 的像素坐标系里
+- `video` 已经变成固定大小 `img_size x img_size`
+
+所以后面 query 坐标不直接存像素，而是要转换成**crop-normalized** 坐标，也就是 `[0,1]` 范围的归一化坐标。
+
+**7. 第七步：开始采样 query，生成 target**
+这一部分在 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L426)，是整个数据集最核心的逻辑。
+
+你可以把每个 query 理解为一句话：
+
+“我从 `t_src` 这一帧上的某个 2D 点出发，想让模型预测它在 `t_tgt` 上的 2D / 3D / 可见性 / 法向等信息，并且 3D 量统一在 `t_cam` 的相机坐标系下定义。”
+
+先说 `_sample_query_data()` 的输入：
+
+- `clip_trajs_2d`: `(S, N, 2)`，crop 后、resize 前的 2D 像素坐标
+- `clip_world_3d`: `(S, N, 3)`，世界坐标系下的 3D 点
+- `clip_valid`: `(S, N)`
+- `clip_vis`: `(S, N)`
+- `clip_extrinsics`: `(S, 4, 4)`
+- `normal_frames`: crop 后、resize 前的 normal 图
+- `depth_frames`: crop 后、resize 前的 depth 图
+
+**8. 第八步：先找出哪些 source 点可以拿来采样**
+在真正采 query 前，代码先对每一帧做合法性筛选 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L536)。
+
+一个点想成为某帧上的合法 source 点，要同时满足：
+
+- `clip_valid[frame_idx, point_idx] > 0.5`
+  这个点在这一帧有定义
+- `clip_vis[frame_idx, point_idx] > 0.5`
+  这个点在这一帧可见
+- 点在 crop 图范围内
+- 它对应的 `clip_world_3d` 是有限数
+
+所以：
+
+```python
+valid_src = np.where(src_defined & src_visible & src_in_bounds & src_world_finite)[0]
+```
+
+这个 `valid_src` 的意思就是：
+
+“在第 `frame_idx` 帧里，哪些轨迹点可以被选成 query 的起点”。
+
+同时代码还会构造边界点集合 `boundary_sources_by_frame`，后面用来做边界过采样 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L560)。
+
+**9. 第九步：边界是怎么来的**
+每一帧会生成三种 mask [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L514)：
+
+- `depth_boundary_masks`
+  从 depth 图做 Sobel 梯度，取高梯度区域
+- `motion_boundary_masks`
+  从轨迹点的运动幅值图做梯度，取高梯度区域
+- `boundary_masks`
+  上面两个的并集
+
+所以 `source_is_boundary` 不是凭空来的，而是：
+
+- 先用 depth / motion 建出边界区域
+- 再看 source 点有没有落到这些区域里
+
+**10. 第十步：每个 query 是怎么采出来的**
+对于每个 `query_idx`，代码会做这些事 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L581)：
+
+1. 先随机选一个 `source_frame`
+   但只能从“有合法 source 点”的帧里选。
+
+2. 再根据 `query_mode` 确定 `target_frame` 和 `camera_frame`
+
+- `same_frame`
+  `source = target = camera`
+- `target_cam`
+  `camera = target`
+- `full`
+  按 `t_tgt_eq_t_cam_ratio` 决定多大概率让 `target == camera`
+
+3. 从当前 `source_frame` 中选一个轨迹点 `point_idx`
+
+- 以 `boundary_ratio` 的概率，从边界点里选
+- 否则从全部合法 source 点里随机选
+
+这一点特别重要：
+
+`point_idx` 不是像素位置，而是**轨迹点编号**。
+
+也就是说，后面这个 query 的所有 supervision 都围绕“同一个物理点/轨迹点”展开，只不过在不同帧上取它的观测。
+
+**11. 第十一步：source / target 的 2D 信息怎么来**
+一旦选定 `source_frame`、`target_frame` 和 `point_idx`，就能直接取出：
+
+```python
+src_xy = clip_trajs_2d[source_frame, point_idx]
+tgt_xy = clip_trajs_2d[target_frame, point_idx]
+```
+
+见 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L619)
+
+然后：
+
+- `coords_uv` 用的是 `src_xy`
+  它是模型输入 query 的 2D 坐标
+- `targets["pos_2d"]` 用的是 `tgt_xy`
+  它是模型要预测的目标 2D 位置
+
+但这两个值最后都不是保留像素坐标，而是做成 crop-normalized：
+
+```python
+x / (crop_w - 1), y / (crop_h - 1)
+```
+
+见 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L653) 和 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L660)
+
+所以你要记住：
+
+- `coords` 是 source 位置
+- `targets["pos_2d"]` 是 target 位置
+- 它们都在同一个归一化 crop 坐标系里
+
+**12. 第十二步：`visibility` 是怎么来的**
+代码先算三个概念 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L629)：
+
+- `target_defined`
+  目标帧这个点在标注里有没有定义
+- `tgt_in_bounds`
+  目标点有没有落在当前 crop 内
+- `clip_vis[target_frame, point_idx] > 0.5`
+  目标帧这个点是否可见
+
+然后合成：
+
+```python
+vis_flag = target_defined and visible and in_bounds
+```
+
+最后：
+
+```python
+targets["visibility"][query_idx] = float(vis_flag)
+```
+
+见 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L668)
+
+所以这里的 `visibility` 不是只表示“有没有标注”，而是更严格的：
+
+“目标点在 target 帧上，既有定义、又可见、又在当前 crop 内”。
+
+**13. 第十三步：`pos_3d` 和 `displacement` 是怎么来的**
+这是最关键的一部分。
+
+先取世界坐标下的 source / target 3D 点 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L641)：
+
+```python
+src_world = clip_world_3d[source_frame, point_idx]
+tgt_world = clip_world_3d[target_frame, point_idx]
+```
+
+然后用 `camera_frame` 对应的外参，把它们都变到**同一个相机坐标系**里 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L644)：
+
+```python
+src_cam_h = clip_extrinsics[camera_frame] @ [src_world, 1]
+tgt_cam_h = clip_extrinsics[camera_frame] @ [tgt_world, 1]
+```
+
+取前三维得到：
+
+- `src_cam`
+- `tgt_cam`
+
+然后：
+
+- `targets["pos_3d"] = tgt_cam`
+- `targets["displacement"] = tgt_cam - src_cam`
+
+见 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L665) 和 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L671)
+
+这两个量的物理含义是：
+
+- `pos_3d`
+  目标时刻这个点，在 `t_cam` 相机坐标系下的 3D 位置
+- `displacement`
+  同一个 `t_cam` 相机坐标系下，目标点相对 source 点的 3D 位移
+
+为什么不直接用世界坐标？
+
+因为这样做有两个好处：
+
+- 所有 3D supervision 都统一在某个相机系里，更贴近视觉任务
+- 即使 `source_frame` 和 `target_frame` 不同，也能在一个统一坐标系下比较
+
+**14. 第十四步：`normal` 是怎么来的**
+法向来自 `target_frame` 的 normal 图 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L675)。
+
+条件是：
+
+- 目标点 `vis_flag == True`
+- 对应帧的 normal 图有效 `normal_valid_frames[target_frame] == True`
+
+满足时，取 target 点位置附近的 normal 值：
+
+```python
+target_normal[query_idx] = normal_frames[target_frame][y, x]
+```
+
+这里最初取的是 **crop 后、resize 前** 的 normal 图。
+
+但后面回到 `__getitem__` 后，还有一步重写 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L851)：
+
+- 对 `mask_normal=True` 的 query
+- 按归一化 `pos_2d`
+- 再从 `resized_normals` 里采一次
+
+所以最终 batch 里的 `targets["normal"]`，更接近于：
+
+“和网络输入分辨率对齐后的 normal 真值”。
+
+**15. 第十五步：这些 mask 分别代表什么**
+这是你后面训练时最要紧的一组。
+
+`mask_2d` [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L695)
+
+- 只有 `vis_flag=True` 才有效
+- 意味着：2D 点必须可见且在 crop 内，才能监督 2D 位置
+
+`mask_vis` [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L696)
+
+- 只要求 `target_defined=True`
+- 也就是说，只要目标帧这个点在标注里存在，就可以监督 visibility
+- 这样模型既能学正样本，也能学负样本
+
+`mask_3d` [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L692)
+
+- 要求 `target_defined=True`
+- 且 `src_cam` / `tgt_cam` 数值有限
+- 不要求点可见
+
+这点非常重要。也就是说：
+
+- 一个点即使在图像里不可见
+- 只要数据集仍然有它的 3D 轨迹
+- 就依然可以拿来做 3D supervision
+
+`mask_disp`
+
+- 和 `mask_3d` 一样
+- 因为 displacement 也是基于这两个 3D 点算出来的
+
+`mask_normal`
+
+- 当前代码是 `vis_flag and target_normal finite`
+- 但因为 `target_normal` 默认初始化为 0，逻辑上会有一点偏宽松
+- 我之前已经提醒过，这里是当前实现里一个值得留意的点
+
+**16. 第十六步：`source_is_boundary` 这些字段是干什么的**
+这些字段不是主监督，而是辅助信息 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L711)：
+
+- `source_is_boundary`
+  source 点是否在任意边界上
+- `source_is_depth_boundary`
+  是否在深度边界上
+- `source_is_motion_boundary`
+  是否在运动边界上
+- `point_indices`
+  这个 query 对应原始轨迹的点编号
+
+它们通常用于：
+
+- 数据分布分析
+- 可视化
+- debug
+- 按边界/非边界分组统计 loss
+
+**17. 第十七步：最后 sample 里有哪些东西**
+最终 `__getitem__` 返回 [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L879)：
+
+- `video`
+- `coords`
+- `t_src`
+- `t_tgt`
+- `t_cam`
+- `frame_indices`
+- `intrinsics_original`
+- `intrinsics_crop`
+- `intrinsics`
+- `extrinsics`
+- `depths`
+- `normals`
+- `transform_metadata`
+- `aspect_ratio`
+- `targets`
+- 可选 `local_patches`
+- 可选 `video_query`
+
+其中和 target 最相关的是：
+
+- `coords`: source 2D query 输入
+- `t_src`: query 来自哪帧
+- `t_tgt`: 目标监督对应哪帧
+- `t_cam`: 3D 坐标系对应哪帧相机
+- `targets`: 各类监督标签和 mask
+
+**18. 第十八步：batch 之后 target 会变成什么**
+经过 `collate_fn` 后，单样本的 `targets` 会堆成 batch [dataset.py](/mnt/zbf/my_dfrt/data/dataset.py#L73)。
+
+如果 batch size 是 `B`，query 数是 `Q`，那：
+
+- `pos_2d`: `[B, Q, 2]`
+- `pos_3d`: `[B, Q, 3]`
+- `visibility`: `[B, Q]`
+- `displacement`: `[B, Q, 3]`
+- `normal`: `[B, Q, 3]`
+
+mask 也是：
+
+- `mask_2d`: `[B, Q]`
+- `mask_vis`: `[B, Q]`
+- `mask_3d`: `[B, Q]`
+- `mask_disp`: `[B, Q]`
+- `mask_normal`: `[B, Q]`
+
+训练时会在 [train.py](/mnt/zbf/my_dfrt/train.py#L686) 把这些搬到 GPU，然后 loss 用这些 mask 来决定哪些 query 参与哪种监督。
+
+**一句话总结整条链路**
+这套数据流的核心思想是：
+
+- 先从长序列里采一段 clip
+- 对 clip 做 crop / resize / augmentation
+- 在 clip 里挑一个 source 点作为 query
+- 再为这个 query 构造：
+  - source 2D 输入 `coords`
+  - target 2D 真值 `pos_2d`
+  - target 可见性 `visibility`
+  - target 3D 真值 `pos_3d`
+  - source 到 target 的 3D 位移 `displacement`
+  - target 法向 `normal`
+  - 各类有效性 mask
+
+如果你愿意，我下一条可以继续给你画一个“**单个 query 的生命周期图**”，我会用具体变量名把这条链路写成下面这种形式：
+
+`point_idx -> src_xy -> coords`
+`point_idx -> tgt_xy -> pos_2d`
+`src_world/tgt_world -> extrinsics[t_cam] -> src_cam/tgt_cam -> pos_3d/displacement`
+
+这样你会更容易把变量之间的关系彻底看顺。

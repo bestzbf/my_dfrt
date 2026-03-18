@@ -3,6 +3,90 @@
 import torch
 import torch.nn.functional as F
 
+
+def _build_patch_sampling_grid(
+    frames_btchw: torch.Tensor,
+    coords: torch.Tensor,
+    patch_size: int,
+) -> torch.Tensor:
+    """Build the normalized sampling grid used by ``grid_sample``.
+
+    This keeps the exact coordinate math of the original implementation so the
+    extracted patch values do not change when we swap in a more memory-efficient
+    batching strategy.
+    """
+    _, _, _, height, width = frames_btchw.shape
+
+    half = patch_size // 2
+    offsets_1d = torch.arange(-half, half + 1, device=frames_btchw.device, dtype=coords.dtype)
+    offsets = torch.stack(torch.meshgrid(offsets_1d, offsets_1d, indexing="xy"), dim=-1)
+
+    coords_pixel = coords.to(dtype=frames_btchw.dtype).clone()
+    coords_pixel[..., 0] = coords_pixel[..., 0] * (width - 1)
+    coords_pixel[..., 1] = coords_pixel[..., 1] * (height - 1)
+
+    grid = coords_pixel.view(coords.shape[0], coords.shape[1], 1, 1, 2) + offsets.view(1, 1, patch_size, patch_size, 2)
+    grid[..., 0] = 2.0 * grid[..., 0] / max(width - 1, 1) - 1.0
+    grid[..., 1] = 2.0 * grid[..., 1] / max(height - 1, 1) - 1.0
+    return grid
+
+
+def _extract_local_patches_grouped_by_source_frame(
+    frames_btchw: torch.Tensor,
+    grid: torch.Tensor,
+    t_src: torch.Tensor,
+    patch_size: int,
+) -> torch.Tensor:
+    """Extract patches while grouping queries that share the same source frame.
+
+    The previous implementation first materialized ``(B * N, C, H, W)`` by
+    copying one full-resolution frame per query before sampling a tiny
+    ``patch_size x patch_size`` neighborhood. Grouping queries by ``t_src`` keeps
+    the exact same sampling math but avoids that large per-query frame tensor.
+    """
+    batch_size, num_frames, _, _, _ = frames_btchw.shape
+    _, num_queries = t_src.shape
+
+    patches_by_batch = []
+    for batch_idx in range(batch_size):
+        if num_queries == 0:
+            empty = frames_btchw.new_empty((0, frames_btchw.shape[2], patch_size, patch_size))
+            patches_by_batch.append(empty)
+            continue
+
+        frame_indices = t_src[batch_idx].clamp(0, num_frames - 1)
+        batch_frames = frames_btchw[batch_idx]
+        batch_grid = grid[batch_idx]
+
+        unique_frames, inverse = torch.unique(frame_indices, sorted=True, return_inverse=True)
+        sampled_chunks = []
+        sampled_indices = []
+
+        for group_idx in range(unique_frames.numel()):
+            query_indices = torch.nonzero(inverse == group_idx, as_tuple=False).flatten()
+            source_frame = batch_frames.index_select(0, unique_frames[group_idx:group_idx + 1])
+            source_grid = batch_grid.index_select(0, query_indices)
+
+            # Reuse the same source frame for every query in this group rather than
+            # materializing one full-resolution frame per query.
+            sampled = F.grid_sample(
+                source_frame.expand(source_grid.shape[0], -1, -1, -1),
+                source_grid,
+                mode="bilinear",
+                padding_mode="border",
+                align_corners=True,
+            )
+            sampled_chunks.append(sampled)
+            sampled_indices.append(query_indices)
+
+        sampled_indices = torch.cat(sampled_indices, dim=0)
+        sampled_patches = torch.cat(sampled_chunks, dim=0)
+        restore_order = torch.argsort(sampled_indices)
+        patches_by_batch.append(sampled_patches.index_select(0, restore_order))
+
+    return torch.stack(patches_by_batch, dim=0)
+
+
 def extract_local_patches(
     frames_btchw: torch.Tensor,
     coords: torch.Tensor,
@@ -27,7 +111,7 @@ def extract_local_patches(
     if t_src.dim() != 2:
         raise ValueError(f"Expected t_src to have shape (B, N), got {tuple(t_src.shape)}")
 
-    batch_size, num_frames, channels, height, width = frames_btchw.shape
+    batch_size, num_frames = frames_btchw.shape[:2]
     _, num_queries, _ = coords.shape
     if t_src.shape != (batch_size, num_queries):
         raise ValueError(
@@ -35,33 +119,13 @@ def extract_local_patches(
             f"got coords={tuple(coords.shape)} and t_src={tuple(t_src.shape)}"
         )
 
-    query_frames = []
-    for batch_idx in range(batch_size):
-        frame_indices = t_src[batch_idx].clamp(0, num_frames - 1)
-        query_frames.append(frames_btchw[batch_idx, frame_indices])
-    query_frames = torch.stack(query_frames, dim=0).reshape(batch_size * num_queries, channels, height, width)
-
-    half = patch_size // 2
-    offsets_1d = torch.arange(-half, half + 1, device=frames_btchw.device, dtype=coords.dtype)
-    offsets = torch.stack(torch.meshgrid(offsets_1d, offsets_1d, indexing="xy"), dim=-1)
-
-    coords_pixel = coords.to(dtype=frames_btchw.dtype).clone()
-    coords_pixel[..., 0] = coords_pixel[..., 0] * (width - 1)
-    coords_pixel[..., 1] = coords_pixel[..., 1] * (height - 1)
-
-    grid = coords_pixel.view(batch_size, num_queries, 1, 1, 2) + offsets.view(1, 1, patch_size, patch_size, 2)
-    grid[..., 0] = 2.0 * grid[..., 0] / max(width - 1, 1) - 1.0
-    grid[..., 1] = 2.0 * grid[..., 1] / max(height - 1, 1) - 1.0
-    grid = grid.reshape(batch_size * num_queries, patch_size, patch_size, 2)
-
-    patches = F.grid_sample(
-        query_frames,
-        grid,
-        mode="bilinear",
-        padding_mode="border",
-        align_corners=True,
+    grid = _build_patch_sampling_grid(frames_btchw, coords, patch_size=patch_size)
+    return _extract_local_patches_grouped_by_source_frame(
+        frames_btchw=frames_btchw,
+        grid=grid,
+        t_src=t_src,
+        patch_size=patch_size,
     )
-    return patches.reshape(batch_size, num_queries, channels, patch_size, patch_size)
 
 
 def extract_local_patches_with_valid_hw(

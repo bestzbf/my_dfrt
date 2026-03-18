@@ -113,6 +113,7 @@ class PointOdysseyDataset(Dataset):
         dataset_location="/home/zbf/Desktop/d4rt/d4rt-pytorch/data/pointodyssey",
         dset="train",
         use_augs=False,
+        deterministic_sampling=False,
         S=48,
         N=32,
         strides=None,
@@ -135,6 +136,9 @@ class PointOdysseyDataset(Dataset):
         self.dataset_location = dataset_location
         self.dset = dset
         self.use_augs = use_augs
+        # Keep deterministic sample replay as an explicit opt-in. Disabling train-time
+        # augmentations for overfit/debug runs should not freeze clip/query resampling.
+        self.deterministic_sampling = deterministic_sampling
         self.S = S
         self.N = N
         self.strides = None if strides is None else list(strides)
@@ -193,9 +197,9 @@ class PointOdysseyDataset(Dataset):
         return len(self.dirs)
 
     def _get_rngs(self, index):
-        if self.use_augs:
-            return random, np.random
-        return random.Random(index), np.random.default_rng(index)
+        if self.deterministic_sampling:
+            return random.Random(index), np.random.default_rng(index)
+        return random, np.random
 
     def _load_rgb(self, path):
         image = cv2.imread(path, cv2.IMREAD_COLOR)
@@ -438,26 +442,83 @@ class PointOdysseyDataset(Dataset):
         py_rng,
         np_rng,
     ):
+        """
+        为当前 clip 采样 query，并构造监督信号。
+
+        这里返回的 supervision 会在 collate 后变成 batch["targets"]，供 loss 直接使用。
+
+        坐标系约定:
+        1. clip_trajs_2d:
+           形状 (S, N, 2)，表示 crop 之后、resize 之前的 2D 像素坐标。
+           也就是说，x/y 仍然是 crop 图像上的像素位置，而不是 [0, 1] 归一化坐标。
+        2. coords_uv / targets["pos_2d"]:
+           都会被归一化到当前 crop 空间，即除以 (crop_w - 1, crop_h - 1) 后得到 [0, 1]
+           附近的值。注意如果目标点跑出 crop，pos_2d 仍然可能落在 [0, 1] 之外，但会由
+           mask_2d 控制不参与 2D loss。
+        3. clip_world_3d:
+           形状 (S, N, 3)，是数据集原始提供的世界坐标系 3D 点。
+        4. targets["pos_3d"] / targets["displacement"]:
+           不是 world 坐标，而是先把 world 点通过 t_cam 指定的相机外参变换到相机坐标系
+           后得到的监督。这样网络学的是“在某个 camera frame 下”的几何量。
+
+        时间索引约定:
+        1. t_src: query 来源帧。coords 表示这个 source frame 上的 2D 查询位置。
+        2. t_tgt: 监督目标帧。pos_2d / visibility / normal 等主要对应这个帧。
+        3. t_cam: 3D 监督所在的相机坐标系。pos_3d / displacement 都定义在这个相机系下。
+        """
         num_frames, num_points, _ = clip_trajs_2d.shape
+
+        # query 输入本身:
+        # coords_uv: 每个 query 在 source frame 上的 2D 位置，归一化到 crop 空间 [0, 1]
+        # t_src: 这个 query 从哪一帧发起
+        # t_tgt: 要预测哪一帧上的结果
+        # t_cam: 3D supervision 使用哪一帧的相机坐标系
         coords_uv = torch.zeros((self.num_queries, 2), dtype=torch.float32)
         t_src = torch.zeros((self.num_queries,), dtype=torch.long)
         t_tgt = torch.zeros((self.num_queries,), dtype=torch.long)
         t_cam = torch.zeros((self.num_queries,), dtype=torch.long)
+
+        # 监督信号:
+        # target_pos_2d: t_tgt 帧上的 2D 目标位置，归一化到 crop 空间
+        # target_pos_3d: t_tgt 时刻该点在 t_cam 相机坐标系下的 3D 位置
+        # target_vis: t_tgt 上该点是否“可见且在 crop 内”，用于 visibility 二分类监督
+        # target_disp: 在同一个 t_cam 相机系下，目标点相对 source 点的 3D 位移
+        # target_normal: t_tgt 帧该点的表面法向，来自 normal 图
         target_pos_2d = torch.zeros((self.num_queries, 2), dtype=torch.float32)
         target_pos_3d = torch.zeros((self.num_queries, 3), dtype=torch.float32)
         target_vis = torch.zeros((self.num_queries,), dtype=torch.float32)
         target_disp = torch.zeros((self.num_queries, 3), dtype=torch.float32)
         target_normal = torch.zeros((self.num_queries, 3), dtype=torch.float32)
+
+        # 各种 supervision mask:
+        # mask_3d: 该 query 是否拥有有效的 3D 位置监督
+        # mask_2d: 该 query 是否拥有有效的 2D 位置监督
+        # mask_disp: 该 query 是否拥有有效的 3D displacement 监督
+        # mask_normal: 该 query 是否拥有有效的 normal 监督
+        # mask_vis: 该 query 是否拥有有效的 visibility 监督
+        #
+        # 这些 mask 的作用是: target 张量即使始终有固定 shape，loss 也只会对“真的有效”
+        # 的那部分 query 计算，避免因为点越界、不可见、法向缺失等情况把错误标签喂给模型。
         mask_3d = torch.zeros((self.num_queries,), dtype=torch.bool)
         mask_2d = torch.zeros((self.num_queries,), dtype=torch.bool)
         mask_disp = torch.zeros((self.num_queries,), dtype=torch.bool)
         mask_normal = torch.zeros((self.num_queries,), dtype=torch.bool)
         mask_vis = torch.zeros((self.num_queries,), dtype=torch.bool)
+
+        # 下面这些不是直接训练主目标，而是“采样诊断信息 / 统计信息”:
+        # source_is_boundary: source 点是否落在“任意边界”(深度边界或运动边界)上
+        # source_is_depth_boundary: source 点是否落在深度边界上
+        # source_is_motion_boundary: source 点是否落在运动边界上
+        # point_indices: 这个 query 对应原始轨迹中的第几个点，便于可视化和调试
         source_is_boundary = torch.zeros((self.num_queries,), dtype=torch.bool)
         source_is_depth_boundary = torch.zeros((self.num_queries,), dtype=torch.bool)
         source_is_motion_boundary = torch.zeros((self.num_queries,), dtype=torch.bool)
         point_indices = torch.zeros((self.num_queries,), dtype=torch.long)
 
+        # 为每一帧构造边界 mask，用于“边界点过采样”。
+        # depth_boundary_masks 从 depth 梯度得到；
+        # motion_boundary_masks 从轨迹运动幅值变化得到；
+        # boundary_masks 取两者并集。
         depth_boundary_masks = [self._compute_boundary_mask(depth) for depth in depth_frames]
         if self.use_motion_boundaries:
             motion_boundary_masks = [
@@ -478,6 +539,12 @@ class PointOdysseyDataset(Dataset):
 
         for frame_idx in range(num_frames):
             src_points = clip_trajs_2d[frame_idx]
+
+            # source 点合法性的定义:
+            # 1. 数据集标注里这个点在该帧有定义
+            # 2. 该点在该帧可见
+            # 3. 该点落在当前 crop 内
+            # 4. 对应的 3D world 坐标是有限值
             src_defined = clip_valid[frame_idx] > 0.5
             src_visible = clip_vis[frame_idx] > 0.5
             src_in_bounds = (
@@ -494,6 +561,8 @@ class PointOdysseyDataset(Dataset):
                 boundary_sources_by_frame.append(np.empty((0,), dtype=np.int64))
                 continue
 
+            # 只在“已经合法”的 source 点里，再筛一遍哪些落在边界区域。
+            # 这样后面做 boundary oversampling 时，不会采到非法点。
             src_xy = np.round(src_points[valid_src]).astype(np.int32)
             src_xy[:, 0] = np.clip(src_xy[:, 0], 0, crop_w - 1)
             src_xy[:, 1] = np.clip(src_xy[:, 1], 0, crop_h - 1)
@@ -514,12 +583,16 @@ class PointOdysseyDataset(Dataset):
         # Given the current structure, we implement the Temporal Sampling Mix (Group A/B) per query.
 
         for query_idx in range(self.num_queries):
+            # 先随机选一个“存在合法 source 点”的 source frame。
             source_frame = py_rng.choice(valid_source_frames)
-            
+
             if self.query_mode == "same_frame":
+                # source / target / camera 全都取同一帧。
+                # 常用于只关心单帧几何、去掉时序变化的实验。
                 target_frame = source_frame
                 camera_frame = source_frame
             elif self.query_mode == "target_cam":
+                # 允许 source 和 target 不同，但 3D 监督总是在 target 对应的相机系下定义。
                 target_frame = py_rng.randint(0, num_frames - 1)
                 camera_frame = target_frame
             else:
@@ -539,6 +612,9 @@ class PointOdysseyDataset(Dataset):
 
             # D4RT Paper: Spatial Sampling - Boundary Oversampling (30%)
             # 30% queries from boundaries (depth or motion), 70% random
+            #
+            # 这里采到的是“轨迹点索引 point_idx”，不是一个像素位置。
+            # 后面 source/target 的 2D/3D 信息，都是围绕这个同一个轨迹点展开。
             if len(boundary_candidates) > 0 and py_rng.random() < self.boundary_ratio:
                 point_idx = int(np_rng.choice(boundary_candidates))
             else:
@@ -546,11 +622,17 @@ class PointOdysseyDataset(Dataset):
 
             src_xy = clip_trajs_2d[source_frame, point_idx]
             tgt_xy = clip_trajs_2d[target_frame, point_idx]
+
+            # source 点在 source_frame 上是否位于边界区域，仅用于统计/可视化/分析。
             src_px = int(np.clip(np.round(src_xy[0]), 0, crop_w - 1))
             src_py = int(np.clip(np.round(src_xy[1]), 0, crop_h - 1))
             source_is_boundary[query_idx] = bool(boundary_masks[source_frame][src_py, src_px])
             source_is_depth_boundary[query_idx] = bool(depth_boundary_masks[source_frame][src_py, src_px])
             source_is_motion_boundary[query_idx] = bool(motion_boundary_masks[source_frame][src_py, src_px])
+
+            # target_defined: 数据集标注里，目标帧这个点是否存在
+            # tgt_in_bounds: 目标点是否还落在 crop 范围内
+            # vis_flag: 最终“2D 可监督”的定义，要求既有定义、又可见、又在 crop 内
             target_defined = bool(clip_valid[target_frame, point_idx] > 0.5)
             tgt_in_bounds = (
                 tgt_xy[0] >= 0.0
@@ -563,29 +645,54 @@ class PointOdysseyDataset(Dataset):
             src_world = clip_world_3d[source_frame, point_idx]
             tgt_world = clip_world_3d[target_frame, point_idx]
 
+            # 把 source / target 的 world 坐标都变换到同一个 camera_frame 相机坐标系下。
+            # 这样定义有两个好处:
+            # 1. pos_3d 和 displacement 都在统一坐标系里，监督更一致；
+            # 2. 即使 source 和 target 来自不同时间，也能在同一个 camera 系里比较。
             src_cam_h = clip_extrinsics[camera_frame] @ np.concatenate([src_world, [1.0]], axis=0)
             tgt_cam_h = clip_extrinsics[camera_frame] @ np.concatenate([tgt_world, [1.0]], axis=0)
             src_cam = src_cam_h[:3].astype(np.float32)
             tgt_cam = tgt_cam_h[:3].astype(np.float32)
 
+            # coords_uv 是模型输入 query 的 2D 位置，定义在 source_frame 上。
             coords_uv[query_idx, 0] = float(src_xy[0] / max(crop_w - 1, 1))
             coords_uv[query_idx, 1] = float(src_xy[1] / max(crop_h - 1, 1))
             t_src[query_idx] = source_frame
             t_tgt[query_idx] = target_frame
             t_cam[query_idx] = camera_frame
 
+            # target_pos_2d 是监督目标在 target_frame 上的位置。
+            # 即使目标点出界，这里仍会写入一个数值；是否参与 2D loss 由 mask_2d 决定。
             target_pos_2d[query_idx, 0] = float(tgt_xy[0] / max(crop_w - 1, 1))
             target_pos_2d[query_idx, 1] = float(tgt_xy[1] / max(crop_h - 1, 1))
+
+            # target_pos_3d: 目标点在 t_cam 相机系下的 3D 位置。
             target_pos_3d[query_idx] = torch.from_numpy(tgt_cam)
+
+            # visibility 是 0/1 浮点标签，监督网络预测“目标点是否可见”。
             target_vis[query_idx] = float(vis_flag)
+
+            # displacement 也在 t_cam 相机系下定义，表示 target 相对 source 的 3D 位移。
             target_disp[query_idx] = torch.from_numpy(tgt_cam - src_cam)
             point_indices[query_idx] = point_idx
 
+            # normal 监督来自 target_frame 的 normal 图。
+            # 只有 target 可见，并且该帧 normal 图真的存在时，才写入法向值。
             if vis_flag and normal_valid_frames[target_frame]:
                 x = int(np.clip(round(float(tgt_xy[0])), 0, crop_w - 1))
                 y = int(np.clip(round(float(tgt_xy[1])), 0, crop_h - 1))
                 target_normal[query_idx] = torch.from_numpy(normal_frames[target_frame][y, x].astype(np.float32))
 
+            # 各个 mask 的含义:
+            #
+            # has_valid_3d:
+            #   target 这个点在标注里存在，且 source/target 变换到相机系后的数值有限。
+            #   用于 3D position loss 和 displacement loss。
+            #
+            # has_valid_normal:
+            #   当前实现里用“法向数值有限”来判断 normal 是否可用。
+            #   注意: target_normal 默认初始化为 0，因此如果某帧 normal 缺失，这里的判断会
+            #   把 0 当成一个有限值。这个逻辑目前偏宽松，阅读时要留意这一点。
             has_valid_3d = bool(target_defined and np.isfinite(src_cam).all() and np.isfinite(tgt_cam).all())
             has_valid_normal = bool(vis_flag and torch.isfinite(target_normal[query_idx]).all().item())
             mask_3d[query_idx] = has_valid_3d
@@ -594,20 +701,47 @@ class PointOdysseyDataset(Dataset):
             mask_disp[query_idx] = has_valid_3d
             mask_normal[query_idx] = has_valid_normal
 
+        # 返回给训练代码的 targets 字典。
+        #
+        # batch 维拼起来以后，各字段的典型 shape 会变成:
+        # pos_2d                -> float32 [B, Q, 2]
+        # pos_3d                -> float32 [B, Q, 3]
+        # visibility            -> float32 [B, Q]
+        # displacement          -> float32 [B, Q, 3]
+        # normal                -> float32 [B, Q, 3]
+        # mask_*                -> bool    [B, Q]
+        # source_is_*           -> bool    [B, Q]
+        # point_indices         -> int64   [B, Q]
         targets = {
+            # t_tgt 帧上的 2D 真值位置，归一化到 crop 空间。
             "pos_2d": target_pos_2d,
+            # t_tgt 时刻该点在 t_cam 相机坐标系下的 3D 位置真值。
             "pos_3d": target_pos_3d,
+            # 目标点是否“可见且在 crop 内”的 0/1 标签。
             "visibility": target_vis,
+            # 在 t_cam 相机系下，target 相对 source 的 3D 位移。
             "displacement": target_disp,
+            # target 帧上该点的表面法向量，来自 normal 图。
             "normal": target_normal,
+
+            # 3D 位置监督是否有效。
             "mask_3d": mask_3d,
+            # 2D 位置监督是否有效。只有可见且在 crop 内才为 True。
             "mask_2d": mask_2d,
+            # visibility 监督是否有效。只要求该点在 target 帧有定义。
             "mask_vis": mask_vis,
+            # displacement 监督是否有效。和 mask_3d 一致。
             "mask_disp": mask_disp,
+            # normal 监督是否有效。
             "mask_normal": mask_normal,
+
+            # source 点是否位于任意边界区域。
             "source_is_boundary": source_is_boundary,
+            # source 点是否位于深度边界。
             "source_is_depth_boundary": source_is_depth_boundary,
+            # source 点是否位于运动边界。
             "source_is_motion_boundary": source_is_motion_boundary,
+            # query 对应的原始轨迹点索引，便于调试和可视化。
             "point_indices": point_indices,
         }
 

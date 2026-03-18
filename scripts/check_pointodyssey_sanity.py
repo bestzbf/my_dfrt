@@ -220,6 +220,7 @@ def smoke_test_dataset_loader(args, seq_name: str):
         dataset_location=args.data_root,
         dset=args.split,
         use_augs=False,
+        deterministic_sampling=True,
         S=args.num_frames,
         img_size=args.img_size,
         num_queries=args.num_queries,

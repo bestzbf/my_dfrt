@@ -1,16 +1,17 @@
-export CUDA_VISIBLE_DEVICES=0
-export DATA_ROOT=/home/zbf/16t/e/d4rt/PointOdyssey
+export CUDA_VISIBLE_DEVICES=5
+export DATA_ROOT=/data2/d4rt/datasets/PointOdyssey_fast
 export MODE=normal
 export STAGE=full_main
-export OUTPUT_ROOT=outputs_allVal_augs/test512_load=%40_lossPaper
+export OUTPUT_ROOT=outputs_all_augs/256_lossPaper
 export ENCODER=base
-export VIDEOMAE_MODEL=/home/zbf/Desktop/d4rt/pretrained/videomae-base
-export PATCH_PROVIDER=sampled_highres
+export VIDEOMAE_MODEL=/data1/zbf/pretrained/videomae-base
+export PATCH_PROVIDER=precomputed_highres
 export QUERY_CHUNK_SIZE=0
-export BATCH_SIZE=16
+export BATCH_SIZE=4
 export VAL_EVERY_EPOCHS=10
-export NUM_WORKERS=8
+export NUM_WORKERS=32
 export PREFETCH_FACTOR=4
+export PYTHON_BIN=/root/miniconda3/envs/d4rt/bin/python
 
 bash train.sh \
   --train-split train \
@@ -28,10 +29,19 @@ bash train.sh \
   --conf-ramp-steps 0 \
   --img-size 256 \
   --t-tgt-eq-t-cam-ratio 0.4 \
-  --pretrained-weights outputs_load/test512_load=%40/full_main/checkpoint_epoch_9980.pth  
+  --amp \
+  --no-gradient-checkpointing \
+  --skip-pointodyssey-sanity
+
+  --resume outputs_allVal_augs/test512_load=%40_lossPaper/full_main/checkpoint_epoch_0100.pth  
+
 
 
 /home/zbf/miniconda3/envs/d4rt/bin/python scripts/build_pointodyssey_fast_cache.py \
   --data-root /home/zbf/16t/e/d4rt/PointOdyssey \
   --splits train val test \
   --workers 16
+
+
+  pip install huggingface_hub                                                                                                                                       
+  huggingface-cli download MCG-NJU/videomae-base --local-dir /data1/zbf/pretrained/videomae-base  

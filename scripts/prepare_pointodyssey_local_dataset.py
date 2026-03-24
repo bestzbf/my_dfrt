@@ -10,11 +10,11 @@ current training/inference pipeline:
 This avoids carrying over the original per-frame JPG/PNG/NPY tree unless explicitly requested.
 
 
-/home/zbf/miniconda3/envs/d4rt/bin/python scripts/prepare_pointodyssey_local_dataset.py \
-  --src-root /home/zbf/16t/e/d4rt/PointOdyssey \
-  --dst-root /mnt/nvme/PointOdyssey_local_fast \
+python scripts/prepare_pointodyssey_local_dataset.py \
+  --src-root /data2/d4rt/datasets/PointOdyssey \
+  --dst-root /data2/d4rt/datasets/PointOdyssey_fast \
   --splits train val test \
-  --workers 4 \
+  --workers 8 \
   --verify-sample
 
 """

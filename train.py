@@ -198,8 +198,9 @@ def parse_args():
     # Memory optimization
     parser.add_argument(
         "--gradient-checkpointing",
-        action="store_true",
-        help="Enable gradient checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Enable gradient checkpointing (use --no-gradient-checkpointing to disable)",
     )
     parser.add_argument(
         "--compile",
@@ -1242,6 +1243,15 @@ def run_validation(model, val_dataloader, criterion, args, device):
 
 def main():
     args = parse_args()
+
+    # B300 (sm_103) workaround: flash/mem_efficient SDP backends fail with cuDNN frontend
+    # on Blackwell GPUs with PyTorch 2.11. Fall back to math backend until fixed upstream.
+    if torch.cuda.is_available():
+        cap = torch.cuda.get_device_capability()
+        if cap[0] >= 10:  # Blackwell and newer
+            torch.backends.cuda.enable_flash_sdp(False)
+            torch.backends.cuda.enable_mem_efficient_sdp(False)
+            torch.backends.cuda.enable_math_sdp(True)
 
     rank, world_size, local_rank = setup_distributed()
     is_main = rank == 0

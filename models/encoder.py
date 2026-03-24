@@ -7,6 +7,12 @@ import torch.nn.functional as F
 from typing import Optional, Tuple
 from functools import partial
 from torch.utils.checkpoint import checkpoint
+from torch.nn.attention import SDPBackend, sdpa_kernel
+
+def _is_blackwell():
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability()[0] >= 10
 
 try:
     import timm
@@ -245,10 +251,18 @@ class EfficientAttention(nn.Module):
         q, k, v = qkv.unbind(0)
 
         # Use PyTorch's efficient attention (FlashAttention when available)
-        x = F.scaled_dot_product_attention(
-            q, k, v,
-            dropout_p=self.attn_drop if self.training else 0.0
-        )
+        # On Blackwell (sm_103+) cuDNN frontend fails; fall back to math backend
+        if _is_blackwell():
+            with sdpa_kernel(SDPBackend.MATH):
+                x = F.scaled_dot_product_attention(
+                    q, k, v,
+                    dropout_p=self.attn_drop if self.training else 0.0
+                )
+        else:
+            x = F.scaled_dot_product_attention(
+                q, k, v,
+                dropout_p=self.attn_drop if self.training else 0.0
+            )
 
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)

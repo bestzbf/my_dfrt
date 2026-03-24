@@ -68,9 +68,24 @@ def load_annotation(seq_path: Path) -> dict[str, np.ndarray]:
     anno_path = seq_path / "anno.npz"
     if not anno_path.exists():
         candidates = sorted(seq_path.glob("*.npz"))
-        if not candidates:
+        if candidates:
+            anno_path = candidates[0]
+        else:
+            # Fall back to anno_fast/ directory with individual .npy files
+            anno_fast = seq_path / "anno_fast"
+            required_keys = ("trajs_2d", "trajs_3d", "intrinsics", "extrinsics", "valids")
+            if anno_fast.is_dir() and all((anno_fast / f"{k}.npy").exists() for k in required_keys):
+                visibs_path = anno_fast / "visibs.npy"
+                valids = np.load(anno_fast / "valids.npy")
+                return {
+                    "trajs_2d": np.load(anno_fast / "trajs_2d.npy"),
+                    "trajs_3d": np.load(anno_fast / "trajs_3d.npy"),
+                    "intrinsics": np.load(anno_fast / "intrinsics.npy"),
+                    "extrinsics": np.load(anno_fast / "extrinsics.npy"),
+                    "valids": valids,
+                    "visibs": np.load(visibs_path) if visibs_path.exists() else valids,
+                }
             raise FileNotFoundError(f"No annotation file found in {seq_path}")
-        anno_path = candidates[0]
 
     anno = np.load(anno_path, allow_pickle=True)
     required_keys = ("trajs_2d", "trajs_3d", "intrinsics", "extrinsics", "valids")

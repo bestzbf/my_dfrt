@@ -4,9 +4,15 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
+from torch.nn.attention import SDPBackend, sdpa_kernel
 
 from utils.patches import extract_local_patches_with_valid_hw
 from .embeddings import FourierEmbedding, TimestepEmbedding, PatchEmbeddingFast
+
+def _is_blackwell():
+    if not torch.cuda.is_available():
+        return False
+    return torch.cuda.get_device_capability()[0] >= 10
 
 
 CANONICAL_QUERY_SPACE_CROP_NORMALIZED = 0
@@ -75,11 +81,20 @@ class CrossAttention(nn.Module):
         v = self.v_proj(value).reshape(B, N_kv, self.num_heads, self.head_dim).transpose(1, 2)
 
         # Use PyTorch's efficient attention (FlashAttention when available)
-        x = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=mask,
-            dropout_p=self.attn_drop if self.training else 0.0
-        )
+        # On Blackwell (sm_103+) cuDNN frontend fails; fall back to math backend
+        if _is_blackwell():
+            with sdpa_kernel(SDPBackend.MATH):
+                x = F.scaled_dot_product_attention(
+                    q, k, v,
+                    attn_mask=mask,
+                    dropout_p=self.attn_drop if self.training else 0.0
+                )
+        else:
+            x = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=mask,
+                dropout_p=self.attn_drop if self.training else 0.0
+            )
 
         x = x.transpose(1, 2).reshape(B, N_q, C)
         x = self.proj(x)

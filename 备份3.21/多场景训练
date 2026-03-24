@@ -1,0 +1,31 @@
+export CUDA_VISIBLE_DEVICES=0
+export DATA_ROOT=/home/zbf/16t/e/d4rt/PointOdyssey
+export MODE=normal
+export STAGE=full_main
+export OUTPUT_ROOT=outputs_allVal_augs/test512_load=%40_lossPaper
+export ENCODER=base
+export VIDEOMAE_MODEL=/home/zbf/Desktop/d4rt/pretrained/videomae-base
+export PATCH_PROVIDER=sampled_highres
+export QUERY_CHUNK_SIZE=0
+export BATCH_SIZE=16
+export VAL_EVERY_EPOCHS=10
+
+bash train.sh \
+  --train-split train \
+  --val-split val \
+  --steps 100000 \
+  --warmup-steps 0 \
+  --lambda-3d 1.0 \
+  --lambda-raw-3d 0.0 \
+  --lambda-conf 0.0 \
+  --lambda-2d 0.1 \
+  --lambda-vis 0.1 \
+  --lambda-disp 0.1 \
+  --lambda-normal 0.5 \
+  --conf-weighting-start-step 999999 \
+  --conf-ramp-steps 0 \
+  --img-size 256 \
+  --t-tgt-eq-t-cam-ratio 0.4 
+
+
+  --pretrained-weights outputs_load/test512_load=%40/full_main/checkpoint_epoch_9980.pth  

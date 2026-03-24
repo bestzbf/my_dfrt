@@ -1,0 +1,104 @@
+/home/zbf/Desktop/dl_env/bin/python visualize_tracks.py \
+  --checkpoint /home/zbf/Desktop/d4rt/多场景321/outputs_allVal_augs/test512_load=%40_lossPaper/full_main/checkpoint_epoch_0320.pth \
+  --output-dir outputs_allVal_augs/test512_load=%40_lossPaper/gif \
+  --split val \
+  --sequence ani1_new_f \
+  --num-queries 128 \
+  --source-mode fixed 
+
+ ani10_new_f, ani14_new_f, ani16_new_, ani1_new_, ani1_new_f, ani3_new_
+
+
+CUDA_VISIBLE_DEVICES=0 python visualize_tracks.py \
+   --checkpoint  /home/zbf/Desktop/d4rt/多场景321/outputs_allVal_augs/test512_load=%40_lossPaper/full_main/checkpoint_epoch_0100.pth \
+   --data-root /home/zbf/16t/e/d4rt/PointOdyssey \
+   --split val \
+   --sequence ani1_new_f \
+   --output-dir outputs_allVal_augstest512_load=%40_lossPaper/100 \
+   --num-queries 128 \
+   --device cuda \
+   --source-mode dataset \
+   --patch-provider sampled_highres \
+   --camera-mode follow_tgt #相机随时间转动（默认行为
+
+
+
+   --camera-mode fixed --camera-frame 0  #相机固定在某个特定帧（
+
+   --camera-mode follow_tgt #相机随时间转动（默认行为
+   --camera-mode fixed --camera-frame 0  #相机固定在某个特定帧（
+
+CUDA_VISIBLE_DEVICES=1
+MODE=normal \
+STAGE=full_main \
+OUTPUT_ROOT=outputs/dynamic_full_main_resized_baselong \
+ENCODER=base \
+VIDEOMAE_MODEL=/mnt/d/data/ZBF_Data/d4rt/3090/pretrained/videomae-base \
+PATCH_PROVIDER=sampled_resized \
+QUERY_CHUNK_SIZE=0 \
+BATCH_SIZE=1 \
+VAL_EVERY_EPOCHS=10 \
+bash train.sh --steps 30000 --warmup-steps 100 --lambda-disp 1
+
+
+
+CUDA_VISIBLE_DEVICES=2 python visualize_tracks.py \
+  --checkpoint outputs/dynamic_full_main_resized_baselong/full_main/checkpoint_epoch_3160.pth \
+  --data-root /mnt/d/data/ZBF_Data/d4rt/test \
+  --split val \
+  --sequence ani1_new_f \
+  --output-dir outputs/dynamic_full_main_resized_base/可视化_r4_new_f_dataset \
+  --videomae-model /mnt/d/data/ZBF_Data/d4rt/3090/pretrained/videomae-base \
+  --num-queries 256 \
+  --device cuda \
+--source-mode dataset
+
+
+
+
+MODE=normal STAGE=full_main OUTPUT_ROOT=outputs/dynamic_full_main_resized_base 
+ENCODER=base 
+VIDEOMAE_MODEL=/home/zbf/Desktop/d4rt/pretrained/videomae-base 
+PATCH_PROVIDER=sampled_resized QUERY_CHUNK_SIZE=0 
+BATCH_SIZE=1 VAL_EVERY_EPOCHS=1 
+bash train.sh --steps 3000 --warmup-steps 100 --lambda-disp 1
+
+
+
+
+CUDA_VISIBLE_DEVICES=0 python visualize_tracks.py \
+  --checkpoint outputs/dynamic_full_main_resized_baselong/full_main/checkpoint_epoch_3160.pth \
+  --data-root /mnt/d/data/ZBF_Data/d4rt/test \
+  --split val \
+  --sequence ani1_new_f \
+  --output-dir outputs/dynamic_full_main_resized_base/可视化_r4_new_f_dataset \
+  --videomae-model /mnt/d/data/ZBF_Data/d4rt/3090/pretrained/videomae-base \
+  --num-queries 256 \
+  --device cuda \
+--source-mode dataset
+
+
+--source-mode clip0
+--source-mode dataset
+--source-mode per_frame
+
+
+
+
+
+--source-frame k 现在是“真的固定第 k 帧做 source
+
+
+/home/zbf/.conda/envs/d4rt_env/bin/python /home/zbf/Desktop/d4rt/3.16/visualize_tracks.py \
+  --checkpoint /home/zbf/Desktop/d4rt/3.16/outputs/dynamic_full_main_resized_base/full_main/checkpoint_latest.pth \
+  --data-root /home/zbf/16t/e/d4rt/PointOdyssey \
+  --split val \
+  --sequence ani10_new_f \
+  --output-dir /home/zbf/Desktop/d4rt/3.16/outputs/dynamic_full_main_resized_base/可视化_r4_new_f_fixed_t7 \
+  --num-queries 480 \
+  --source-mode fixed \
+  --source-frame 24 \
+  --device cuda:0
+
+
+

@@ -1,0 +1,46 @@
+encoder: base
+decoder_depth: 6
+img_size: 256
+num_frames: 48
+patch_size: 9
+patch_provider: auto
+videomae_model: MCG-NJU/videomae-base
+
+batch_size: 8
+gradient_accumulation_steps: 1
+num_queries: 2048
+query_chunk_size: 256
+steps: 4000
+lr: 1.0e-4
+min_lr: 1.0e-6
+warmup_steps: 200
+weight_decay: 0.03
+grad_clip: 10.0
+amp: true
+gradient_checkpointing: true
+
+lambda_3d: 1.0
+lambda_raw_3d: 0.0
+lambda_2d: 0.1
+lambda_vis: 0.0
+lambda_disp: 0.0
+lambda_normal: 0.0
+lambda_conf: 0.0
+
+query_mode: same_frame
+t_tgt_eq_t_cam_ratio: 0.4
+
+dataset: pointodyssey
+train_split: train
+val_split: val
+test_split: test
+num_workers: 4
+disable_train_augs: false
+
+save_epochs: 20
+log_epochs: 10
+auto_resume: false
+pretrained_weights: null
+pretrained_encoder: null
+
+seed: 42

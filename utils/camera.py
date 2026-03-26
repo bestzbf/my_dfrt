@@ -298,7 +298,7 @@ def estimate_intrinsics(
         t_idx, t_idx, t_idx
     )
     points_3d = outputs['pos_3d'].squeeze(0)  # (h*w, 3)
-    confidence = outputs['confidence'].squeeze()  # (h*w,)
+    confidence = outputs['confidence_weight'].squeeze()  # (h*w,) - exp(-s), true confidence
 
     # Extract coordinates
     px, py, pz = points_3d[:, 0], points_3d[:, 1], points_3d[:, 2]

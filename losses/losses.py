@@ -388,20 +388,16 @@ class D4RTLoss(nn.Module):
     def _reduce_point_loss(
         self,
         point_loss: torch.Tensor,
-        confidence: torch.Tensor,
+        uncertainty: torch.Tensor,
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """Apply Kendall confidence weighting exp(-s) * L_3D."""
+        """Apply Kendall confidence weighting exp(-s) * L_3D with gradual ramp-up."""
         if self.use_confidence_weighting:
-            # Using Kendall's log-parameterization: confidence is 's'
+            # Using Kendall's log-parameterization: uncertainty is 's'
             # Weighted loss = exp(-s) * L_3D
-            
-            # [Fix] To stop the model from simply pushing 's' to -2 to cheat the loss,
-            # we need to ensure that the gradients flowing back into 's' are balanced.
-            # If the raw 3D error is large, the network SHOULD NOT be allowed to lower 's'.
-            # By applying exp(-s) to the loss, if L_3D is large, lowering 's' makes exp(-s)*L_3D explode.
-            # BUT, we clamped 's' to -5 in decoder.py.
-            confidence_weight = torch.exp(-confidence)
+            confidence_weight = torch.exp(-uncertainty)
+            # Apply weighting_factor for gradual ramp-up: lerp from 1.0 to exp(-s)
+            confidence_weight = 1.0 + self.confidence_weighting_factor * (confidence_weight - 1.0)
             point_loss = confidence_weight * point_loss
 
         if mask is not None:
@@ -412,17 +408,19 @@ class D4RTLoss(nn.Module):
         return point_loss.mean()
 
     def set_confidence_schedule(self, lambda_conf: float, weighting_factor: Optional[float] = None) -> None:
+        """Set confidence loss weight and weighting factor for gradual ramp-up.
+
+        Args:
+            lambda_conf: Weight for confidence penalty loss
+            weighting_factor: Factor in [0,1] for gradual confidence weighting ramp-up.
+                            0.0 = no weighting (weight=1.0), 1.0 = full Kendall weighting (weight=exp(-s))
+        """
         self.lambda_conf = float(lambda_conf)
-        # Force weighting_factor to be 1.0 (always fully weight the 3D loss by confidence)
-        # But we control the impact via lambda_conf.
-        # If lambda_conf is small, the model won't learn to reduce 's' too much.
-        # But for Kendall's formulation, we MUST always multiply by exp(-s) for the math to hold.
-        # Partial weighting (lerp) breaks the probabilistic interpretation.
         if weighting_factor is not None:
             self.confidence_weighting_factor = float(weighting_factor)
         else:
             self.confidence_weighting_factor = 1.0
-        self.use_confidence_weighting = True # Always enable weighting logic, control via lambda_conf
+        self.use_confidence_weighting = True
 
     def forward(
         self,
@@ -493,7 +491,7 @@ class D4RTLoss(nn.Module):
             point_loss = torch.abs(pred_log - target_log).mean(dim=-1)  # (B, N)
             losses['loss_3d'] = self._reduce_point_loss(
                 point_loss,
-                confidence,
+                uncertainty,
                 mask=mask_3d,
             )
         else:
@@ -557,7 +555,7 @@ class D4RTLoss(nn.Module):
 
         # Confidence penalty
         losses['loss_conf'] = compute_confidence_loss(
-            predictions['confidence'],
+            predictions['uncertainty'],
             mask=mask_3d
         )
 

@@ -219,7 +219,7 @@ def estimate_camera_pose(
         t_src_i, t_src_i, t_src_i
     )
     points_i = outputs_i['pos_3d'].squeeze(0)  # (h*w, 3)
-    conf_i = outputs_i['confidence'].squeeze()  # (h*w,)
+    conf_i = outputs_i['confidence_weight'].squeeze()  # (h*w,) - exp(-s), true confidence
 
     # Query same points in frame_j coordinate system
     # q_j = (u, v, t_src=i, t_tgt=i, t_cam=j)
@@ -229,7 +229,7 @@ def estimate_camera_pose(
         t_src_i, t_src_i, t_cam_j
     )
     points_j = outputs_j['pos_3d'].squeeze(0)  # (h*w, 3)
-    conf_j = outputs_j['confidence'].squeeze()  # (h*w,)
+    conf_j = outputs_j['confidence_weight'].squeeze()  # (h*w,) - exp(-s), true confidence
 
     # Combine confidences as weights
     weights = conf_i * conf_j

@@ -475,13 +475,13 @@ class D4RTLoss(nn.Module):
         # 3D position loss. Confidence weighting is only enabled once the
         # confidence penalty itself participates in optimization; otherwise the
         # model can minimize this term by collapsing confidence toward zero.
-        confidence = predictions['confidence'].squeeze(-1)  # (B, N)
+        uncertainty = predictions['uncertainty'].squeeze(-1)  # (B, N) - Kendall's s
 
         if self.debug_3d_loss_mode == "raw_l1":
             point_loss = torch.abs(predictions['pos_3d'] - targets['pos_3d']).mean(dim=-1)
             losses['loss_3d'] = self._reduce_point_loss(
                 point_loss,
-                confidence,
+                uncertainty,
                 mask=mask_3d,
             )
         elif mask_3d is not None:

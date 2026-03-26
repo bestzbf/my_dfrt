@@ -1,7 +1,7 @@
 export CUDA_VISIBLE_DEVICES=5
 export DATA_ROOT=/data2/d4rt/datasets/PointOdyssey_fast
 export MODE=normal
-export STAGE=full_main
+export STAGE=full
 export OUTPUT_ROOT=outputs_all_augs/256_lossPaper
 export ENCODER=base
 export VIDEOMAE_MODEL=/data1/zbf/pretrained/videomae-base

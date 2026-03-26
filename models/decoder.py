@@ -448,12 +448,15 @@ class D4RTDecoder(nn.Module):
         # Kendall log-parameterization: output s directly instead of c
         # s = -log(c)
         s = self.head_conf(query)
-        
+
         # [CRITICAL FIX] Relax the clamp!
         # min=-5.0 allows exp(-s) to reach exp(5) ≈ 148, giving the model enough "pain" to force 3D learning.
         # Previously min=-2.0 capped the pain at exp(2) ≈ 7.4, which was too comfortable for the model.
         # max=10.0 prevents s from growing infinitely positive
         s = torch.clamp(s, min=-5.0, max=10.0)
+
+        # Convert to confidence weight for downstream use
+        confidence_weight = torch.exp(-s)
 
         return {
             'pos_3d': pos_3d,
@@ -461,7 +464,8 @@ class D4RTDecoder(nn.Module):
             'visibility': visibility,
             'displacement': displacement,
             'normal': normal,
-            'confidence': s  # Actually 's' in Kendall's formulation
+            'uncertainty': s,  # Kendall's s = -log(c)
+            'confidence_weight': confidence_weight  # exp(-s) = c, for downstream weighting
         }
 
     def forward(

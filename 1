@@ -1,12 +1,51 @@
-/home/zbf/Desktop/dl_env/bin/python visualize_tracks.py \
-  --checkpoint /home/zbf/Desktop/d4rt/多场景321/outputs_allVal_augs/test512_load=%40_lossPaper/full_main/checkpoint_epoch_0320.pth \
-  --output-dir outputs_allVal_augs/test512_load=%40_lossPaper/gif \
-  --split val \
-  --sequence ani1_new_f \
-  --num-queries 128 \
+python visualize_tracks.py \
+  --checkpoint /data1/zbf/my_dfrt/outputs_single_scene/an/full_main/checkpoint_latest.pth \
+  --output-dir outputs_single_scene/an/gif \
+  --split train \
+  --sequence ani \
+  --num-queries 256 \
   --source-mode fixed 
 
  ani10_new_f, ani14_new_f, ani16_new_, ani1_new_, ani1_new_f, ani3_new_
+
+
+
+/root/miniconda3/envs/d4rt/bin/python visualize_tracks2.py \
+  --checkpoint /data1/zbf/my_dfrt/outputs_all_augs/256_lossPaper_load1580/full_main/checkpoint_epoch_1840.pth \
+  --data-root /data2/d4rt/datasets/PointOdyssey_fast \
+  --split train \
+  --sequence ani_new_ \
+  --output-dir outputs_all_augs/ani_new_/tracks2d_3d \
+  --device cuda \
+  --num-queries 128 \
+  --source-mode dataset \
+  --source-frame 40 \
+  --with-world-pointcloud-gif \
+  --with-world-pointcloud-multiview-gif \
+  --pointcloud-stride 4 \
+  --pointcloud-chunk-size 8192 \
+  --pointcloud-uniformization voxel \
+  --pointcloud-voxel-size 0.03 
+
+
+
+
+/root/miniconda3/envs/d4rt/bin/python visualize_tracks_gif.py \
+  --checkpoint /data1/zbf/my_dfrt/outputs_all_augs/256_lossPaper_load1580/full_main/checkpoint_epoch_1840.pth \
+  --output-dir outputs_all_augs/256_lossPaper_load1580/gif \
+  --split train \
+  --sequence ani_new_ \
+  --num-queries 256 \
+  --source-mode dataset 
+
+
+
+
+
+
+
+
+
 
 
 CUDA_VISIBLE_DEVICES=0 python visualize_tracks.py \

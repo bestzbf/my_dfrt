@@ -1,0 +1,114 @@
+\section{Method}
+\label{sec:method}
+
+\name is based on a simple encoder-decoder architecture inspired by the Scene Representation Transformer~\cite{srt, rust}.
+As shown in \cref{fig:method}, the video is first processed by a powerful encoder producing the \emph{Global Scene Representation} $\gsc$.
+The role of the encoder is to capture information about the full environment, identifying dense correspondence across all video frames, as well as understanding the flow of time and its effect on the scene.
+In a second stage, a lightweight decoder queries $\gsc$ through a simple low-level interface.
+Specifically, given a 2D point in a \emph{source frame}, the decoder predicts the \emph{3D position} of the point at a given \emph{target timestep} (defining the temporal state) and expressed relative to a given \emph{camera} reference (defined by the frame timestep where the camera viewpoint corresponds to this reference).
+
+
+We draw attention to three desirable properties of this formulation:
+first, the indices need not coincide, allowing a full disentanglement of space and time;
+second, each query is decoded independently, allowing for both efficient training and inference as well as flexible decoding (both sparse and dense); and
+third, this interface unlocks a suite of downstream applications in a unified, consistent manner (\cref{tab:query_mechanism}).
+
+\subsection{\nameraw Framework}
+\label{sec:method:framework}
+
+Given a video $V \in \mathbb{R}^{T\times H\times W\times 3}$, the encoder $\enc$ extracts the latent \emph{Global Scene Representation}
+\begin{equation*}
+\gsc = \enc(V) \in \mathbb{R}^{N\times C}.
+\end{equation*}
+
+Once $\gsc$ is calculated, it remains fixed throughout the second stage, where the decoder $\dec$ cross-attends from any number of queries into $\gsc$.
+We define a query $\query = (u, v, t_\text{src}, t_\text{tgt}, t_\text{cam})$, where $(u, v, t_{src})$ correspond to \emph{source} parameters and $(t_\text{tgt}, t_\text{cam})$ correspond to \emph{target} parameters.
+Here, $(u, v) \in [0, 1]^2$ represent the normalized 2D coordinates of a point of interest in the source frame $t_{src}$, while $(t_\text{tgt}, t_\text{cam}) \in [1,\ldots, T]$ denote the temporal indices of the target timestep and the reference camera coordinate system (illustrated in \cref{fig:method}).
+Each query $\query$ is processed \emph{fully independently} with the video features $\gsc$ to produce its corresponding 3D point position $\vec{P}$:
+\begin{equation*}
+\vec{P} = \dec(\query, \gsc) \in \mathbb{R}^3.
+\end{equation*}
+
+
+
+\para{From query to 4D reconstruction.}
+Through a simple variation of queries, our framework allows us to address a broad range of 4D tasks as shown in \cref{tab:query_mechanism}.
+Choosing any fixed point $(u, v)$ from a source frame $t_\text{src}$ in the video while varying $t_\text{tgt} = t_\text{cam} = \{1\ldots T\}$ produces its \emph{point track}, the 3D trajectory of the corresponding point throughout the video.
+For full \emph{point cloud} reconstruction, the 3D position of all pixels in the video can be directly predicted in a shared reference frame $t_\text{cam}$ by the model.
+This alleviates the need for coordinate transformations to map pixels from different video frames
+into a unified coordinate system using explicit, potentially noisy camera estimates.
+\emph{Depth maps} can be recovered by simply querying any pixel in the video with $t_\text{src}=t_\text{tgt}=t_\text{cam}$ and only keeping the Z-dimension of the output $\vec{P}$.
+
+We next detail how \emph{camera extrinsics} and \emph{intrinsics} predictions are obtained.
+To derive the relative camera pose between any pair of video frames $i,j\in[1\ldots T]$, we create queries for an ensemble of source points $\{(u_k, v_k)\}_k$ sampled on a $(h,w)$ grid in both reference frames:
+\begin{equation*}
+\query_{i,k} = (u_k, v_k, i, i, i),\quad
+\query_{j,k} = (u_k, v_k, i, i, j).
+\end{equation*}
+The resulting sets $\{\dec(\query_{i,k}, \gsc)\}_k$ and $\{\dec(\query_{j,k}, \gsc)\}_k$ describe the same 3D points in different reference frames.
+We therefore only need to find the rigid transformation between them, which can be efficiently derived through Umeyama's algorithm~\cite{umeyama1991least} that solves a $3{\times}3$ SVD decomposition.
+
+To recover intrinsics for video frame $i\in[1\ldots T]$, we construct a set of queries for different source points, again sampled on a $(h,w)$ grid.
+We decode all corresponding 3D positions $\vec{P}=(p_x, p_y, p_z)$.
+Assuming a pinhole camera model with a principal point at $(0.5, 0.5)$, we get focal length parameters as follows:
+\begin{equation*}
+    f_x {=} p_z(u - 0.5)/p_x,\quad
+    f_y {=} p_z(v - 0.5)/p_y.
+\end{equation*}
+We take the median over the $k$ estimates for robustness.
+Camera models with distortion (\eg, fisheye) can also be seamlessly incorporated by adding a non-linear refinement step on top of the initial estimation~\cite{zhang2002flexible}.
+
+\input{tabs/query_mechanism_2}
+
+
+\subsection{Model Architecture}
+\label{sec:method:architecture}
+
+
+Our encoder $\enc$ is based on the Vision Transformer~\cite{dosovitskiy2021} with interleaved \emph{local frame-wise}, and \emph{global} self-attention layers~\cite{wang2025vggt}.
+For simplicity, and to support arbitrary aspect ratios, we resize the input video to a fixed square resolution before tokenizing it.
+To incorporate the original aspect ratio, we embed it into a separate token and pass it to the transformer along with the main video tokens.
+
+
+\para{Pointwise decoder.}
+The decoder $\dec$ is a small cross-attention transformer.
+A query token is first constructed by adding the Fourier feature embedding~\cite{AttentionIsAllYouNeed} of the 2D coordinates $(u, v)$ to the learned discrete timestep embeddings for $t_\text{src}$, $t_\text{tgt}$, and $t_\text{cam}$.
+We empirically observe that augmenting the query with an embedding of the local $9{\times}9$ pixel RGB patch centered at $(u, v)$ dramatically improves performance, see \cref{sec:exp:ablations}.
+
+Each query is decoded independently through cross-attention into the \emph{Global Scene Representation} $\gsc$, ensuring that queries do not interact.
+The resulting output feature is then mapped to a 3D point position $\vec{P}$ via a simple learned projection.
+Decoding queries independently is a deliberate design decision with major advantages.
+It allows efficient training, as only a small number of queries need to be decoded to provide a supervision signal to the model.
+Equally importantly, at inference time, the queries can be chosen freely across all video frames as described in \cref{sec:method:training}, and need not be correlated to each other to avoid out-of-distribution effects -- indeed, we have empirically observed major performance drops when enabling self-attention between queries in early experiments.
+Finally, this design allows highly efficient inference thanks to its trivial parallelism.
+As shown in \cref{fig:speed} and \cref{tab:fps}, we obtain the best trade-off between performance and latency across multiple tasks.
+
+
+\input{tabs/algo}
+
+
+\subsection{Training and Inference}
+\label{sec:method:training}
+
+The model is implemented in Kauldron~\cite{kauldron2025github} and trained end-to-end by minimizing the weighted sum of losses computed over a batch of $N$ sampled queries.
+The primary supervision signal is derived from an $L_1$ loss applied to the normalized 3D point position $\vec{P}$.
+Specifically, both the target and the estimated point sets are normalized by their respective mean depths~\cite{wang2024dust3r} and then passed through the transform $\text{sign}(x) \cdot \log(1 {+} |x|)$ to dampen the influence of far-away points on the loss.
+We also supervise a set of auxiliary predictions from additional linear projections on the decoder output:
+An $L_1$ loss on \emph{2D coordinates} of the point positions in image space;
+cosine similarity for \emph{3D surface normals}~\cite{wang2025pi};
+binary cross-entropy for \emph{target point visibility}; and $L_1$ on the vector of \emph{point motion}.
+All loss terms are applied only where ground truth supervision is available.
+We finally incorporate a confidence penalty $\text{--}\log(c)$ where $c$ additionally weights the 3D point error~\cite{kendall2017uncertainties}.
+
+\para{Efficient dense dynamic correspondence.}
+A key capability of our query-based model is that it can efficiently compute dense correspondences for \emph{all} pixels in a video, both static and dynamic.
+As shown in \cref{fig:point_cloud_vis}, this capability is crucial for building a complete, holistic scene reconstruction, which in turn is key to eliminating the occlusion-induced discontinuities and sparse artifacts common in prior works.
+However, a naive approach to reconstruct tracks for all pixels across the video would involve $O(T^2 H W)$ queries, the majority of which are not required.
+
+We introduce \cref{alg:track_all_pixels} which exploits spatio-temporal redundancy using an occupancy grid $\grid \in \{0, 1\}^{T \times H \times W}$ to speed this procedure up significantly.
+The algorithm only initiates new tracks from unvisited pixels.
+Each \emph{full-video track} marks all spatio-temporal pixels it \emph{visibly} passes through as visited.
+Empirically, we find that this yields an adaptive speedup between 5--15$\times$ depending on the motion complexity in the video.
+This dense, flexible strategy is feasible for our method precisely because our decoder is \emph{both} sparse, and lightweight.
+It is notable that prior works are ill-suited for this task for various reasons.
+Most methods fail to provide any correspondences for dynamic portions of the scenes~\cite{wang2025vggt, wang2025pi, li2025megasam}, dense frame-level decoding remains locked in the costly naive approach~\cite{feng2025st4rtrack}, and models with heavy sparse decoders face a large per-query cost~\cite{karaev2025cotracker3, xiao2025spatialtrackerv2}.

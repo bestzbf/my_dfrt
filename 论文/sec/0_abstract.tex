@@ -1,0 +1,10 @@
+\begin{abstract}
+    Understanding and reconstructing the complex geometry and motion of dynamic scenes from video remains a formidable challenge in computer vision.
+    This paper introduces \name, a simple yet powerful feedforward model designed to efficiently solve this task.
+    \name utilizes a unified transformer architecture to jointly infer depth, spatio-temporal correspondence, and full camera parameters from a single video.
+    Its core innovation is a novel querying mechanism that sidesteps the heavy computation of dense, per-frame decoding and the complexity of managing multiple, task-specific decoders.
+    Our decoding interface allows the model to independently and flexibly probe the 3D position of any point in space and time.
+    The result is a lightweight and highly scalable method that enables remarkably efficient training and inference.
+    We demonstrate that our approach sets a new state of the art, outperforming previous methods across a wide spectrum of 4D reconstruction tasks.
+    We refer to the project webpage for animated results.\textsuperscript{3}
+\end{abstract}

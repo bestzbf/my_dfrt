@@ -1,0 +1,108 @@
+\appendix
+
+\onecolumn
+{
+\centering
+\Large
+\textbf{\thetitle}\\
+\vspace{0.5em}Appendix \\
+\vspace{1.0em}
+}
+
+
+\section{Model Overview \& Training Details}
+\label{sec:app:overview}
+\input{figs/app_full_mehod}
+
+\noindent The model is trained end-to-end by minimizing a composite loss $\mathcal{L}$, which is a weighted sum of task-specific losses computed over a batch of $N$ sampled queries:
+\begin{equation*}
+\mathcal{L} = \frac{1}{N} \sum_{i=1}^{N} \Big( 
+    c\lambda_{3D}\mathcal{L}_{3D} 
+    - \lambda_{\text{conf}}\log{c}
+    + \lambda_{2D}\mathcal{L}_{2D}
+    + \lambda_{\text{vis}}\mathcal{L}_{\text{vis}} 
+    + \lambda_{\text{disp}}\mathcal{L}_{\text{disp}} 
+    + \lambda_{\text{conf}}\mathcal{L}_{\text{conf}} 
+    + \lambda_{\text{normal}}\mathcal{L}_{\text{normal}}
+\Big)_i
+\end{equation*}
+where $c$ is the confidence score predicted by the model.
+We use the following loss weights:
+$\lambda_{\scriptscriptstyle \mathrm{3D}}{=}1.0$, $\lambda_{\scriptscriptstyle \mathrm{2D}}{=}0.1$, $\lambda_{\text{vis}}{=}0.1$, $\lambda_{\text{disp}}{=}0.1$,  $\lambda_{\text{conf}}{=}0.2$, $\lambda_{\text{normal}}{=}0.5$,  $\lambda_{\text{conf}}{=}0.2$.
+We train using the AdamW optimizer with a weight decay of $0.03$.
+The learning rate is warmed up for $2{,}500$ steps until it reaches a peak value of $10^{-4}$. 
+Subsequently, it follows a cosine annealing schedule, decaying to a final value of $10^{-6}$. 
+Gradients are clipped to a maximum ${L}^2$-norm of $10$.
+
+\paragraph{Data augmentation.}
+Extensive data augmentation techniques are applied to the video during training to improve model generalization.
+We apply temporally consistent color jittering by performing random brightness, saturation, contrast, and hue adjustments. We also apply random color drop with a probability of $0.2$, and Gaussian blur augmentation with a probability of $0.4$. 
+For spatial augmentation, we use random crop augmentations with a scale ratio between $0.3$ and $1.0$ of the original size. 
+After determining the crop size, a random aspect ratio is selected by sampling from a uniform distribution in the logarithmic domain; this ensures equal probability for wide and tall crops while respecting image boundaries. 
+Additionally, during the random crop augmentation, the image is randomly zoomed in with a probability of $0.05$.
+On the temporal dimension, frames are subsampled from the full video with a random stride. 
+
+\paragraph{Training queries.}
+Queries are sampled from available ground truth point trajectories.
+To focus the model on challenging regions, $30\%$ of the queries (along dimensions $u,v$) are sampled near depth discontinuities or motion boundaries, which are pre-computed using a Sobel filter on depth maps.
+Timesteps $t_{src}$, $t_{tgt}$, and $t_{cam}$ are sampled uniformly at random, except that we enforce $t_{tgt} = t_{cam}$ with probability $0.4$ to improve downstream performance.
+
+
+
+\clearpage
+
+\section{Generalization to Long Videos}\label{sec:app:long-seq}
+We implement a long-sequence processing algorithm by partitioning videos into overlapping segments. We then align these segments by estimating Sim(3) transformations using the Umeyama algorithm~\cite{umeyama1991least}, based on the top 85\% of points with the highest confidence in the overlapping regions. The process is similar to the first stage proposed in VGGT-Long~\cite{deng2025vggtlong}, we omit loop detection and optimization stage in ~\cite{deng2025vggtlong} to directly evaluate the reconstruction model's raw precision. As shown in \cref{fig:kitti_eval} on KITTI~\cite{kitti2013}, our model yields the best ATE in the first example, significantly outperforming VGG-T and $\pi^3$ by a large margin. On the second example, we significantly outperform VGG-T and produce a result on par with $\pi^3$. 
+
+\input{figs/kitti}
+
+
+
+\clearpage
+
+\section{High-Resolution Decoding with Subpixel Precision}\label{sec:app:high-res}
+
+
+\noindent A key advantage of \name's architecture is the decoupling of the global scene encoding from the point-wise decoding.
+As the query coordinates $(u, v)$ are defined in a continuous normalized space $[0, 1]^2$, our decoder is able to probe the scene at arbitrary resolutions, independent of the resolution of the Global Scene Representation $F$.
+
+We explore this capability in \cref{tab:ablation_resolution}.
+To quantify the preservation of high-frequency details, we report the Pseudo Depth Boundary Error accuracy ($\epsilon^{\text{acc}}_{\text{PDBE}}$) proposed by~\citet{pham2025sharpdepth}, in addition to standard depth metrics. We compare four configurations using a ViT-g encoder fixed at a resolution of $256{\times}256$.
+The baseline output at the encoder's native resolution (\textbf{Config \raisebox{0.75pt}{\textcircled{\scriptsize 1}}}) is naturally coarse. Incorporating the local appearance patch mechanism described in the main paper (\textbf{Config \raisebox{0.75pt}{\textcircled{\scriptsize 2}}}) allows for the recovery of finer low-level structures, although pixelation artifacts persist.
+We further leverage the continuous nature of our query mechanism to predict at the \textit{original} resolution.
+While naive dense querying (\textbf{Config \raisebox{0.75pt}{\textcircled{\scriptsize 3}}}) recovers smoother edges, it still fails at recovering high frequencies.
+
+In \textbf{Config \raisebox{0.75pt}{\textcircled{\scriptsize 4}}}, we extract the local RGB patches from the source frames at their \textit{original} resolution for decoding.
+
+The significant drop in $\epsilon^{\text{acc}}_{\text{PDBE}}$ demonstrates how this allows \name to recover finer details.
+We show qualitative results in \cref{supfig:subpixel_dec} where we observe that hair strands and object boundaries are resolved more accurately.
+
+\input{tabs/ablation_resolution}
+\input{figs/subpixel_decode_ablation}
+
+
+
+\section{Further Ablations}
+
+
+\paragraph{Pretrained Encoder.}
+In \cref{tab:app:abla_init}, we show our model performance when the video encoder is initialized with random weights compared to using pre-trained VideoMAE~\cite{videomaev2} weights.
+We observe significant improvements across the board.
+
+\input{tabs/ablation_init}
+
+\paragraph{Local RGB patch size.}
+We perform an ablation study on the size of the local RGB patch.
+As shown in \cref{fig:ablation_patch_size}, our results indicate that the patch size 9$\times$9 yields the best overall performance across camera pose and depth estimation tasks.
+
+\input{figs/ablation_source_patch_size_plot}
+
+
+
+\section{Further Qualitative Results}
+Complementing the qualitative visualizations in the main text, we provide additional examples of our reconstruction results in \cref{supfig:ours_vis}, along with further baseline comparisons in \cref{supfig:side_by_side_vis} and \cref{supfig:depth_vis}.
+
+
+\input{figs/supp_ours_vis}
+\input{figs/supp_side_by_side_vis}
+\input{figs/depth_qual_3}

@@ -23,7 +23,6 @@ except ImportError:
 from data.dataset import PointOdysseyDataset
 from models import create_d4rt
 from utils.camera import umeyama_alignment
-from utils.patches import extract_local_patches
 
 # --- Helper Functions ---
 
@@ -40,21 +39,6 @@ def inference_autocast_context(device):
         from contextlib import nullcontext
         return nullcontext()
     return torch.autocast(device_type=device.type, dtype=dtype)
-
-
-def build_decode_local_patches(
-    query_frames: torch.Tensor,
-    coords: torch.Tensor,
-    t_src: torch.Tensor,
-    patch_size: int,
-) -> torch.Tensor:
-    """Recompute local patches for visualization-time query overrides."""
-    return extract_local_patches(
-        frames_btchw=query_frames,
-        coords=coords,
-        t_src=t_src,
-        patch_size=patch_size,
-    )
 
 def load_model(args, checkpoint_path: Path, device: torch.device):
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
@@ -451,14 +435,12 @@ def main():
         img_size=ckpt_args.get("img_size", 256),
         num_queries=args.num_queries, # Sparse queries
         use_augs=False,
-        # deterministic_sampling=(args.sampling_mode == "deterministic"),
         verbose=True,
         sequence_name=resolved_sequence,
         strides=[1], # Force stride 1
         query_mode=ckpt_args.get("query_mode", "full"),
         precompute_local_patches=precompute_local_patches,
-        return_query_video=patch_provider in {"sampled_highres", "precomputed_highres"},
-        local_patch_source="highres" if patch_provider == "precomputed_highres" else "resized",
+        return_query_video=patch_provider == "sampled_highres",
         static_scene_frame_idx=ckpt_args.get("static_scene_frame_idx", None),
     )
     
@@ -539,28 +521,18 @@ def main():
     seq_path = os.path.join(dataset.root, seq_name)
     
     anno_path = os.path.join(seq_path, "anno.npz")
-    anno_fast_dir = os.path.join(seq_path, "anno_fast")
-    if os.path.isdir(anno_fast_dir):
-        trajs_2d_all = np.load(os.path.join(anno_fast_dir, "trajs_2d.npy"))
-        valids_all = np.load(os.path.join(anno_fast_dir, "valids.npy"))
-        visibs_path = os.path.join(anno_fast_dir, "visibs.npy")
-        visibs_all = np.load(visibs_path) if os.path.exists(visibs_path) else valids_all
-    elif os.path.exists(anno_path):
-        anno = np.load(anno_path, allow_pickle=True)
-        trajs_2d_all = anno["trajs_2d"]
-        valids_all = anno["valids"]
-        visibs_all = anno["visibs"] if "visibs" in anno else valids_all
-    else:
+    if not os.path.exists(anno_path):
         import glob
         npzs = glob.glob(os.path.join(seq_path, "*.npz"))
-        if len(npzs) > 0:
-            anno = np.load(npzs[0], allow_pickle=True)
-            trajs_2d_all = anno["trajs_2d"]
-            valids_all = anno["valids"]
-            visibs_all = anno["visibs"] if "visibs" in anno else valids_all
+        if len(npzs) > 0: anno_path = npzs[0]
         else:
-            print("Error: No annotation file found!")
-            return
+             print("Error: No annotation file found!")
+             return
+        
+    anno = np.load(anno_path, allow_pickle=True)
+    trajs_2d_all = anno["trajs_2d"] # [TotalFrames, TotalPoints, 2]
+    valids_all = anno["valids"]
+    visibs_all = anno["visibs"] if "visibs" in anno else valids_all
     
     frame_indices = sample['frame_indices'].numpy() # [S]
     
@@ -641,32 +613,22 @@ def main():
     dataset_t_src_cpu = t_src.squeeze(0).cpu().numpy()
     fixed_coords_cpu = None if coords_fixed is None else coords_fixed.squeeze(0).cpu().numpy()
     query_frames_for_decode = video_query if video_query is not None else video
-    patch_size = int(ckpt_args.get("patch_size", 9))
-    patch_provider_requires_local_patches = (
-        patch_provider in {"precomputed_resized", "precomputed_highres"}
-        or (patch_provider == "auto" and local_patches is not None)
-    )
 
     input_title = "Input"
     input_panel_np = None
     input_coords_vis = None
     input_visibility = None
-    local_patches_fixed = None
+    use_sample_local_patches = False
     if effective_source_mode == "fixed":
         print(f"Using clip frame {fixed_source_frame} as the fixed source for all queries.")
         input_title = f"Input (Clip t={fixed_source_frame})"
         input_panel_np = video.squeeze(0).permute(0, 2, 3, 1).float().cpu().numpy()
         input_coords_vis = fixed_coords_cpu
-        if patch_provider_requires_local_patches:
-            local_patches_fixed = build_decode_local_patches(
-                query_frames=query_frames_for_decode,
-                coords=coords_fixed,
-                t_src=t_src_fixed,
-                patch_size=patch_size,
-            )
+        use_sample_local_patches = False
     elif effective_source_mode == "dataset":
         print("Using dataset-sampled source coordinates and t_src values for each query.")
         input_title = "Input (Dataset Sources)"
+        use_sample_local_patches = True
     else:
         print(
             "Using per-frame identity queries (t_src=t_tgt=t_cam=t). "
@@ -676,6 +638,9 @@ def main():
         input_panel_np = video.squeeze(0).permute(0, 2, 3, 1).float().cpu().numpy()
         input_coords_vis = full_tracks_gt.copy()
         input_visibility = full_visibility.copy()
+        use_sample_local_patches = False
+
+    local_patches_for_decode = local_patches if use_sample_local_patches else None
     identity_reported = False
     
     for t in tqdm(range(S), desc="Decoding frames"):
@@ -694,21 +659,6 @@ def main():
             curr_t_src = t_src_fixed
             curr_t_tgt = torch.full((1, num_queries), t, device=device, dtype=torch.long)
             curr_t_cam = torch.full((1, num_queries), t, device=device, dtype=torch.long)
-
-        if patch_provider_requires_local_patches:
-            if effective_source_mode == "dataset":
-                local_patches_for_decode = local_patches
-            elif effective_source_mode == "fixed":
-                local_patches_for_decode = local_patches_fixed
-            else:
-                local_patches_for_decode = build_decode_local_patches(
-                    query_frames=query_frames_for_decode,
-                    coords=curr_coords,
-                    t_src=curr_t_src,
-                    patch_size=patch_size,
-                )
-        else:
-            local_patches_for_decode = None
         
         with torch.no_grad():
             with inference_autocast_context(device):

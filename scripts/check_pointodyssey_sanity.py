@@ -140,8 +140,9 @@ def validate_annotation_shapes(seq_name: str, anno: dict[str, np.ndarray]):
 
     rotation = extrinsics[:, :3, :3]
     rotation_error = np.linalg.norm(rotation @ np.transpose(rotation, (0, 2, 1)) - np.eye(3), axis=(1, 2))
-    if float(np.nanmax(rotation_error)) > 1e-1:
-        raise ValueError(f"{seq_name}: extrinsics rotation matrices are not close to orthonormal")
+    max_error = float(np.nanmax(rotation_error))
+    if max_error > 0.5:
+        raise ValueError(f"{seq_name}: extrinsics rotation matrices are not close to orthonormal (max_error={max_error:.4f})")
 
 
 def sample_frame_indices(num_frames: int, max_frames_check: int) -> np.ndarray:

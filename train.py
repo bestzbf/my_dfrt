@@ -16,7 +16,7 @@ import torch.distributed as dist
 import yaml
 import torch.nn as nn
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.data.distributed import DistributedSampler
 
 from data import PointOdysseyDataset, collate_fn
@@ -336,6 +336,19 @@ def parse_args():
         ),
     )
     parser.add_argument(
+        "--dataset-repeat-factor",
+        type=int,
+        default=32,
+        help=(
+            "Repeat the training dataset index list N times via ConcatDataset. "
+            "Each __getitem__ re-samples randomly, so repeated indices do NOT produce identical samples. "
+            "Useful for single-scene training where the raw clip list is small: "
+            "repeat_factor=256 turns 50 clips into 12800 'samples' per epoch, "
+            "keeping steps_per_epoch and the LR schedule well-behaved. "
+            "Set to 1 to disable repeating."
+        ),
+    )
+    parser.add_argument(
         "--disable-grouped-3d-normalization",
         action="store_true",
         help=(
@@ -630,6 +643,14 @@ def create_dataloaders(args, rank, world_size):
 
     if len(train_dataset) == 0:
         raise RuntimeError(f"Train dataset is empty: {train_dir}")
+
+    # Repeat dataset to support larger batch sizes / single-scene training
+    dataset_repeat_factor = args.dataset_repeat_factor
+    if dataset_repeat_factor > 1:
+        original_len = len(train_dataset)
+        train_dataset = ConcatDataset([train_dataset] * dataset_repeat_factor)
+        if is_main:
+            print(f"Dataset repeated {dataset_repeat_factor}x: {original_len} -> {len(train_dataset)} samples")
 
     if world_size > 1:
         train_sampler = DistributedSampler(
@@ -1471,6 +1492,13 @@ def main():
     train_start_time = time.time()
     step = start_step
     stop_training = False
+
+    # When resuming from a checkpoint whose epoch counter exceeds the newly-computed
+    # max_epochs (e.g. after switching from single-GPU to DDP, steps_per_epoch changes),
+    # extend max_epochs so the loop isn't empty and training runs until step target.
+    if args.steps > 0 and start_epoch >= max_epochs:
+        remaining = max(1, scheduler_total_steps - start_step)
+        max_epochs = start_epoch + max(1, math.ceil(remaining / steps_per_epoch))
 
     for epoch_idx in range(start_epoch, max_epochs):
         completed_epoch = epoch_idx + 1

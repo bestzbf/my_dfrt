@@ -1,0 +1,141 @@
+\section{Experiments}
+\label{sec:exp}
+
+We benchmark \name against recent state-of-the-art methods.
+After inspecting qualitative differences in capability in \cref{sec:exp:qualitative}, we proceed with evaluating \task performance in \cref{sec:exp:4d}, focusing the comparison on the best methods from \cref{sec:related:tracking}.
+We then continue with pure reconstruction tasks in \cref{sec:exp:3d}, comparing to the recent SOTA models mentioned in \cref{sec:related:recon}.
+We conclude with a set of key ablations in \cref{sec:exp:ablations}.
+
+\para{Training setup.}
+For the encoder, we use the ViT-g model variant with 40 layers on a spatio-temporal patch size of $2{\times}16{\times}16$.
+This encoder and our 8-layer cross-attention decoder contain 1\,B and 144\,M parameters, respectively.
+Our training mixture contains public and internal datasets including
+BlendedMVS~\cite{yao2020blendedmvs},
+Co3Dv2~\cite{reizenstein2021common},
+Dynamic Replica~\cite{karaev2023dynamicstereo},
+Kubric~\cite{movi-e},
+MVS-Synth~\cite{DeepMVS},
+PointOdyssey~\cite{PointOdyssey}, ScanNet++~\cite{yeshwanthliu2023scannetpp},
+ScanNet~\cite{dai2017scannet},
+Tartanair~\cite{tartanair2020iros},
+VirtualKitti~\cite{virtual_kitti}, and
+Waymo Open~\cite{Sun_2020_CVPR}.
+We train on 48-frame clips at $256{\times}256$ resolution, decoding 2048 random queries that are oversampled on specific regions for more efficient training
+, see the appendix for details.
+The model is trained for 500\,k steps using the AdamW optimizer~\cite{adam, adamw} with a local batch size of 1 across 64 TPU chips, taking a total of just over 2 days to complete.
+
+\input{figs/fps}
+\input{tabs/3d_tracking}
+
+
+\subsection{Qualitative Analysis}
+\label{sec:exp:qualitative}
+
+We begin our evaluations by inspecting video reconstruction quality in \cref{fig:point_cloud_vis}.
+Dynamic objects (\eg, swan and train) reveal qualitative differences, highlighting performance gaps between different methods.
+Pure reconstruction methods (see \cref{sec:related:recon}), exemplified by the state-of-the-art models MegaSaM and $\pi^3$, fail to understand dynamics in the scenes, producing either repeated images of the entities as they move through the scene, or failing to reconstruct them altogether.
+Conversely, tracking-based models successfully reconstruct and track dynamics.
+However, they commonly only track points from one frame, leaving gaps in the reconstruction in all areas that are occluded in the first frame as seen for SpatialTrackerV2~\cite{xiao2025spatialtrackerv2} here.
+Meanwhile, \name is able to track all dynamic pixels of the video in a unified reference frame.
+We further evaluate our method on diverse in-the-wild videos in \cref{fig:ours_vis}, demonstrating its performance to both static and dynamic scenes.
+
+
+\subsection{\task}
+\label{sec:exp:4d}
+
+\input{tabs/video_depth}
+
+We now turn to the quantitative evaluation of \task, comparing \name to other methods that can estimate dynamic correspondences.
+We evaluate on TAPVid-3D~\cite{koppula2024tapvid} which is comprised of three subsets of real-world videos in challenging settings.
+
+We first evaluate 3D tracking in the local camera frame using the standard protocol from \citet{koppula2024tapvid}, which measures a model's ability to predict and track the 3D position of every observed point in the \emph{local} camera reference frames.
+We report standard 3D tracking metrics \emph{Average percent of points within delta error} $\text{APD}_{3D}$, \emph{Occlusion Accuracy} (OA) and \emph{3D Average Jaccard} (AJ).
+As shown in \cref{tab:3d_track} (left), \name achieves state-of-the-art results against competing methods, both with and without known ground-truth intrinsics.
+
+\cref{tab:3d_track} (right) shows results for \emph{world coordinate 3D tracking}.
+This task measures a model's ability to predict tracks within a single, consistent world coordinate system, thereby also measuring the models' ability to implicitly change reference frames.
+PStudio is omitted here as it has no camera motion, rendering this task effectively identical to the preceding one.
+Since there is no concept of occlusion for this task, we report $\text{APD}_{3D}$ as well as the L1 distance between the predicted and ground-truth tracks which provides a comprehensive, global measure of deviation.
+We observe that our model excels at this task as well, exhibiting strong improvements across metrics.
+
+We finally compare efficiency in
+\cref{tab:fps}, by counting the number of tracks each model can produce for a given target frame-per-second rate (FPS).
+The measurements show that our model is 18-300$\times$ faster than prior methods.
+
+\input{tabs/camera_pose}
+
+\subsection{3D Reconstruction}
+\label{sec:exp:3d}
+
+We now evaluate the 3D reconstruction capabilities of our model.
+The most holistic task here is 3D point cloud reconstruction, which requires predicting all observed pixels in the same world coordinate system.
+
+We evaluate on two standard benchmarks: MPI Sintel~\cite{bulter2012sintel} and ScanNet~\cite{scannet}, which consist of dynamic and static scenes, respectively.
+For evaluation, we first align the predicted and ground-truth point clouds via mean-shifting following \citet{li2025megasam} before reporting the mean L1 distance.
+As shown in \cref{tab:depth} (left), our model outperforms all recent state-of-the-art models across datasets.
+
+
+
+\para{Depth estimation.}
+We evaluate depth estimation performance across four datasets: Sintel~\cite{bulter2012sintel},
+ScanNet~\cite{scannet},
+KITTI~\cite{kitti2013}, and
+Bonn~\cite{Bonn2019}.
+Following prior works~\cite{li2025megasam, wang2025cut3r}, we align the predicted video depth with the ground-truth depth before computing metrics.
+Specifically, we adopt two alignment settings:
+\emph{scale-only} (S) and \emph{scale-and-shift} (SS) alignment.
+Both settings determine a single global scale factor between the predicted and ground-truth depths across the sequence, while the latter introduces an additional 3D translation term, following an affine-invariant setup.
+After alignment, we compute the \emph{Absolute Relative Error} (AbsRel)~\cite{AbsRelErr} between the predicted and ground-truth depths.
+
+
+
+
+We show results in \cref{tab:depth} (right).
+\name achieves top-tier performance across all benchmarks, with particularly strong results on Sintel which is the most challenging dataset due to its highly dynamic scenes.
+
+
+
+\para{Camera pose estimation.}
+We evaluate camera pose estimation performance on the same datasets.
+Following prior work~\cite{wang2025cut3r, jiang2025geo4d}, we evaluate on the $14$-sequence subset of Sintel which provides full rendering with motion blur and atmospheric effects to measure in-the-wild performance.
+We report the \emph{Absolute Translation Error} (ATE), \emph{Relative Translation Error} (RPE trans), and \emph{Relative Rotation Error} (RPE rot) after Sim(3) alignment with the ground truth as in \cite{zhang2024monst3r, wang2025cut3r, wang2025pi}, as well as the \emph{Pose AUC@$30$} as in \cite{wang2025vggt}.
+\cref{tab:camera} presents the results, where our model strongly outperforms competing baselines on both indoor scenes (ScanNet and Re10K) and simulated outdoor scenes (Sintel).
+
+
+
+
+\cref{fig:speed} visualizes efficiency and accuracy for camera pose estimation across several recent state-of-the-art methods.
+To ensure a fair comparison, we remove the decoding heads of the baselines which are unrelated to camera estimation, making them faster.
+Despite this, we find that \name surpasses all existing methods in both accuracy and efficiency, notably outperforming MegaSaM in throughput by two orders of magnitude.
+
+\subsection{Ablation Studies}
+\label{sec:exp:ablations}
+
+We present a series of ablation studies to validate our design choices and hyperparameters.
+Unless otherwise noted, we adopt a ViT-L backbone with $6$ decoder layers as the default setting.
+The model is trained for 300\,k iterations with a batch size 16.
+All results are reported on the challenging Sintel dataset for both video depth and camera pose.
+
+
+\input{figs/ablation_source_patch}
+\input{tabs/ablation_source_patch}
+
+
+\para{Local RGB patch.}
+As described in \cref{sec:method:architecture}, we introduce an additional embedding that encodes the local appearance around the query's source location.
+This additional embedding yields dramatic performance improvements as shown in \cref{tab:abla_source_patch} and \cref{fig:ablation_source_patch}. These improvements can be attributed to two factors: (i) the local appearance information helps the query establish more reliable correspondences with the encoded spatiotemporal features; and (ii) these patches provide low-level cues that help to segment objects from their surroundings, leading to fine-grained predictions, as exemplified by the sharper depth estimates. We note that while most related works have specialized modules to preserve low level details, such as DPT~\cite{Ranftl2021} with its skip connections between encoder and decoder layers, our approach is much simpler.
+In \cref{sec:app:high-res} of the appendix, we further highlight how the patches unlock subpixel precision.
+
+
+\para{Encoder size.}
+We now examine how performance scales with the size of our encoder.
+\cref{tab:abla_model_size} summarizes our findings for ViT-B (90\,M) to ViT-g (1\,B).
+As the number of trainable parameters increases, we observe a significant performance improvement, particularly in depth estimation and RPE-R in camera pose estimation.
+
+\input{tabs/ablation_loss}
+\input{tabs/ablation_model_size}
+
+\para{Auxiliary losses.}
+We finally investigate the contribution of each auxiliary loss in \cref{tab:ablation_loss}.
+We observe a range of behaviors acros the auxiliary losses:
+some significantly boost depth performance (\eg, 2D position, normal), others are critical for better camera pose estimation (\eg, confidence), and displacement has small improvements across the board.

@@ -1,0 +1,35 @@
+\section{Introduction}
+\label{sec:intro}
+
+Traditional 3D reconstruction asks:
+\emph{`What is the geometry of everything, everywhere, \underline{all at once}?'}
+We argue this exhaustive, rigid approach is fundamentally ill-equipped for a dynamic world.
+Despite the clear need for unified 4D understanding, leading approaches often tackle the problem by dividing it into discrete, task-specific components.
+\blfootnote{
+\textsuperscript{1}Work was done during an internship at Google DeepMind.\\
+\textsuperscript{2}Correspondence: \url{d4rt@msajjadi.com}\\
+\textsuperscript{3}Project website: \url{https://d4rt-paper.github.io/}
+}
+
+For instance, MegaSaM~\cite{li2025megasam} relies on a complex mosaic of off-the-shelf models to separately estimate mono-depth, metric depth, and motion segmentation.
+Fusing these disparate signals requires computationally expensive test-time optimization to enforce geometric consistency.
+Recent feedforward approaches such as VGGT~\cite{wang2025vggt} employ separate, specialized decoders for distinct modalities.
+Crucially, neither of these methods is capable of establishing correspondences for \emph{dynamic} portions of the scene.
+While SpatialTrackerV2~\cite{xiao2025spatialtrackerv2} incorporates dynamics, it still lacks a unified, single-stage formulation, instead relying on costly iterative refinement.
+\input{figs/teaser}
+\input{figs/method}
+
+We propose shifting the paradigm from fragmented, frame-level decoding to efficient, on-demand querying.
+We introduce \name, a feedforward method leveraging a flexible and scalable architecture to achieve full 4D reconstruction.
+As shown in \cref{fig:teaser}, our model first encodes the input video, generating a latent scene representation which is then used to independently decode any number of spatio-temporal point queries.
+This simple, novel design unifies all 4D reconstruction tasks into a single interface and unlocks efficient training and inference.
+
+
+\noindent Our key contributions are as follows:
+\begin{itemize}
+    \item We propose \name, a novel method for efficient feedforward querying of point-level 4D scene information captured in a video.
+    \item We demonstrate how our unified approach unlocks 4D correspondence, point clouds, depth maps, and camera parameters for both static and dynamic scenes through a single interface.
+    \item In an extensive set of experiments, we show that \name sets a new state of the art in
+    \emph{Dynamic 4D Reconstruction and Tracking} while outperforming existing approaches in both speed and accuracy.
+    \item Finally, we demonstrate how our flexible decoder unlocks an efficient algorithm to track all pixels in a video, enabling dense, holistic scene reconstruction.
+\end{itemize}

@@ -31,9 +31,8 @@ bash train.sh \
   --t-tgt-eq-t-cam-ratio 0.4 \
   --amp \
   --no-gradient-checkpointing \
-  --skip-pointodyssey-sanity
-
-  --resume outputs_allVal_augs/test512_load=%40_lossPaper/full_main/checkpoint_epoch_0100.pth  
+  --skip-pointodyssey-sanity \
+  --resume /data1/zbf/my_dfrt/outputs_all_augs/256_lossPaper/full_main/checkpoint_epoch_1580.pth
 
 
 
@@ -43,5 +42,10 @@ bash train.sh \
   --workers 16
 
 
-  pip install huggingface_hub                                                                                                                                       
-  huggingface-cli download MCG-NJU/videomae-base --local-dir /data1/zbf/pretrained/videomae-base  
+python visualize_tracks.py \
+  --checkpoint /data1/zbf/my_dfrt/outputs_all_augs/256_lossPaper/full_main/checkpoint_latest.pth \
+  --output-dir outputs_all_augs/256_lossPaper/gif \
+  --split val \
+  --sequence ani1_new_f \
+  --num-queries 256 \
+  --source-mode fixed 

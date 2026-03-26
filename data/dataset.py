@@ -713,6 +713,8 @@ class PointOdysseyDataset(Dataset):
         if suffix == ".npy":
             normal = np.load(io.BytesIO(encoded.tobytes())).astype(np.float32)
             return normal
+        if len(encoded) == 0:
+            raise ValueError(f"Empty encoded buffer for frame {frame_pos}")
         normal = cv2.imdecode(encoded, cv2.IMREAD_UNCHANGED)
         if normal is None:
             raise ValueError(f"Failed to decode normal frame {frame_pos} from encoded cache")
@@ -725,7 +727,11 @@ class PointOdysseyDataset(Dataset):
         if not is_valid:
             height, width = fallback_shape
             return np.zeros((height, width, 3), dtype=np.float32), False
-        return self._load_normal_from_encoded_cache(cache_entry, frame_pos, suffix), True
+        try:
+            return self._load_normal_from_encoded_cache(cache_entry, frame_pos, suffix), True
+        except (ValueError, cv2.error):
+            height, width = fallback_shape
+            return np.zeros((height, width, 3), dtype=np.float32), False
 
     def _sample_stride(self, total_frames, py_rng):
         if self.strides is None:
@@ -890,30 +896,6 @@ class PointOdysseyDataset(Dataset):
         motion_boundary_masks=None,
     ):
         num_frames, num_points, _ = clip_trajs_2d.shape
-        coords_uv = torch.zeros((self.num_queries, 2), dtype=torch.float32)
-        t_src = torch.zeros((self.num_queries,), dtype=torch.long)
-        t_tgt = torch.zeros((self.num_queries,), dtype=torch.long)
-        
-        # [DEBUG OVERFIT] If we are overfitting to a single video and evaluating,
-        # we should make sure the test queries match exactly what the model was trained on!
-        # The model is trained with target_2d normalized to [-1, 1].
-        pass
-        
-        t_cam = torch.zeros((self.num_queries,), dtype=torch.long)
-        target_pos_2d = torch.zeros((self.num_queries, 2), dtype=torch.float32)
-        target_pos_3d = torch.zeros((self.num_queries, 3), dtype=torch.float32)
-        target_vis = torch.zeros((self.num_queries,), dtype=torch.float32)
-        target_disp = torch.zeros((self.num_queries, 3), dtype=torch.float32)
-        target_normal = torch.zeros((self.num_queries, 3), dtype=torch.float32)
-        mask_3d = torch.zeros((self.num_queries,), dtype=torch.bool)
-        mask_2d = torch.zeros((self.num_queries,), dtype=torch.bool)
-        mask_disp = torch.zeros((self.num_queries,), dtype=torch.bool)
-        mask_normal = torch.zeros((self.num_queries,), dtype=torch.bool)
-        mask_vis = torch.zeros((self.num_queries,), dtype=torch.bool)
-        source_is_boundary = torch.zeros((self.num_queries,), dtype=torch.bool)
-        source_is_depth_boundary = torch.zeros((self.num_queries,), dtype=torch.bool)
-        source_is_motion_boundary = torch.zeros((self.num_queries,), dtype=torch.bool)
-        point_indices = torch.zeros((self.num_queries,), dtype=torch.long)
 
         depth_boundary_masks = [self._compute_boundary_mask(depth) for depth in depth_frames]
         if self.use_motion_boundaries:
@@ -971,106 +953,124 @@ class PointOdysseyDataset(Dataset):
         # It's often implemented as a separate task or mixed in.
         # Given the current structure, we implement the Temporal Sampling Mix (Group A/B) per query.
 
-        for query_idx in range(self.num_queries):
-            source_frame = py_rng.choice(valid_source_frames)
-            
-            if self.query_mode == "same_frame":
-                target_frame = source_frame
-                camera_frame = source_frame
-            elif self.query_mode == "target_cam":
-                target_frame = py_rng.randint(0, num_frames - 1)
-                camera_frame = target_frame
+        N = self.num_queries
+        valid_src_frames_arr = np.array(valid_source_frames, dtype=np.int64)
+
+        # ── 1. Generate all source / target / camera frames at once ──────────────
+        src_frames = np_rng.choice(valid_src_frames_arr, size=N)  # (N,)
+
+        if self.query_mode == "same_frame":
+            tgt_frames = src_frames.copy()
+            cam_frames = src_frames.copy()
+        elif self.query_mode == "target_cam":
+            tgt_frames = np_rng.choice(num_frames, size=N)
+            cam_frames = tgt_frames.copy()
+        else:
+            tgt_frames = np_rng.choice(num_frames, size=N)
+            if self.t_tgt_eq_t_cam_ratio >= 1.0:
+                cam_frames = tgt_frames.copy()
             else:
-                # D4RT Paper: Temporal Sampling - Pattern Mixing
-                # Group A (40%): t_tgt = t_cam
-                # Group B (60%): t_tgt != t_cam (random)
-                
-                # [OVERFIT MODIFICATION] Allow user to force t_tgt == t_cam via a parameter or hardcode for now
-                # If t_tgt_eq_t_cam_ratio is >= 1.0, we always force t_tgt == t_cam
-                if self.t_tgt_eq_t_cam_ratio >= 1.0 or py_rng.random() < self.t_tgt_eq_t_cam_ratio:
-                    target_frame = py_rng.randint(0, num_frames - 1)
-                    camera_frame = target_frame
-                else:
-                    target_frame = py_rng.randint(0, num_frames - 1)
-                    camera_frame = py_rng.randint(0, num_frames - 1)
+                use_same_cam = np_rng.random(size=N) < self.t_tgt_eq_t_cam_ratio
+                cam_frames_alt = np_rng.choice(num_frames, size=N)
+                cam_frames = np.where(use_same_cam, tgt_frames, cam_frames_alt)
 
-            src_points = clip_trajs_2d[source_frame]
-            valid_src = valid_sources_by_frame[source_frame]
-            boundary_candidates = boundary_sources_by_frame[source_frame]
+        # ── 2. Point selection – group by source_frame (~S iterations) ���──────────
+        use_bnd_mask = np_rng.random(size=N) < self.boundary_ratio  # (N,)
+        pt_indices_np = np.empty(N, dtype=np.int64)
 
-            # D4RT Paper: Spatial Sampling - Boundary Oversampling (30%)
-            # 30% queries from boundaries (depth or motion), 70% random
-            if len(boundary_candidates) > 0 and py_rng.random() < self.boundary_ratio:
-                point_idx = int(np_rng.choice(boundary_candidates))
-            else:
-                point_idx = int(np_rng.choice(valid_src))
+        for sf in np.unique(src_frames):
+            mask = src_frames == sf
+            q_idxs = np.where(mask)[0]
+            valid_src = valid_sources_by_frame[sf]
+            bnd_cands = boundary_sources_by_frame[sf]
+            wants_bnd = use_bnd_mask[q_idxs] & (len(bnd_cands) > 0)
 
-            src_xy = clip_trajs_2d[source_frame, point_idx]
-            tgt_xy = clip_trajs_2d[target_frame, point_idx]
-            src_px = int(np.clip(np.round(src_xy[0]), 0, crop_w - 1))
-            src_py = int(np.clip(np.round(src_xy[1]), 0, crop_h - 1))
-            source_is_boundary[query_idx] = bool(boundary_masks[source_frame][src_py, src_px])
-            source_is_depth_boundary[query_idx] = bool(depth_boundary_masks[source_frame][src_py, src_px])
-            source_is_motion_boundary[query_idx] = bool(motion_boundary_masks[source_frame][src_py, src_px])
-            target_defined = bool(clip_valid[target_frame, point_idx] > 0.5)
-            tgt_in_bounds = (
-                tgt_xy[0] >= 0.0
-                and tgt_xy[0] < crop_w
-                and tgt_xy[1] >= 0.0
-                and tgt_xy[1] < crop_h
-            )
-            vis_flag = bool(target_defined and clip_vis[target_frame, point_idx] > 0.5 and tgt_in_bounds)
+            bnd_q = q_idxs[wants_bnd]
+            if len(bnd_q) > 0:
+                pt_indices_np[bnd_q] = np_rng.choice(bnd_cands, size=len(bnd_q))
 
-            src_world = clip_world_3d[source_frame, point_idx]
-            tgt_world = clip_world_3d[target_frame, point_idx]
+            nbnd_q = q_idxs[~wants_bnd]
+            if len(nbnd_q) > 0:
+                pt_indices_np[nbnd_q] = np_rng.choice(valid_src, size=len(nbnd_q))
 
-            src_cam_h = clip_extrinsics[camera_frame] @ np.concatenate([src_world, [1.0]], axis=0)
-            tgt_cam_h = clip_extrinsics[camera_frame] @ np.concatenate([tgt_world, [1.0]], axis=0)
-            src_cam = src_cam_h[:3].astype(np.float32)
-            tgt_cam = tgt_cam_h[:3].astype(np.float32)
+        # ── 3. Batch coordinate lookups ───────────────────────────────────────────
+        src_xy = clip_trajs_2d[src_frames, pt_indices_np]   # (N, 2)
+        tgt_xy = clip_trajs_2d[tgt_frames, pt_indices_np]   # (N, 2)
 
-            coords_uv[query_idx, 0] = float(src_xy[0] / max(crop_w - 1, 1))
-            coords_uv[query_idx, 1] = float(src_xy[1] / max(crop_h - 1, 1))
-            t_src[query_idx] = source_frame
-            t_tgt[query_idx] = target_frame
-            t_cam[query_idx] = camera_frame
+        src_px_arr = np.clip(np.round(src_xy[:, 0]).astype(np.int32), 0, crop_w - 1)
+        src_py_arr = np.clip(np.round(src_xy[:, 1]).astype(np.int32), 0, crop_h - 1)
+        tgt_px_arr = np.clip(np.round(tgt_xy[:, 0]).astype(np.int32), 0, crop_w - 1)
+        tgt_py_arr = np.clip(np.round(tgt_xy[:, 1]).astype(np.int32), 0, crop_h - 1)
 
-            target_pos_2d[query_idx, 0] = float(tgt_xy[0] / max(crop_w - 1, 1))
-            target_pos_2d[query_idx, 1] = float(tgt_xy[1] / max(crop_h - 1, 1))
-            target_pos_3d[query_idx] = torch.from_numpy(tgt_cam)
-            target_vis[query_idx] = float(vis_flag)
-            target_disp[query_idx] = torch.from_numpy(tgt_cam - src_cam)
-            point_indices[query_idx] = point_idx
+        # ── 4. Boundary lookups (stack once, fancy-index) ─────────────────────────
+        bnd_stack  = np.stack(boundary_masks,       axis=0)  # (S, H, W) bool
+        dbnd_stack = np.stack(depth_boundary_masks, axis=0)  # (S, H, W) bool
+        mbnd_stack = np.stack(motion_boundary_masks, axis=0) # (S, H, W) bool
 
-            if vis_flag and normal_valid_frames[target_frame]:
-                x = int(np.clip(round(float(tgt_xy[0])), 0, crop_w - 1))
-                y = int(np.clip(round(float(tgt_xy[1])), 0, crop_h - 1))
-                target_normal[query_idx] = torch.from_numpy(normal_frames[target_frame][y, x].astype(np.float32))
+        src_is_bnd  = bnd_stack [src_frames, src_py_arr, src_px_arr]  # (N,)
+        src_is_dbnd = dbnd_stack[src_frames, src_py_arr, src_px_arr]  # (N,)
+        src_is_mbnd = mbnd_stack[src_frames, src_py_arr, src_px_arr]  # (N,)
 
-            has_valid_3d = bool(target_defined and np.isfinite(src_cam).all() and np.isfinite(tgt_cam).all())
-            has_valid_normal = bool(vis_flag and torch.isfinite(target_normal[query_idx]).all().item())
-            mask_3d[query_idx] = has_valid_3d
-            mask_2d[query_idx] = vis_flag
-            mask_vis[query_idx] = target_defined
-            mask_disp[query_idx] = has_valid_3d
-            mask_normal[query_idx] = has_valid_normal
+        # ── 5. Validity flags ─────────────────────────────────────────────────────
+        target_defined_arr = clip_valid[tgt_frames, pt_indices_np] > 0.5   # (N,)
+        tgt_vis_arr        = clip_vis  [tgt_frames, pt_indices_np] > 0.5   # (N,)
+        tgt_in_bounds_arr  = (
+            (tgt_xy[:, 0] >= 0.0) & (tgt_xy[:, 0] < crop_w) &
+            (tgt_xy[:, 1] >= 0.0) & (tgt_xy[:, 1] < crop_h)
+        )
+        vis_flags = target_defined_arr & tgt_vis_arr & tgt_in_bounds_arr   # (N,)
 
+        # ── 6. Batch 3D transforms (einsum replaces N individual 4×4 matmuls) ─────
+        src_world = clip_world_3d[src_frames, pt_indices_np]  # (N, 3)
+        tgt_world = clip_world_3d[tgt_frames, pt_indices_np]  # (N, 3)
+        ones_col  = np.ones((N, 1), dtype=np.float32)
+        src_world_h = np.concatenate([src_world, ones_col], axis=-1)  # (N, 4)
+        tgt_world_h = np.concatenate([tgt_world, ones_col], axis=-1)  # (N, 4)
+        cam_ext = clip_extrinsics[cam_frames]                          # (N, 4, 4)
+        src_cam = np.einsum('nij,nj->ni', cam_ext, src_world_h)[:, :3].astype(np.float32)  # (N, 3)
+        tgt_cam = np.einsum('nij,nj->ni', cam_ext, tgt_world_h)[:, :3].astype(np.float32)  # (N, 3)
+
+        # ── 7. Normal lookups – grouped by target_frame (≤S iterations) ──────────
+        normal_valid_arr = np.array(normal_valid_frames, dtype=bool)    # (S,)
+        needs_normal     = vis_flags & normal_valid_arr[tgt_frames]      # (N,)
+        target_normal_np = np.zeros((N, 3), dtype=np.float32)
+        if needs_normal.any():
+            for tf in np.unique(tgt_frames[needs_normal]):
+                tm = needs_normal & (tgt_frames == tf)
+                qi = np.where(tm)[0]
+                target_normal_np[qi] = normal_frames[tf][tgt_py_arr[qi], tgt_px_arr[qi]]
+
+        # ── 8. Mask computations ──────────────────────────────────────────────────
+        src_finite = np.isfinite(src_cam).all(axis=-1)   # (N,)
+        tgt_finite = np.isfinite(tgt_cam).all(axis=-1)   # (N,)
+        has_valid_3d = target_defined_arr & src_finite & tgt_finite
+
+        target_normal_t  = torch.from_numpy(target_normal_np)
+        has_valid_normal = needs_normal & torch.isfinite(target_normal_t).all(dim=-1).numpy()
+
+        # ── 9. Assemble output tensors ────────────────────────────────────────────
+        cw1 = max(crop_w - 1, 1)
+        ch1 = max(crop_h - 1, 1)
         targets = {
-            "pos_2d": target_pos_2d,
-            "pos_3d": target_pos_3d,
-            "visibility": target_vis,
-            "displacement": target_disp,
-            "normal": target_normal,
-            "mask_3d": mask_3d,
-            "mask_2d": mask_2d,
-            "mask_vis": mask_vis,
-            "mask_disp": mask_disp,
-            "mask_normal": mask_normal,
-            "source_is_boundary": source_is_boundary,
-            "source_is_depth_boundary": source_is_depth_boundary,
-            "source_is_motion_boundary": source_is_motion_boundary,
-            "point_indices": point_indices,
+            "pos_2d":                   torch.from_numpy(np.stack([tgt_xy[:, 0] / cw1, tgt_xy[:, 1] / ch1], axis=-1).astype(np.float32)),
+            "pos_3d":                   torch.from_numpy(tgt_cam),
+            "visibility":               torch.from_numpy(vis_flags.astype(np.float32)),
+            "displacement":             torch.from_numpy((tgt_cam - src_cam)),
+            "normal":                   target_normal_t,
+            "mask_3d":                  torch.from_numpy(has_valid_3d),
+            "mask_2d":                  torch.from_numpy(vis_flags),
+            "mask_vis":                 torch.from_numpy(target_defined_arr),
+            "mask_disp":                torch.from_numpy(has_valid_3d),
+            "mask_normal":              torch.from_numpy(has_valid_normal),
+            "source_is_boundary":       torch.from_numpy(src_is_bnd),
+            "source_is_depth_boundary": torch.from_numpy(src_is_dbnd),
+            "source_is_motion_boundary":torch.from_numpy(src_is_mbnd),
+            "point_indices":            torch.from_numpy(pt_indices_np),
         }
+        coords_uv   = torch.from_numpy(np.stack([src_xy[:, 0] / cw1, src_xy[:, 1] / ch1], axis=-1).astype(np.float32))
+        t_src       = torch.from_numpy(src_frames.astype(np.int64))
+        t_tgt       = torch.from_numpy(tgt_frames.astype(np.int64))
+        t_cam       = torch.from_numpy(cam_frames.astype(np.int64))
 
         return coords_uv, t_src, t_tgt, t_cam, targets
 
@@ -1343,14 +1343,14 @@ class PointOdysseyDataset(Dataset):
             resized_depths = torch.zeros((self.S, 1, self.img_size, self.img_size), dtype=torch.float32)
             resized_normals = torch.zeros((self.S, 3, self.img_size, self.img_size), dtype=torch.float32)
 
-            for frame_idx in range(self.S):
-                rgb_resized = cv2.resize(rgb_frames[frame_idx], (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
-                depth_resized = cv2.resize(depth_frames[frame_idx], (self.img_size, self.img_size), interpolation=cv2.INTER_NEAREST)
-                normal_resized = cv2.resize(normal_frames[frame_idx], (self.img_size, self.img_size), interpolation=cv2.INTER_LINEAR)
+            # 批量resize：torch比cv2循环快4倍
+            rgb_stack = torch.from_numpy(np.stack(rgb_frames)).permute(0, 3, 1, 2)
+            depth_stack = torch.from_numpy(np.stack(depth_frames)).unsqueeze(1)
+            normal_stack = torch.from_numpy(np.stack(normal_frames)).permute(0, 3, 1, 2)
 
-                resized_video[frame_idx] = torch.from_numpy(rgb_resized).permute(2, 0, 1)
-                resized_depths[frame_idx] = torch.from_numpy(depth_resized).unsqueeze(0)
-                resized_normals[frame_idx] = torch.from_numpy(normal_resized).permute(2, 0, 1)
+            resized_video = F.interpolate(rgb_stack, size=(self.img_size, self.img_size), mode='bilinear', align_corners=False)
+            resized_depths = F.interpolate(depth_stack, size=(self.img_size, self.img_size), mode='nearest')
+            resized_normals = F.interpolate(normal_stack, size=(self.img_size, self.img_size), mode='bilinear', align_corners=False)
 
             coords_uv, t_src, t_tgt, t_cam, targets = self._sample_query_data(
                 clip_trajs_2d=clip_trajs_2d,

@@ -1,0 +1,20 @@
+ 用法：                                                                                                                                                                                        
+❯ # 基本用法（ani 序列，默认 100k steps，bs=4）
+  CUDA_VISIBLE_DEVICES=4 BATCH_SIZE=10 DATASET_REPEAT_FACTOR=1000 PRETRAINED_WEIGHTS=/data1/zbf/my_dfrt/outputs_single_scene/an/full_main/checkpoint_epoch_0920.pth OUTPUT_ROOT=outputs_single_scene/an bash train_single_scene.sh ani --disable-train-augs                                                                                                                                                   
+
+
+
+  # 短序列 + 高 repeat factor（过拟合测试）                                                                                                                                                     
+  DATASET_REPEAT_FACTOR=64 bash train_single_scene.sh ani13_new_                                                                                                                                
+                                                                                                                                                                                                
+  # 关增强的快速过拟合实验                                                                                                                                                                      
+  STEPS=20000 bash train_single_scene.sh ani --disable-train-augs                                                                                                                               
+                                                                                                                                                                                                
+  # 指定 GPU                                                                                                                                                                                    
+  CUDA_VISIBLE_DEVICES=5 bash train_single_scene.sh ani                                                                                                                                         
+                                                                                                                                                                                                
+  # 自定义输出目录
+  OUTPUT_ROOT=outputs_debug/ani bash train_single_scene.sh ani --steps 5000                                                                                                                     
+                                                                                                                                                                                                
+  所有 STEPS、BATCH_SIZE、DATASET_REPEAT_FACTOR 等都可以通过环境变量覆盖，额外的 train.sh 参数直接跟在序列名后面传入。                                                                          
+                                                                                                                        

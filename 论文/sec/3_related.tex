@@ -1,0 +1,41 @@
+\input{tabs/capabilities}
+
+\input{figs/speed}
+
+\section{Related Work}
+\label{sec:related}
+
+Classical approaches to 3D reconstruction are fundamentally anchored in multi-view geometry, specifically Structure-from-Motion (SfM)~\cite{hartley2003multiple, oliensis2000critique} and Multi-View Stereo (MVS)~\cite{furukawa2015stereo,schonberger2016pixelwise}.
+The standard pipeline exemplified by COLMAP~\cite{schonberger2016structure} incrementally estimates and optimizes sparse geometry and camera poses.
+The advantage of these methods is their explicit enforcement of geometric consistency and mathematically interpretable reconstructions.
+However, they are computationally intensive and brittle.
+
+\subsection{Feedforward 3D Reconstruction}
+\label{sec:related:recon}
+The field of 3D reconstruction has recently shifted towards end-to-end, feedforward models that directly infer geometry from images.
+The seminal work DUSt3R~\cite{wang2024dust3r} 
+demonstrated that Transformer-based networks~\cite{AttentionIsAllYouNeed} can perform 3D reconstruction from unposed and uncalibrated image pairs in an end-to-end approach.
+VGGT~\cite{wang2025vggt} later scaled this approach beyond pairs by using a Vision Transformer~\cite{dosovitskiy2021} with global attention.
+Building on this feedforward paradigm, several works have extended the methodology to dynamic videos~\cite{zhang2024monst3r, wang2025cut3r, wang2025c4d, chen2025easi3r} and more efficient inference~\cite{wang2025pi, yang2025fast3r}.
+However, these models share significant limitations.
+For instance, many do not support changing camera intrinsics within a video~\cite{wang2025pi, wang2025vggt, li2025megasam}, and several are restricted to using only the first frame as the camera reference~\cite{wang2024dust3r,li2025megasam, wang2025cut3r}.
+More importantly, architectures inspired by VGGT~\cite{wang2025vggt} either use separate decoder heads for each task~\cite{zhang2024monst3r, wang2025cut3r, wang2025pi} (\eg, depth, pose, point cloud), or they incorporate separate models for sub-tasks of 4D reconstruction~\cite{wang2025c4d,lu2025align3r, sucar2025dynamic}, making the full pipeline cumbersome and computationally expensive to run.
+Finally, these methods are not directly capable of providing correspondences for dynamic regions of the scene.
+
+
+\input{figs/point_cloud_vis}
+
+
+\subsection{From 2D to 3D Point Tracking}
+\label{sec:related:tracking}
+
+The task of point tracking aims to establish long-term 2D correspondences through challenges like occlusions and non-rigid motion, evolving from early methods such as Particle Video~\cite{sand2008particle} to newer deep-learning approaches~\cite{harley2022particle, doersch2022tap, doersch2023tapir, zholus2025tapnext}.
+This field has further progressed from tracking a sparse set of points to the dense tracking of every pixel in a video~\cite{le2024dot, ngo2024delta, harley2025alltracker}.
+A parallel line of work has explored lifting these 2D tracks into 3D, which is achieved by projecting tracks from image space to camera coordinates using ground truth or predicted depth and camera intrinsics~\cite{koppula2024tapvid}.
+
+\input{figs/main_ours_vis}
+
+
+Most recently, models like SpatialTracker~\cite{xiao2024spatialtracker, xiao2025spatialtrackerv2}, L4P~\cite{badki2026l4p}, DPM~\cite{sucar2025dynamic} and St4RTracker~\cite{feng2025st4rtrack} have moved to directly predicting 3D tracks without priors. Yet, limitations remain: St4RTracker~\cite{feng2025st4rtrack} and DPM~\cite{sucar2025dynamic} follow the pairwise paradigm of DUSt3R~\cite{wang2024dust3r}, preventing holistic video processing. SpatialTrackerV2~\cite{xiao2025spatialtrackerv2} is a multi-stage approach and exhibits slow inference speeds as it relies on iterative refinements. Meanwhile, L4P~\cite{badki2026l4p} requires different heads for sparse and dense outputs of the same nature (\eg, flow vs. 2D tracking or depth vs. 3D tracking). In contrast, our approach unifies these tasks within a single architecture.
+\cref{tab:capabilities} summarizes capabilities across a recent set of state-of-the-art models.
+

@@ -1,0 +1,16 @@
+\section{Conclusion}
+\label{sec:conclusion}
+
+In this work, we introduce \name, a simple yet highly scalable feedforward network that reconstructs dynamic 4D scenes with temporal correspondence.
+Our core innovation is an efficient, query-based decoder that allows for the independent prediction of any point's 3D position in space and time.
+This flexible parametrization avoids the computational bottlenecks of dense per-frame decoders, enabling inference that scales linearly with the number of points to be reconstructed.
+Crucially, we demonstrate that \name achieves state-of-the-art results across a wide range of 4D tasks including depth,
+point cloud estimation, and 3D point tracking.
+\name demonstrates that scaling to complex, dynamic environments does not require sacrificing precision, offering a unified framework for the next generation of 4D perception.
+
+
+
+\para{Contribution and Acknowledgements.}
+MS led the project, with management support from JZ. MS proposed the SRT-style decoder, and GL proposed local RGB patches and tracking-all-pixels. CZ, GL, IR, and MS contributed to the core model design. LM, SS, IR, and SK designed and created training datasets. CZ, GL, and MS carried out the major implementation, with significant contributions from SK, IR, LM, and JX. CZ drove the model experimentation. Comprehensive evaluations and data pipelines were set up by CZ, GL, SK, IR, LM, JX, SS, and MS. Visualizations were produced by GL, IR and JX. RS, JB, RH, ZG, and AZ provided project support, advising, and guidance.
+
+\noindent We thank a number of colleagues and advisors for making this work possible. We thank Saurabh Saxena, Kaiming He, Carl Doersch, Leonidas Guibas, Noah Snavely, Ben Poole, Joao Carreira, Pauline Luc, Yi Yang,  Howard Huang, Huizhong Chen, Cordelia Schmid for providing advice during the project; Gabriel Brostow, for advising SK during the course of the project and for providing feedback on the manuscript; Relja \mbox{Aran\dj elović} and Maks Ovsjanikov for providing feedback on the manuscript; Ross Goroshin, Tengda Han and Dilara Gokay for their help during early-stage development; Aravindh Mahendran for helping with code reviews; Daniel Duckworth for helping with visualizations and comparisons against baselines; and Alberto García and Jesús Pérez for the invaluable contributions to data generation and collection.

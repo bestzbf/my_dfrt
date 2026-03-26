@@ -78,9 +78,9 @@ class DenseTracker:
         device = video.device
         stride = self.config.spatial_stride
 
-        # Effective dimensions after stride
-        H_eff = H // stride
-        W_eff = W // stride
+        # Effective dimensions after stride (ceil to include edge pixels)
+        H_eff = (H + stride - 1) // stride
+        W_eff = (W + stride - 1) // stride
 
         # Step 1: Compute Global Scene Representation
         if verbose:
@@ -170,19 +170,15 @@ class DenseTracker:
             for i in range(n_sample):
                 for t in range(T):
                     if visible_mask[i, t]:
-                        # Get 2D position at this timestep
-                        u_t = tracks_2d[i, t, 0].clamp(0, 1)
-                        v_t = tracks_2d[i, t, 1].clamp(0, 1)
+                        # Get 2D position at this timestep (raw, no clamp)
+                        px = tracks_2d[i, t, 0].item() * W
+                        py = tracks_2d[i, t, 1].item() * H
 
-                        # Convert to grid indices
-                        x_grid = int((u_t * W).item()) // stride
-                        y_grid = int((v_t * H).item()) // stride
-
-                        x_grid = min(max(x_grid, 0), W_eff - 1)
-                        y_grid = min(max(y_grid, 0), H_eff - 1)
-
-                        # Mark as visited
-                        occupancy_grid[t, y_grid, x_grid] = True
+                        # Only mark visited if prediction falls within image bounds
+                        if 0 <= px < W and 0 <= py < H:
+                            x_grid = int(px) // stride
+                            y_grid = int(py) // stride
+                            occupancy_grid[t, y_grid, x_grid] = True
 
             # Also mark source pixels as visited
             for i in range(n_sample):
@@ -257,8 +253,8 @@ class DenseTracker:
         device = video.device
         stride = self.config.spatial_stride
 
-        H_eff = H // stride
-        W_eff = W // stride
+        H_eff = (H + stride - 1) // stride
+        W_eff = (W + stride - 1) // stride
 
         if verbose:
             print("Encoding video...")
@@ -339,16 +335,15 @@ class DenseTracker:
 
                 for i in range(n_sample):
                     if visible_mask[i, t]:
-                        u_t = pos_2d[i, 0].clamp(0, 1)
-                        v_t = pos_2d[i, 1].clamp(0, 1)
+                        # Get 2D position at this timestep (raw, no clamp)
+                        px = pos_2d[i, 0].item() * W
+                        py = pos_2d[i, 1].item() * H
 
-                        x_grid = int((u_t * W).item()) // stride
-                        y_grid = int((v_t * H).item()) // stride
-
-                        x_grid = min(max(x_grid, 0), W_eff - 1)
-                        y_grid = min(max(y_grid, 0), H_eff - 1)
-
-                        occupancy_grid[t, y_grid, x_grid] = True
+                        # Only mark visited if prediction falls within image bounds
+                        if 0 <= px < W and 0 <= py < H:
+                            x_grid = int(px) // stride
+                            y_grid = int(py) // stride
+                            occupancy_grid[t, y_grid, x_grid] = True
 
             for i in range(n_sample):
                 occupancy_grid[t_src[i], y_idx[i], x_idx[i]] = True

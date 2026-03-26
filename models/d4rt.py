@@ -66,6 +66,8 @@ class D4RT(nn.Module):
              encoder_kwargs["use_timm_init"] = kwargs["use_timm_init"]
         if "use_aspect_ratio_token" in kwargs:
              encoder_kwargs["use_aspect_ratio_token"] = kwargs["use_aspect_ratio_token"]
+        if "pretrained" in kwargs:
+             encoder_kwargs["pretrained"] = kwargs["pretrained"]
 
         # Create encoder
         self.encoder = create_encoder(**encoder_kwargs)
@@ -212,13 +214,18 @@ class D4RT(nn.Module):
         """Predict depth maps for all frames.
 
         Args:
-            video: (B, T, H, W, C) video tensor
+            video: (B, T, H, W, C) or (B, C, T, H, W) video tensor
             aspect_ratio: (B, 1) original width/height ratio, or legacy (B, 2)
             output_resolution: (H, W) output resolution, defaults to video resolution
 
         Returns:
             depth: (B, T, H, W) depth maps
         """
+        # Normalize to (B, T, H, W, C) format
+        if video.dim() == 5 and video.shape[1] == 3:
+            # (B, C, T, H, W) -> (B, T, H, W, C)
+            video = video.permute(0, 2, 3, 4, 1)
+
         B, T, H, W, C = video.shape
 
         if output_resolution is None:
@@ -272,7 +279,7 @@ class D4RT(nn.Module):
         """Predict 3D point tracks through the video.
 
         Args:
-            video: (B, T, H, W, C) video tensor
+            video: (B, T, H, W, C) or (B, C, T, H, W) video tensor
             query_points: (B, N, 2) query point coordinates in [0, 1]
             query_frames: (B, N) source frame indices for each query point
             aspect_ratio: (B, 1) original width/height ratio, or legacy (B, 2)
@@ -283,6 +290,11 @@ class D4RT(nn.Module):
                 - tracks_2d: (B, N, T, 2) 2D positions at each timestep
                 - visibility: (B, N, T) visibility at each timestep
         """
+        # Normalize to (B, T, H, W, C) format
+        if video.dim() == 5 and video.shape[1] == 3:
+            # (B, C, T, H, W) -> (B, T, H, W, C)
+            video = video.permute(0, 2, 3, 4, 1)
+
         B, T, H, W, C = video.shape
         N = query_points.shape[1]
         device = video.device
@@ -391,13 +403,15 @@ class D4RT(nn.Module):
 def create_d4rt(
     variant: str = 'base',
     pretrained: bool = False,
+    encoder_pretrained: bool = True,
     **kwargs
 ) -> D4RT:
     """Create D4RT model with predefined configurations.
 
     Args:
         variant: One of 'base', 'large', 'huge', 'giant'
-        pretrained: Whether to load pretrained weights
+        pretrained: Whether to load full D4RT pretrained weights (not implemented)
+        encoder_pretrained: Whether encoder uses pretrained weights (VideoMAE/timm)
         **kwargs: Additional arguments passed to D4RT
 
     Returns:
@@ -412,6 +426,11 @@ def create_d4rt(
 
     config = decoder_configs.get(variant, decoder_configs['base'])
     config['encoder_variant'] = variant
+
+    # Pass encoder_pretrained to encoder creation
+    if 'pretrained' not in kwargs:
+        kwargs['pretrained'] = encoder_pretrained
+
     config.update(kwargs)
 
     model = D4RT(**config)

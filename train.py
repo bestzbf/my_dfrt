@@ -1140,7 +1140,7 @@ def load_checkpoint(
     )
 
 
-def load_pretrained_weights(checkpoint_path, model, is_main=False):
+def load_pretrained_weights(checkpoint_path, model, is_main=False, drop_conf_head=False):
     """Load model weights only, without optimizer/scheduler state."""
     if not checkpoint_path:
         return False
@@ -1151,7 +1151,8 @@ def load_pretrained_weights(checkpoint_path, model, is_main=False):
 
     checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
     state_dict = normalize_state_dict_keys(extract_state_dict(checkpoint))
-    _drop_confidence_head_weights(state_dict, is_main=is_main, context="pretrained")
+    if drop_conf_head:
+        _drop_confidence_head_weights(state_dict, is_main=is_main, context="pretrained")
 
     target_model = model.module if hasattr(model, "module") else model
     missing, unexpected = target_model.load_state_dict(state_dict, strict=False)

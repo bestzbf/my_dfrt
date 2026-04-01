@@ -11,15 +11,15 @@ python visualize_tracks.py \
 
 
 /root/miniconda3/envs/d4rt/bin/python visualize_tracks2.py \
-  --checkpoint /data1/zbf/my_dfrt/outputs_all_augs/256_lossPaper_load1580/full_main/checkpoint_epoch_1840.pth \
+  --checkpoint /data1/zbf/my_dfrt/outputs_all_augs/256_lossPaper_load2020_con/full/checkpoint_epoch_3240.pth \
   --data-root /data2/d4rt/datasets/PointOdyssey_fast \
   --split train \
-  --sequence ani_new_ \
-  --output-dir outputs_all_augs/ani_new_/tracks2d_3d \
+  --sequence cab_e_3rd \
+  --output-dir outputsall/10/tracks2d_3d \
   --device cuda \
   --num-queries 128 \
-  --source-mode dataset \
-  --source-frame 40 \
+  --source-mode fixed \
+  --source-frame 0 \
   --with-world-pointcloud-gif \
   --with-world-pointcloud-multiview-gif \
   --pointcloud-stride 4 \
@@ -27,6 +27,27 @@ python visualize_tracks.py \
   --pointcloud-uniformization voxel \
   --pointcloud-voxel-size 0.03 
 
+
+
+cd /data1/zbf/my_dfrt && export CUDA_VISIBLE_DEVICES=1 && for seq in ani12_new_f ani14_new_ ani2 anima5_s cab_e_3rd dancingroom1_3rd dancingroom1_3rd1 dancingroom1_3rd2 dancingroom3_3rd egobody_egocentric seminar_g110_0315_3rd seminar_g110_0315_ego1 seminar_g110_0315_ego2; do
+  echo "处理: $seq"
+  /root/miniconda3/envs/d4rt/bin/python visualize_tracks2.py \
+    --checkpoint /data1/zbf/my_dfrt/outputs_all_augs/256_lossPaper_load2020_con/full/checkpoint_epoch_3240.pth \
+    --data-root /data2/d4rt/datasets/PointOdyssey_fast \
+    --split test \
+    --sequence "$seq" \
+    --output-dir outputsall/test/tracks2d_3d \
+    --device cuda \
+    --num-queries 128 \
+    --source-mode fixed \
+    --source-frame 0 \
+    --with-world-pointcloud-gif \
+    --with-world-pointcloud-multiview-gif \
+    --pointcloud-stride 4 \
+    --pointcloud-chunk-size 8192 \
+    --pointcloud-uniformization voxel \
+    --pointcloud-voxel-size 0.03
+done
 
 
 
@@ -141,3 +162,12 @@ CUDA_VISIBLE_DEVICES=0 python visualize_tracks.py \
 
 
 
+ 3D点云动画
+
+cd /data1/zbf/my_dfrt
+python visualize_gt_tracks_direct.py --num-samples 5 --clip-len 24 --max-tracks 200 --trail-len 15 --max-stride 4
+
+
+ 2D轨迹
+cd /data1/zbf/my_dfrt
+python visualize_3d_tracks.py --num-samples 3 --clip-len 16 --max-tracks 50

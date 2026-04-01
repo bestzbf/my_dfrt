@@ -1,0 +1,38 @@
+[Co3Dv2Adapter] subset='fewview_train', split='train', categories=51, sequences=31834
+[precompute] co3dv2: 31834 sequences → /data2/d4rt/datasets/Co3Dv2
+co3dv2:   0%|          | 0/31834 [00:00<?, ?it/s]/data2/d4rt/code/datasets/computer/depth_to_normals.py:119: RuntimeWarning: invalid value encountered in divide
+  normal = np.where(norm > 1e-6, normal / norm, 0.0).astype(np.float32)
+co3dv2:   0%|          | 1/31834 [00:15<133:33:15, 15.10s/it]/data2/d4rt/code/datasets/computer/depth_to_normals.py:119: RuntimeWarning: invalid value encountered in divide
+  normal = np.where(norm > 1e-6, normal / norm, 0.0).astype(np.float32)
+/data2/d4rt/code/datasets/computer/depth_to_normals.py:119: RuntimeWarning: invalid value encountered in divide
+  normal = np.where(norm > 1e-6, normal / norm, 0.0).astype(np.float32)
+/data2/d4rt/code/datasets/computer/depth_to_normals.py:119: RuntimeWarning: invalid value encountered in divide
+  normal = np.where(norm > 1e-6, normal / norm, 0.0).astype(np.float32)
+/data2/d4rt/code/datasets/computer/depth_to_normals.py:119: RuntimeWarning: invalid value encountered in divide
+  normal = np.where(norm > 1e-6, normal / norm, 0.0).astype(np.float32)
+/data2/d4rt/code/datasets/computer/depth_to_normals.py:119: RuntimeWarning: invalid value encountered in divide
+  normal = np.where(norm > 1e-6, normal / norm, 0.0).astype(np.float32)
+/data2/d4rt/code/datasets/computer/depth_to_normals.py:119: RuntimeWarning: invalid value encountered in divide
+  normal = np.where(norm > 1e-6, normal / norm, 0.0).astype(np.float32)
+/data2/d4rt/code/datasets/computer/depth_to_normals.py:119: RuntimeWarning: invalid value encountered in divide
+  normal = np.where(norm > 1e-6, normal / norm, 0.0).astype(np.float32)
+/data2/d4rt/code/datasets/computer/depth_to_normals.py:119: RuntimeWarning: invalid value encountered in divide
+  normal = np.where(norm > 1e-6, normal / norm, 0.0).astype(np.float32)
+/data2/d4rt/code/datasets/computer/depth_to_normals.py:119: RuntimeWarning: invalid value encountered in divide
+  normal = np.where(norm > 1e-6, normal / norm, 0.0).astype(np.float32)
+/data2/d4rt/code/datasets/computer/depth_to_normals.py:119: RuntimeWarning: invalid value encountered in divide
+  normal = np.where(norm > 1e-6, normal / norm, 0.0).astype(np.float32)
+/data2/d4rt/code/datasets/computer/depth_to_normals.py:119: RuntimeWarning: invalid value encountered in divide
+  normal = np.where(norm > 1e-6, normal / norm, 0.0).astype(np.float32)
+/data2/d4rt/code/datasets/computer/depth_to_normals.py:119: RuntimeWarning: invalid value encountered in divide
+  normal = np.where(norm > 1e-6, normal / norm, 0.0).astype(np.float32)
+/data2/d4rt/code/datasets/computer/depth_to_normals.py:119: RuntimeWarning: invalid value encountered in divide
+  normal = np.where(norm > 1e-6, normal / norm, 0.0).astype(np.float32)
+/data2/d4rt/code/datasets/computer/depth_to_normals.py:119: RuntimeWarning: invalid value encountered in divide
+  normal = np.where(norm > 1e-6, normal / norm, 0.0).astype(np.float32)
+/data2/d4rt/code/datasets/computer/depth_to_normals.py:119: RuntimeWarning: invalid value encountered in divide
+  normal = np.where(norm > 1e-6, normal / norm, 0.0).astype(np.float32)
+co3dv2:   0%|          | 2/31834 [00:23<99:58:50, 11.31s/it] co3dv2:   0%|          | 3/31834 [00:24<58:28:50,  6.61s/it]co3dv2:   0%|          | 4/31834 [00:32<61:13:10,  6.92s/it]/data2/d4rt/code/datasets/computer/depth_to_tracks.py:230: RuntimeWarning: invalid value encountered in cast
+  px = np.clip(np.round(uv_t[:, 0]).astype(np.int32), 0, W - 1)
+co3dv2:   0%|          | 5/31834 [00:37<55:51:30,  6.32s/it]co3dv2:   0%|          | 6/31834 [00:38<39:50:47,  4.51s/it]co3dv2:   0%|          | 7/31834 [00:39<29:50:20,  3.38s/it]co3dv2:   0%|          | 8/31834 [00:41<25:30:44,  2.89s/it]co3dv2:   0%|          | 9/31834 [00:44<26:44:12,  3.02s/it]co3dv2:   0%|          | 10/31834 [00:48<29:24:38,  3.33s/it]co3dv2:   0%|          | 11/31834 [01:01<56:25:02,  6.38s/it]co3dv2:   0%|          | 12/31834 [01:03<42:33:53,  4.82s/it]co3dv2:   0%|          | 13/31834 [01:09<47:41:01,  5.39s/it]co3dv2:   0%|          | 14/31834 [01:11<37:53:56,  4.29s/it]co3dv2:   0%|          | 15/31834 [01:12<29:46:26,  3.37s/it]co3dv2:   0%|          | 16/31834 [01:14<24:33:04,  2.78s/it]co3dv2:   0%|          | 17/31834 [01:15<20:26:48,  2.31s/it]co3dv2:   0%|          | 18/31834 [01:18<21:46:55,  2.46s/it]co3dv2:   0%|          | 19/31834 [01:23<28:37:08,  3.24s/it]co3dv2:   0%|          | 20/31834 [01:29<35:37:30,  4.03s/it]co3dv2:   0%|          | 21/31834 [01:31<30:50:53,  3.49s/it]co3dv2:   0%|          | 22/31834 [01:31<22:25:10,  2.54s/it]co3dv2:   0%|          | 23/31834 [01:39<35:17:38,  3.99s/it]co3dv2:   0%|          | 25/31834 [01:41<22:49:49,  2.58s/it]co3dv2:   0%|          | 26/31834 [01:42<20:11:15,  2.28s/it]co3dv2:   0%|          | 27/31834 [01:44<20:46:25,  2.35s/it]co3dv2:   0%|          | 28/31834 [01:57<45:08:02,  5.11s/it]co3dv2:   0%|          | 29/31834 [01:59<37:43:34,  4.27s/it]co3dv2:   0%|          | 30/31834 [01:59<27:33:51,  3.12s/it]co3dv2:   0%|          | 31/31834 [02:03<28:18:13,  3.20s/it]co3dv2:   0%|          | 32/31834 [02:07<30:39:42,  3.47s/it]co3dv2:   0%|          | 33/31834 [02:07<22:37:44,  2.56s/it]co3dv2:   0%|          | 34/31834 [02:11<25:33:38,  2.89s/it]co3dv2:   0%|          | 35/31834 [02:13<24:14:19,  2.74s/it]co3dv2:   0%|          | 37/31834 [02:14<14:19:14,  1.62s/it]co3dv2:   0%|          | 38/31834 [02:27<39:42:38,  4.50s/it]co3dv2:   0%|          | 40/31834 [02:28<25:25:38,  2.88s/it]co3dv2:   0%|          | 41/31834 [02:31<25:58:08,  2.94s/it]co3dv2:   0%|          | 42/31834 [02:38<34:37:50,  3.92s/it]co3dv2:   0%|          | 43/31834 [02:47<45:12:10,  5.12s/it]co3dv2:   0%|          | 44/31834 [02:48<36:39:32,  4.15s/it]co3dv2:   0%|          | 45/31834 [02:52<35:30:51,  4.02s/it]co3dv2:   0%|          | 46/31834 [02:53<27:54:11,  3.16s/it]/data2/d4rt/code/datasets/computer/depth_to_tracks.py:230: RuntimeWarning: invalid value encountered in cast
+  px = np.clip(np.round(uv_t[:, 0]).astype(np.int32), 0, W - 1)

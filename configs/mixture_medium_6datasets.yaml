@@ -1,0 +1,33 @@
+# 中等版配置（6个数据集）
+# 平衡性能和资源消耗
+mode: mixture
+datasets:
+  # 有轨迹数据集
+  - name: pointodyssey
+    root: /path/to/PointOdyssey
+    weight: 0.30
+  - name: kubric
+    root: /path/to/Kubric
+    weight: 0.20
+  - name: dynamic_replica
+    root: /path/to/DynamicReplica
+    weight: 0.15
+
+  # 静态数据集
+  - name: scannet
+    root: /path/to/ScanNet
+    weight: 0.15
+  - name: co3dv2
+    root: /path/to/Co3Dv2
+    weight: 0.12
+  - name: blendedmvs
+    root: /path/to/BlendedMVS
+    weight: 0.08
+
+clip_len: 48
+img_size: 256
+num_queries: 2048
+use_augs: true
+boundary_ratio: 0.3
+t_tgt_eq_t_cam_ratio: 0.4
+seed: 42

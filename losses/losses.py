@@ -392,7 +392,7 @@ class D4RTLoss(nn.Module):
         mask: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Apply Kendall confidence weighting exp(-s) * L_3D with gradual ramp-up."""
-        if self.use_confidence_weighting:
+        if self.use_confidence_weighting and self.lambda_conf > 0:
             # Using Kendall's log-parameterization: uncertainty is 's'
             # Weighted loss = exp(-s) * L_3D
             confidence_weight = torch.exp(-uncertainty)
@@ -582,10 +582,10 @@ class D4RTLoss(nn.Module):
         losses['metric_target_norm_depth_mean'] = target_norm_depth_mean
         if mask_3d is not None:
             valid_mask_3d = mask_3d.bool()
-            conf_mean = torch.where(valid_mask_3d, confidence, torch.zeros_like(confidence)).sum()
+            conf_mean = torch.where(valid_mask_3d, uncertainty, torch.zeros_like(uncertainty)).sum()
             conf_mean = conf_mean / (valid_mask_3d.sum() + 1e-6)
         else:
-            conf_mean = confidence.mean()
+            conf_mean = uncertainty.mean()
         losses['metric_conf_mean'] = conf_mean
 
         # Total loss

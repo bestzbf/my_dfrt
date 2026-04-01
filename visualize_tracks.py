@@ -279,6 +279,20 @@ def draw_tracks_2d_compare(
                     cv2.circle(frame_input, (px, py), 4, color, -1)
                     cv2.circle(frame_input, (px, py), 2, (255, 255, 255), -1)
 
+            # Draw GT trajectory on input panel for comparison
+            curr_x_input = int(coords_2d_gt[i, t, 0] * (W - 1))
+            curr_y_input = int(coords_2d_gt[i, t, 1] * (H - 1))
+            if 0 <= curr_x_input < W and 0 <= curr_y_input < H:
+                cv2.circle(frame_input, (curr_x_input, curr_y_input), 3, color, -1)
+
+            if t > 0:
+                for k in range(1, t + 1):
+                    prev_x = int(coords_2d_gt[i, t-k, 0] * (W - 1))
+                    prev_y = int(coords_2d_gt[i, t-k, 1] * (H - 1))
+                    curr_trail_x = int(coords_2d_gt[i, t-k+1, 0] * (W - 1))
+                    curr_trail_y = int(coords_2d_gt[i, t-k+1, 1] * (H - 1))
+                    cv2.line(frame_input, (prev_x, prev_y), (curr_trail_x, curr_trail_y), color, 2)
+
             # --- Draw Pred (Right) ---
             curr_x_pred = int(coords_2d_pred[i, t, 0] * (W - 1))
             curr_y_pred = int(coords_2d_pred[i, t, 1] * (H - 1))

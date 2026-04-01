@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
 MODE="${MODE:-normal}"
-STAGE="${STAGE:-full_main}"
+STAGE="${STAGE:-full}"
 DATA_ROOT="${DATA_ROOT:-/mnt/d/data/ZBF_Data/d4rt/test}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/pointodyssey_curriculum}"
 PYTHON_BIN="${PYTHON_BIN:-python}"

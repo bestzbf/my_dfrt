@@ -12,6 +12,7 @@ shift || true
 DATA_ROOT="${DATA_ROOT:-/16t/e/d4rt/PointOdyssey}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-outputs/pointodyssey_curriculum}"
 PYTHON_BIN="${PYTHON_BIN:-python}"
+TRAIN_SCRIPT="${TRAIN_SCRIPT:-train.py}"
 BASE_CONFIG="${BASE_CONFIG:-configs/d4rt_pointodyssey_curriculum_base.yaml}"
 
 case "$STAGE" in
@@ -61,7 +62,7 @@ OUTPUT_DIR="$OUTPUT_ROOT/$STAGE"
 mkdir -p "$OUTPUT_ROOT"
 
 CMD=(
-  $PYTHON_BIN train.py
+  $PYTHON_BIN $TRAIN_SCRIPT
   --config "$BASE_CONFIG"
   --data-root "$DATA_ROOT"
   --output-dir "$OUTPUT_DIR"

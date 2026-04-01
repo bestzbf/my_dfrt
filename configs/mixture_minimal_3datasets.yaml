@@ -1,0 +1,21 @@
+# 最小版配置（3个核心数据集）
+# 适合快速实验和资源受限场景
+mode: mixture
+datasets:
+  - name: pointodyssey
+    root: /path/to/PointOdyssey
+    weight: 0.5
+  - name: scannet
+    root: /path/to/ScanNet
+    weight: 0.3
+  - name: kubric
+    root: /path/to/Kubric
+    weight: 0.2
+
+clip_len: 48
+img_size: 256
+num_queries: 2048
+use_augs: true
+boundary_ratio: 0.3
+t_tgt_eq_t_cam_ratio: 0.4
+seed: 42

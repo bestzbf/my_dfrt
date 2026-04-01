@@ -446,14 +446,13 @@ class D4RTDecoder(nn.Module):
         normal = self.head_normal(query)
         normal = F.normalize(normal, dim=-1)
         # Kendall log-parameterization: output s directly instead of c
-        # s = -log(c)
+        # s = -log(c), where c ∈ (0, 1], so s ∈ [0, +∞)
         s = self.head_conf(query)
 
-        # [CRITICAL FIX] Relax the clamp!
-        # min=-5.0 allows exp(-s) to reach exp(5) ≈ 148, giving the model enough "pain" to force 3D learning.
-        # Previously min=-2.0 capped the pain at exp(2) ≈ 7.4, which was too comfortable for the model.
-        # max=10.0 prevents s from growing infinitely positive
-        s = torch.clamp(s, min=-5.0, max=10.0)
+        # Paper requirement: s must be non-negative since s = -log(c) and c ≤ 1
+        # Use softplus to ensure s > 0, then clamp to prevent extreme values
+        s = F.softplus(s)
+        s = torch.clamp(s, max=10.0)
 
         # Convert to confidence weight for downstream use
         confidence_weight = torch.exp(-s)

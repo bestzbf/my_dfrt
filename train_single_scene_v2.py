@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Training script for D4RT."""
+"""Training script for D4RT - Single Scene with /data2/d4rt/code datasets."""
 
 import argparse
 import json
@@ -19,7 +19,13 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader, ConcatDataset
 from torch.utils.data.distributed import DistributedSampler
 
-from data import PointOdysseyDataset, collate_fn
+# Import datasets factory from /data2/d4rt/code
+sys.path.insert(0, '/data2/d4rt/code')
+from datasets.factory import create_training_dataset
+from datasets.collate import d4rt_collate_fn as collate_fn
+sys.path.pop(0)
+
+# Import losses and models from local directory
 from losses import D4RTLoss
 from models import create_d4rt
 
@@ -419,11 +425,6 @@ def parse_args():
         help="Load only model weights from --resume and skip optimizer/scheduler/scaler state.",
     )
     parser.add_argument(
-        "--override-lr",
-        action="store_true",
-        help="After full resume, forcefully override the optimizer lr with --lr. Keeps optimizer momentum/state but resets the lr.",
-    )
-    parser.add_argument(
         "--drop-conf-head-on-load",
         action="store_true",
         help="Drop decoder confidence-head weights when loading old incompatible checkpoints. Requires --resume-model-only or pretrained loading.",
@@ -537,26 +538,45 @@ def resolve_patch_data_config(args):
 
 
 def build_dataset(args, split, use_augs, verbose):
-    patch_data_config = resolve_patch_data_config(args)
-    return PointOdysseyDataset(
-        dataset_location=args.data_root,
-        dset=split,
-        S=args.num_frames,
-        img_size=args.img_size,
-        num_queries=args.num_queries,
-        patch_size=args.patch_size,
-        use_augs=use_augs,
-        verbose=verbose,
-        sequence_name=_sequence_for_split(args, split),
-        query_mode=args.query_mode,
-        t_tgt_eq_t_cam_ratio=args.t_tgt_eq_t_cam_ratio,
-        use_motion_boundaries=not args.disable_motion_boundary_oversampling,
-        precompute_local_patches=patch_data_config["precompute_local_patches"],
-        return_query_video=patch_data_config["return_query_video"],
-        local_patch_source=patch_data_config["local_patch_source"],
-        return_aux_tensors=False,
-        static_scene_frame_idx=args.static_scene_frame_idx,
-    )
+    """Build dataset using /data2/d4rt/code/datasets factory."""
+    sequence = _sequence_for_split(args, split)
+    if not sequence:
+        raise ValueError(f"No sequence specified for split {split}")
+
+    config = {
+        'mode': 'scene',
+        'name': 'pointodyssey',
+        'root': args.data_root,
+        'sequences': [sequence],
+        'clip_len': args.num_frames,
+        'img_size': args.img_size,
+        'num_queries': args.num_queries,
+    }
+    dataset = create_training_dataset(config, split=split)
+
+    # Override __len__ to respect dataset_repeat_factor
+    # For single scene, use smaller epoch size for faster feedback
+    if hasattr(args, 'dataset_repeat_factor') and args.dataset_repeat_factor > 0:
+        epoch_size = 100 * args.dataset_repeat_factor  # 100 steps per repeat factor
+
+        # Create wrapper to override __len__
+        class EpochSizeWrapper:
+            def __init__(self, dataset, epoch_size):
+                self.dataset = dataset
+                self.epoch_size = epoch_size
+            def __len__(self):
+                return self.epoch_size
+            def __getitem__(self, idx):
+                return self.dataset[idx % len(self.dataset)]
+
+        dataset = EpochSizeWrapper(dataset, epoch_size)
+        if verbose:
+            print(f"[build_dataset] Overriding epoch size: {epoch_size} (repeat_factor={args.dataset_repeat_factor})")
+    else:
+        if verbose:
+            print(f"[build_dataset] No repeat_factor override, using default: {len(dataset)}")
+
+    return dataset
 
 
 def _resolve_pointodyssey_sanity_split(args):
@@ -649,13 +669,10 @@ def create_dataloaders(args, rank, world_size):
     if len(train_dataset) == 0:
         raise RuntimeError(f"Train dataset is empty: {train_dir}")
 
-    # Repeat dataset to support larger batch sizes / single-scene training
-    dataset_repeat_factor = args.dataset_repeat_factor
-    if dataset_repeat_factor > 1:
-        original_len = len(train_dataset)
-        train_dataset = ConcatDataset([train_dataset] * dataset_repeat_factor)
-        if is_main:
-            print(f"Dataset repeated {dataset_repeat_factor}x: {original_len} -> {len(train_dataset)} samples")
+    # Note: dataset_repeat_factor is handled in build_dataset by overriding __len__
+    # ConcatDataset doesn't work with random-sampling MixtureDataset
+    if is_main:
+        print(f"Dataset epoch size: {len(train_dataset)} samples")
 
     if world_size > 1:
         train_sampler = DistributedSampler(
@@ -757,7 +774,9 @@ def prepare_batch(batch, device):
     t_src = batch["t_src"].to(device, non_blocking=True)
     t_tgt = batch["t_tgt"].to(device, non_blocking=True)
     t_cam = batch["t_cam"].to(device, non_blocking=True)
-    aspect_ratio = batch["aspect_ratio"].to(device, non_blocking=True)
+    aspect_ratio = batch.get("aspect_ratio")
+    if aspect_ratio is not None:
+        aspect_ratio = aspect_ratio.to(device, non_blocking=True)
 
     targets = {}
     if "targets" in batch:
@@ -1269,7 +1288,9 @@ def run_validation(model, val_dataloader, criterion, args, device):
 
 
 def main():
+    print("[DEBUG] Starting main()")
     args = parse_args()
+    print("[DEBUG] Args parsed")
 
     # B300 (sm_103) workaround: flash/mem_efficient SDP backends fail with cuDNN frontend
     # on Blackwell GPUs with PyTorch 2.11. Fall back to math backend until fixed upstream.
@@ -1491,11 +1512,6 @@ def main():
             drop_conf_head=args.drop_conf_head_on_load,
             is_main=is_main,
         )
-        if getattr(args, "override_lr", False) and not args.resume_model_only:
-            for pg in optimizer.param_groups:
-                pg["lr"] = args.lr
-            if is_main:
-                print(f"[override-lr] Optimizer lr forcefully set to {args.lr}")
 
     if is_main:
         print(f"Starting training from epoch {start_epoch + 1}, step {start_step}")
@@ -1533,6 +1549,18 @@ def main():
             batch_fetch_count += 1
             train_data_wait_total += time.time() - batch_wait_start
             step_compute_start = time.time()
+
+            # Verify single scene on first batch
+            if step == 0 and 'metadata' in batch:
+                sequences = set()
+                for meta in batch['metadata']:
+                    if 'sequence_root' in meta:
+                        # Extract sequence name from path like /data2/.../train/ani
+                        seq_root = str(meta['sequence_root'])
+                        seq_name = seq_root.rstrip('/').split('/')[-1]
+                        sequences.add(seq_name)
+                print(f"[VERIFY] Training on sequences: {sequences}", flush=True)
+
             current_lambda_conf, current_conf_factor = compute_confidence_schedule(step, args)
             criterion.set_confidence_schedule(current_lambda_conf, current_conf_factor)
 
@@ -1574,6 +1602,11 @@ def main():
             sync_gradients(model)
             optimizer_step(model, optimizer, scheduler, scaler, args)
             step += 1
+
+            # Print progress every 10 steps
+            if is_main and step % 2 == 0:
+                print(f"Step {step}/{scheduler_total_steps} | Epoch {completed_epoch}/{max_epochs} | Loss: {train_metrics.get('loss', 0):.4f}", flush=True)
+
             train_compute_total += time.time() - finalize_start
             if step >= scheduler_total_steps:
                 stop_training = True

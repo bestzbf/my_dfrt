@@ -3,8 +3,8 @@ set -euo pipefail
 
 # ──────────────────────────────────────────────────────────────────────────────
 # 分布式多 GPU 训练脚本，支持从 checkpoint resume
-#   NPROC_PER_NODE=2 CUDA_VISIBLE_DEVICES=3,4,5 bash train_dist_resume.sh
-# cd /data1/zbf/my_dfrt && NPROC_PER_NODE=1 CUDA_VISIBLE_DEVICES=2 bash train_dist_resume.sh
+#   NPROC_PER_NODE=3 CUDA_VISIBLE_DEVICES=3,4,5 bash train_dist_resume.sh
+# cd /data1/zbf/my_dfrt && NPROC_PER_NODE=2 CUDA_VISIBLE_DEVICES=3,4 bash train_dist_resume_con.sh
 # ──────────────────────────────────────────────────────────────────────────────
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -28,11 +28,11 @@ MASTER_PORT="${MASTER_PORT:-29501}"
 
 # ─── 路径 ─────────────────────────────────────────────────────────────────────
 export DATA_ROOT="${DATA_ROOT:-/data2/d4rt/datasets/PointOdyssey_fast}"
-export OUTPUT_ROOT="${OUTPUT_ROOT:-outputs_all_augs/newloss3d}"
+export OUTPUT_ROOT="${OUTPUT_ROOT:-outputs_all_noraw/load3240}"
 PYTHON_ENV_BIN="/root/miniconda3/envs/d4rt/bin"
 TORCHRUN_BIN="$PYTHON_ENV_BIN/torchrun"
 
-RESUME_CKPT="${RESUME_CKPT:-/data1/zbf/my_dfrt/outputs_all_augs/newloss3d/full/checkpoint_epoch_2540_fixed.pth}"
+RESUME_CKPT="${RESUME_CKPT:-/data1/zbf/my_dfrt/outputs_all_augs/256_lossPaper_load2020_con/full/checkpoint_epoch_3240.pth}"
 
 # ─── 模型 / 训练配置 ──────────────────────────────────────────────────────────
 export MODE=normal
@@ -67,9 +67,10 @@ bash train.sh \
   --val-split val \
   --steps 1000000 \
   --warmup-steps 0 \
+  --lr 5e-4 \
   --lambda-3d 1.0 \
-  --lambda-raw-3d 0.00 \
-  --lambda-conf 0.0 \
+  --lambda-raw-3d 0.0 \
+  --lambda-conf 0.2 \
   --lambda-2d 0.1 \
   --lambda-vis 0.1 \
   --lambda-disp 0.1 \
@@ -84,4 +85,5 @@ bash train.sh \
   --no-gradient-checkpointing \
   --skip-pointodyssey-sanity \
   --gradient-accumulation-steps 4 \
-  --resume "$RESUME_CKPT"
+  --resume "$RESUME_CKPT" \
+  --resume-model-only

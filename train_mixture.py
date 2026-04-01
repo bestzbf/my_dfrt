@@ -61,7 +61,7 @@ def main():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model = create_d4rt(encoder="base", decoder_depth=12, img_size=args.resolution,
                         num_frames=args.num_frames, patch_size=(2, 16, 16),
-                        query_patch_size=9).to(device)
+                        query_patch_size=9, videomae_model="/data1/zbf/pretrained/videomae-base").to(device)
 
     # Load pretrained weights
     if args.pretrain:

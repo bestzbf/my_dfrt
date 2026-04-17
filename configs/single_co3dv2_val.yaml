@@ -1,0 +1,26 @@
+mode: single
+name: co3dv2
+root: /data2/d4rt/datasets/Co3Dv2
+
+# Co3Dv2 adapter kwargs - use fewview_dev for held-out validation
+adapter_kwargs:
+  subset_name: fewview_dev
+  categories: null          # null = 全部 51 类别
+  require_precomputed: false # 允许无 precomputed.npz 的序列（走静态路径）
+
+clip_len: 48
+img_size: 256
+num_queries: 512
+use_augs: false  # val 不用 aug
+boundary_ratio: 0.3
+t_tgt_eq_t_cam_ratio: 0.4
+seed: 42
+
+# 关键：允许 has_tracks=True 但 valids=0 时 fallback 到静态路径
+allow_track_fallback: true
+
+epoch_size: 2000
+precompute_patches: true
+precompute_from_highres: false
+
+index_cache_dir: /data1/zbf/my_dfrt/.index_cache

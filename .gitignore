@@ -1,0 +1,52 @@
+# Claude Code
+.claude/
+.codex
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Core dumps
+core.*
+
+# Datasets
+datasets1/
+
+# Outputs
+outputs/
+vis_output/
+tmp/
+
+# Config
+# configs/
+
+# Documentation (project-specific)
+*.md
+!README.md
+
+# Models
+# models/
+
+# Training scripts
+# train_*.sh
+# train_*.py
+# run_*.sh
+
+# Visualization
+# visualize_*.py
+
+# Analysis scripts
+analyze_*.py
+check_*.py
+
+# Losses
+# losses/
+
+# Utils
+# utils/
+
+# Subdirectories
+NeoVerse/

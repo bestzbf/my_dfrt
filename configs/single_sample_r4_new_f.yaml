@@ -1,0 +1,19 @@
+# 单样本训练配置 - r4_new_f
+# 训练集和验证集使用同一个样本（通过符号链接实现）
+mode: scene
+name: pointodyssey
+root: /data2/d4rt/datasets/PointOdyssey/sample
+sequences:
+  - r4_new_f
+
+clip_len: 48
+img_size: 256
+num_queries: 2048
+use_augs: false  # 关闭数据增强
+boundary_ratio: 0.3
+t_tgt_eq_t_cam_ratio: 0.4
+seed: 42
+index_cache_dir: /data1/zbf/my_dfrt/.index_cache
+sampling_mode: stride
+stride_range: [1, 10]  # 帧间隔范围1-10，提供更多样化的采样
+epoch_size: 1000  # 每个epoch 1000次迭代

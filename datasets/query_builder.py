@@ -209,11 +209,14 @@ _DATASET_Z_MAX: dict[str, float] = {
     #   dynamic_replica:p50=2.92  p99=7.33  p99.9=8.35   max=9.08 → 12 覆盖全部
     #   scannet:        metric metres, 室内场景，实测 max ≈ 2.18 m → 5 安全
     #   co3dv2:         任意坐标单位，14% 有效点 Z>20 → 50 保守上限
+    #   blendedmvs:     rendered depth, 场景尺度差异极大（室内 ~1m 到室外 ~468m）
+    #                   35% 场景 max>20m, p99 ≈ 448m, max=468m → 500 覆盖全部
     "pointodyssey":    12.0,
     "kubric":          55.0,
     "dynamic_replica": 12.0,
     "scannet":          5.0,
     "co3dv2":          50.0,
+    "blendedmvs":     500.0,
 }
 _DEFAULT_Z_MAX = 20.0   # fallback for unknown datasets
 
@@ -553,18 +556,16 @@ class D4RTQueryBuilder:
         valid_frames_arr = np.array(valid_frames)
 
         # 1. 批量随机帧采样
-        src_frames   = np_rng.choice(valid_frames_arr, size=N)
-
-        # CRITICAL FIX: 按 t_tgt_eq_t_cam_ratio 比例生成静态重投影查询（t_tgt=t_src=t_cam）
-        # 和时序跟踪查询（t_tgt 随机）。之前只有时序跟踪，导致 static_query_ratio=0。
-        use_static_reprojection = np_rng.random(size=N) < self.t_tgt_eq_t_cam_ratio
-        tgt_frames   = np.where(use_static_reprojection, src_frames, np_rng.integers(0, T, size=N))
-
-        # 对于静态重投影查询，强制 t_cam = t_src；否则随机选择
-        use_same_cam = np_rng.random(size=N) < self.t_tgt_eq_t_cam_ratio
-        cam_frames   = np.where(use_static_reprojection, src_frames,
-                                np.where(use_same_cam, tgt_frames, np_rng.integers(0, T, size=N)))
-        use_bnd      = np_rng.random(size=N) < self.boundary_ratio
+        # PAPER-ALIGNED: t_src/t_tgt/t_cam sampled independently at random.
+        # Enforce t_tgt=t_cam with prob t_tgt_eq_t_cam_ratio (paper: 0.4).
+        # Previously forced t_tgt=t_src=t_cam for 40% of queries, which
+        # collapsed tracking queries into depth-only self-reprojection.
+        src_frames = np_rng.choice(valid_frames_arr, size=N)
+        tgt_frames = np_rng.integers(0, T, size=N)
+        cam_frames = np_rng.integers(0, T, size=N)
+        force_eq   = np_rng.random(size=N) < self.t_tgt_eq_t_cam_ratio
+        cam_frames = np.where(force_eq, tgt_frames, cam_frames)
+        use_bnd    = np_rng.random(size=N) < self.boundary_ratio
 
         # 2. 按 source frame 分组选点（~S 次迭代而非 N 次）
         pt_indices = np.zeros(N, dtype=np.int64)
@@ -641,7 +642,10 @@ class D4RTQueryBuilder:
         targets["source_is_depth_boundary"][:]   = torch.from_numpy(src_is_dbnd)
         targets["source_is_motion_boundary"][:] = torch.from_numpy(src_is_mbnd)
         targets["point_indices"][:]              = torch.from_numpy(pt_indices)
-        targets["is_static_reprojection"][:]     = torch.from_numpy(use_static_reprojection)
+        # is_static_reprojection: marks queries with no temporal component
+        # (t_tgt == t_src). In the paper-aligned sampling this arises naturally
+        # when t_tgt happens to equal t_src, not from a forced 40% split.
+        targets["is_static_reprojection"][:]     = torch.from_numpy(tgt_frames == src_frames)
 
         # ---- normal（向量化批量查表） ----
         # 只有 t_cam == t_tgt 时，normal 才与目标 3D 监督处于同一相机坐标系。
@@ -738,14 +742,15 @@ class D4RTQueryBuilder:
         for qi in range(self.num_queries):
             src_fi = py_rng.choice(valid_frames)
 
-            # Without tracks we only have static geometry supervision for the
-            # source frame. Forcing t_tgt=t_src avoids teaching inconsistent
-            # temporal semantics such as "random target time, unchanged target".
-            tgt_fi = src_fi
+            # PAPER-ALIGNED: t_src/t_tgt/t_cam sampled independently at random.
+            # Enforce t_tgt=t_cam with prob t_tgt_eq_t_cam_ratio (paper: 0.4).
+            # In static scenes the world point doesn't move, so we can compute
+            # both pos_3d (in t_cam frame) and pos_2d (in t_tgt frame) for
+            # arbitrary t_tgt — no need to force t_tgt=t_src.
+            tgt_fi = py_rng.randint(0, T - 1)
+            cam_fi = py_rng.randint(0, T - 1)
             if py_rng.random() < self.t_tgt_eq_t_cam_ratio:
                 cam_fi = tgt_fi
-            else:
-                cam_fi = py_rng.randint(0, T - 1)
 
             vpx = valid_pixels_by_frame[src_fi]
             bpx = boundary_pixels_by_frame[src_fi]
@@ -770,9 +775,12 @@ class D4RTQueryBuilder:
             targets["source_is_boundary"][qi]        = bool(boundary[src_fi][px_y_r, px_x_r])
             targets["source_is_depth_boundary"][qi]  = bool(depth_boundary[src_fi][px_y_r, px_x_r])
             targets["point_indices"][qi]             = px_y * cw + px_x
-            targets["is_static_reprojection"][qi]    = True
+            # is_static_reprojection: marks queries with no temporal component
+            # (t_tgt == t_src), used for loss weighting analysis.
+            targets["is_static_reprojection"][qi]    = (tgt_fi == src_fi)
 
-            # pos_3d：从 src 帧 depth 反投影到 cam_fi 相机坐标系
+            # pos_3d：从 src 帧 depth 反投影 → world → cam_fi 相机坐标系
+            # pos_2d：投影 p_world 到 tgt_fi 图像平面（静态场景下 p_world 不变）
             if has_depth:
                 depth_val = float(result.depths[src_fi][px_y_r, px_x_r])
                 if depth_val > 1e-3 and depth_val < z_max and np.isfinite(depth_val):
@@ -785,18 +793,32 @@ class D4RTQueryBuilder:
                     z_c = depth_val
                     p_src_cam = np.array([x_c, y_c, z_c, 1.0], dtype=np.float32)
 
-                    # src cam → world → cam_fi cam
-                    E_src = E[src_fi]                       # w2c src
-                    E_cam = E[cam_fi]                       # w2c cam_fi
-                    # world = inv(E_src) @ p_src_cam
+                    # src cam → world
+                    E_src = E[src_fi]
                     p_world = np.linalg.inv(E_src) @ p_src_cam
-                    p_cam   = (E_cam @ p_world)[:3].astype(np.float32)
+
+                    # world → cam_fi cam (for pos_3d)
+                    E_cam = E[cam_fi]
+                    p_cam = (E_cam @ p_world)[:3].astype(np.float32)
 
                     if np.isfinite(p_cam).all() and p_cam[2] > 1e-3 and p_cam[2] < z_max:
                         targets["pos_3d"][qi]  = torch.from_numpy(p_cam)
                         targets["mask_3d"][qi] = True
 
-        # mask_2d / mask_vis / mask_disp / mask_normal 全部保持 False
+                        # pos_2d: only when t_tgt=t_cam (paper design).
+                        # Project p_world to tgt_fi=cam_fi image plane.
+                        if tgt_fi == cam_fi:
+                            K_tgt = K[tgt_fi]
+                            u = float(K_tgt[0,0] * p_cam[0] / p_cam[2] + K_tgt[0,2])
+                            v = float(K_tgt[1,1] * p_cam[1] / p_cam[2] + K_tgt[1,2])
+                            u_c = u * scale_x
+                            v_c = v * scale_y
+                            if 0 <= u_c < cw and 0 <= v_c < ch:
+                                targets["pos_2d"][qi, 0] = u_c / max(cw - 1, 1)
+                                targets["pos_2d"][qi, 1] = v_c / max(ch - 1, 1)
+                                targets["mask_2d"][qi]   = True
+
+        # mask_2d set above when t_tgt=t_cam and pos_2d in bounds; others remain False
         return coords, t_src_t, t_tgt_t, t_cam_t, targets
 
     # ------------------------------------------------------------------

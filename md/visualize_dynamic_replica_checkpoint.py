@@ -181,12 +181,16 @@ def load_transform_result(dataset, index: int, allow_no_tracks: bool = False):
         dataset_idx, sequence_name, frame_indices = dataset.mixture_sampler.sample(rng)
         adapter = dataset.adapters[dataset_idx]
         try:
+            print(f"[vis]   load_transform: idx={index} attempt={attempt} seq={sequence_name} frames={len(frame_indices)}", flush=True)
             clip = adapter.load_clip(sequence_name, frame_indices)
+            print(f"[vis]   load_transform: clip loaded, running transform ...", flush=True)
             result = dataset.transform(clip, rng=rng)
+            print(f"[vis]   load_transform: transform done", flush=True)
             if not allow_no_tracks and not bool(result.metadata.get("has_tracks", False)):
                 raise RuntimeError("sample has no tracks")
             return result, dataset_idx, sequence_name, frame_indices
         except Exception as exc:  # noqa: BLE001
+            print(f"[vis]   load_transform: attempt {attempt} failed: {exc}", flush=True)
             last_error = exc
             rng = random.Random(dataset.seed + index + attempt + 1)
     raise RuntimeError(f"Failed to load valid sample at index {index}: {last_error}")
@@ -198,7 +202,10 @@ def find_samples(dataset, start_index: int, count: int, max_search: int, allow_n
     idx = start_index
     while len(found) < count and checked < max_search:
         try:
+            if checked % 10 == 0:
+                print(f"[vis] find_samples: checked={checked}/{max_search}, found={len(found)}/{count}, idx={idx}", flush=True)
             result, dataset_idx, sequence_name, frame_indices = load_transform_result(dataset, idx, allow_no_tracks=allow_no_tracks)
+            print(f"[vis] find_samples: found sample {len(found)} at idx={idx} seq={sequence_name}", flush=True)
             found.append(
                 {
                     "sample_index": idx,
@@ -423,13 +430,18 @@ def compute_track_predictions(
         axis=1,
     )
 
-    size = result.img_size
-    gt_2d_norm = gt_xy_crop / np.array(
+    crop_scale = np.array(
         [max(result.crop.crop_w - 1, 1), max(result.crop.crop_h - 1, 1)],
         dtype=np.float32,
-    )[None, None]
-    pred_2d_px = normalized_to_pixels(pred_2d, size)
-    gt_2d_px = normalized_to_pixels(gt_2d_norm, size)
+    )
+    pred_2d_px = pred_2d * crop_scale[None, None]
+    gt_2d_px = gt_xy_crop
+
+    img_sz = float(result.img_size)
+    display_scale = np.array([img_sz - 1, img_sz - 1], dtype=np.float32)
+    rescale = display_scale / crop_scale
+    pred_2d_display = pred_2d * display_scale[None, None]
+    gt_2d_display = gt_xy_crop * rescale[None, None]
 
     vis_mask = gt_vis & np.isfinite(gt_2d_px).all(axis=-1) & np.isfinite(pred_2d_px).all(axis=-1)
     e2d = np.linalg.norm(pred_2d_px - gt_2d_px, axis=-1)
@@ -440,8 +452,8 @@ def compute_track_predictions(
     e3d = np.where(mask3d, e3d, np.nan)
 
     src_frame = int(query_frames[0])
-    src_points_px = gt_2d_px[:, src_frame]
-    colors = point_colors_from_frame(result.images[src_frame], src_points_px)
+    src_points_display = gt_2d_display[:, src_frame]
+    colors = point_colors_from_frame(result.images[src_frame], src_points_display)
 
     return {
         "pred_2d_norm": pred_2d,
@@ -454,6 +466,8 @@ def compute_track_predictions(
         "err_2d_px": e2d,
         "err_3d": e3d,
         "colors": colors,
+        "pred_2d_display": pred_2d_display,
+        "gt_2d_display": gt_2d_display,
     }
 
 
@@ -517,8 +531,8 @@ def plot_2d_compare_static(
         pd_vis = pred["pred_vis"][display_ids, frame_id] > 0.5
         both_vis = gt_vis & pd_vis
 
-        gt_pts = pred["gt_2d_px"][display_ids, frame_id]
-        pd_pts = pred["pred_2d_px"][display_ids, frame_id]
+        gt_pts = pred["gt_2d_display"][display_ids, frame_id]
+        pd_pts = pred["pred_2d_display"][display_ids, frame_id]
         err = pred["err_2d_px"][display_ids, frame_id]
 
         ax_gt = axes[0, col]
@@ -531,8 +545,8 @@ def plot_2d_compare_static(
         # 画轨迹线（从第0帧到当前帧）
         for pid in range(len(display_ids)):
             color = point_colors[pid]
-            trail_gt = pred["gt_2d_px"][display_ids[pid], :frame_id + 1]
-            trail_pd = pred["pred_2d_px"][display_ids[pid], :frame_id + 1]
+            trail_gt = pred["gt_2d_display"][display_ids[pid], :frame_id + 1]
+            trail_pd = pred["pred_2d_display"][display_ids[pid], :frame_id + 1]
             trail_gt_vis = pred["gt_vis"][display_ids[pid], :frame_id + 1]
             trail_pd_vis = pred["pred_vis"][display_ids[pid], :frame_id + 1] > 0.5
             if trail_gt_vis.sum() >= 2:
@@ -628,8 +642,8 @@ def write_2d_compare_gif(
         gt_vis = pred["gt_vis"][display_ids, frame_id]
         pd_vis = pred["pred_vis"][display_ids, frame_id] > 0.5
         both_vis = gt_vis & pd_vis
-        gt_pts = pred["gt_2d_px"][display_ids, frame_id]
-        pd_pts = pred["pred_2d_px"][display_ids, frame_id]
+        gt_pts = pred["gt_2d_display"][display_ids, frame_id]
+        pd_pts = pred["pred_2d_display"][display_ids, frame_id]
         err = pred["err_2d_px"][display_ids, frame_id]
 
         fig, axes = plt.subplots(1, 3, figsize=(12.8, 4.2), constrained_layout=True)
@@ -642,8 +656,8 @@ def write_2d_compare_gif(
         # 画轨迹线（从第0帧到当前帧）
         for i, pid in enumerate(range(len(display_ids))):
             color = point_colors[pid]
-            trail_gt = pred["gt_2d_px"][display_ids[pid], :frame_id + 1]
-            trail_pd = pred["pred_2d_px"][display_ids[pid], :frame_id + 1]
+            trail_gt = pred["gt_2d_display"][display_ids[pid], :frame_id + 1]
+            trail_pd = pred["pred_2d_display"][display_ids[pid], :frame_id + 1]
             trail_gt_vis = pred["gt_vis"][display_ids[pid], :frame_id + 1]
             trail_pd_vis = pred["pred_vis"][display_ids[pid], :frame_id + 1] > 0.5
             if trail_gt_vis.sum() >= 2:
@@ -727,6 +741,18 @@ def prepare_dense_gt_sequence(
     point_source: str,
     outlier_percentile: float = 95.0,
 ) -> list[dict[str, Any]]:
+    if result.trajs_3d_world is None or result.trajs_2d is None:
+        return [
+            {
+                "frame_id": i,
+                "points_world": np.empty((0, 3), dtype=np.float32),
+                "colors": np.empty((0, 3), dtype=np.float32),
+                "selected_points": 0,
+                "rendered_points": 0,
+            }
+            for i in range(len(result.images))
+        ]
+
     norm = np.array(
         [max(result.crop.crop_w - 1, 1), max(result.crop.crop_h - 1, 1)],
         dtype=np.float32,
@@ -734,10 +760,13 @@ def prepare_dense_gt_sequence(
     dense_frames: list[dict[str, Any]] = []
     rng = np.random.default_rng(seed)
 
+    trajs_3d = np.asarray(result.trajs_3d_world, dtype=np.float32)
+    trajs_2d = np.asarray(result.trajs_2d, dtype=np.float32)
+
     # 跨帧统计 XYZ 范围，用 percentile 裁剪离群点阈值
     # 避免少量极端值（如 PointOdyssey Y 轴 -878）把整个点云压缩到不可见
     if outlier_percentile < 100.0:
-        all_finite = result.trajs_3d_world[np.isfinite(result.trajs_3d_world).all(axis=-1)]
+        all_finite = trajs_3d[np.isfinite(trajs_3d).all(axis=-1)]
         if len(all_finite) > 0:
             lo = np.percentile(all_finite, 100.0 - outlier_percentile, axis=0)
             hi = np.percentile(all_finite, outlier_percentile, axis=0)
@@ -749,8 +778,8 @@ def prepare_dense_gt_sequence(
         hi = np.full(3, np.inf, dtype=np.float32)
 
     for frame_id in range(len(result.images)):
-        finite_3d = np.isfinite(result.trajs_3d_world[frame_id]).all(axis=-1)
-        finite_2d = np.isfinite(result.trajs_2d[frame_id]).all(axis=-1)
+        finite_3d = np.isfinite(trajs_3d[frame_id]).all(axis=-1)
+        finite_2d = np.isfinite(trajs_2d[frame_id]).all(axis=-1)
         if point_source == "visible":
             selected = result.visibs[frame_id].astype(bool) & finite_3d & finite_2d
         elif point_source == "all_finite":
@@ -760,7 +789,7 @@ def prepare_dense_gt_sequence(
 
         # 过滤离群点
         if outlier_percentile < 100.0:
-            pts_all = result.trajs_3d_world[frame_id]
+            pts_all = trajs_3d[frame_id]
             in_range = np.all((pts_all >= lo) & (pts_all <= hi), axis=-1)
             selected = selected & in_range
 
@@ -770,9 +799,9 @@ def prepare_dense_gt_sequence(
             indices = rng.choice(indices, size=max_points, replace=False)
             indices = np.sort(indices)
 
-        points_world = result.trajs_3d_world[frame_id, indices].astype(np.float32)
+        points_world = trajs_3d[frame_id, indices].astype(np.float32)
         points_world = maybe_flip_y(points_world, flip_y)
-        coords_norm = result.trajs_2d[frame_id, indices].astype(np.float32) / norm[None]
+        coords_norm = trajs_2d[frame_id, indices].astype(np.float32) / norm[None]
         points_px = normalized_to_pixels(coords_norm, result.img_size)
         colors = point_colors_from_frame(result.images[frame_id], points_px)
         dense_frames.append(
@@ -1445,8 +1474,8 @@ def plot_2d_overlay(
         pred_vis = pred["pred_vis"][display_ids, frame_id] > 0.5
         mask = gt_vis & pred_vis
 
-        gt_pts = pred["gt_2d_px"][display_ids, frame_id]
-        pd_pts = pred["pred_2d_px"][display_ids, frame_id]
+        gt_pts = pred["gt_2d_display"][display_ids, frame_id]
+        pd_pts = pred["pred_2d_display"][display_ids, frame_id]
         err = pred["err_2d_px"][display_ids, frame_id]
 
         if np.any(mask):
@@ -1610,9 +1639,14 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
 
     device = select_device(args.device)
+    print(f"[vis] Loading dataset from {args.config} (split={args.split}) ...", flush=True)
     dataset = load_val_dataset(args.config, split=args.split)
+    print(f"[vis] Dataset loaded: {len(dataset.adapters)} adapter(s)", flush=True)
+    print(f"[vis] Loading model from {args.checkpoint} ...", flush=True)
     model = load_model(args, device)
+    print(f"[vis] Model loaded on {device}", flush=True)
 
+    print(f"[vis] Finding {args.num_samples} samples (start={args.start_index}, max_search={args.max_search}) ...", flush=True)
     samples = find_samples(
         dataset=dataset,
         start_index=args.start_index,
@@ -1639,6 +1673,7 @@ def main() -> None:
         sample_index = int(sample["sample_index"])
         sample_dir = out_dir / f"sample_{sample_rank:02d}_idx{sample_index}_{result.sequence_name}"
         sample_dir.mkdir(parents=True, exist_ok=True)
+        print(f"[vis] Processing sample {sample_rank}/{len(samples)}: {result.sequence_name} (idx={sample_index})", flush=True)
 
         has_tracks = bool(result.metadata.get("has_tracks", False)) and result.trajs_2d is not None
 
@@ -1726,6 +1761,7 @@ def main() -> None:
         else:
             metrics_2d = {"mean_2d_px_err": math.nan, "median_2d_px_err": math.nan, "p90_2d_px_err": math.nan}
             metrics_3d = {"num_3d_points": 0, "mean_3d_euc_err": math.nan, "median_3d_euc_err": math.nan, "p90_3d_euc_err": math.nan}
+        print(f"[vis]   Step: prepare_dense_gt_sequence ...", flush=True)
         dense_gt_frames = prepare_dense_gt_sequence(
             result=result,
             max_points=args.dense_gt_max_points,
@@ -1750,6 +1786,7 @@ def main() -> None:
             dense_ref_frame["points_world"],
             colors=dense_ref_frame["colors"],
         )
+        print(f"[vis]   Step: compute_dense_pred_reference_sequence ...", flush=True)
         dense_pred_frames = compute_dense_pred_reference_sequence(
             model=model,
             result=result,
@@ -1800,6 +1837,7 @@ def main() -> None:
             dense_pred_world_ref_frame["points_world"],
             colors=dense_pred_world_ref_frame["colors"],
         )
+        print(f"[vis]   Step: compute_dense_canonical_sequence ...", flush=True)
         # canonical 重建：每帧独立重建到参考坐标系，静态背景不动，动态物体移动
         canonical_frames = compute_dense_canonical_sequence(
             model=model,

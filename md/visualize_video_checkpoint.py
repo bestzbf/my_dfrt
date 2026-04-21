@@ -879,7 +879,7 @@ def plot_dense_reference_static(
             frame["points_ref"][:, 0],
             frame["points_ref"][:, 1],
             frame["points_ref"][:, 2],
-            c=frame["colors"],
+            c=np.clip(frame["colors"], 0.0, 1.0),
             s=0.45,
             alpha=0.9,
         )
@@ -920,7 +920,7 @@ def write_dense_reference_gif(
             frame["points_ref"][:, 0],
             frame["points_ref"][:, 1],
             frame["points_ref"][:, 2],
-            c=frame["colors"],
+            c=np.clip(frame["colors"], 0.0, 1.0),
             s=0.45,
             alpha=0.9,
         )

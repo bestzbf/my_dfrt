@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
+CUDA_VISIBLE_DEVICES=5
+
+
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-
-# CHECKPOINT=/data/zbf/openclaw/d4rt/outputs/mixture_3datasets_finetune_v2_gpu5/checkpoint_latest_35.pth \
-# bash run_visualize_checkpoint.sh
+# CHECKPOINT=/data/zbf/openclaw/d4rt/outputs/single_co3dv2_5cat/checkpoint_latest_195.pth \
+# bash run_visualize_checkpoint.sh DATASET="pointodyssey"
 
 # 统一 checkpoint 可视化包装脚本。
 #
@@ -86,7 +88,25 @@ MAX_SEARCH="${MAX_SEARCH:-200}"
 REFERENCE_FRAME="${REFERENCE_FRAME:--1}"
 SEED="${SEED:-42}"
 SPLIT="${SPLIT:-val}"
-ALLOW_NO_TRACKS="${ALLOW_NO_TRACKS:-0}"
+ALLOW_NO_TRACKS="${ALLOW_NO_TRACKS:-}"
+
+auto_select_co3dv2_config() {
+  local split="$1"
+  local checkpoint_path="$2"
+  local suffix=""
+  if [[ "$split" == "val" ]]; then
+    suffix="_val"
+  fi
+
+  case "$checkpoint_path" in
+    *co3dv2_5cat*)
+      echo "configs/single_co3dv2_5cat${suffix}.yaml"
+      ;;
+    *)
+      echo "configs/single_co3dv2${suffix}.yaml"
+      ;;
+  esac
+}
 
 # 稀疏 tracking 可视化参数。
 NUM_POINTS="${NUM_POINTS:-1024}"
@@ -108,6 +128,7 @@ DENSE_PRED_QUERY_DEPTH_PERCENTILE="${DENSE_PRED_QUERY_DEPTH_PERCENTILE:-50}"
 
 # GIF 参数。
 GIF_FPS="${GIF_FPS:-8}"
+DEPTH_STRIDE="${DEPTH_STRIDE:-2}"
 
 # 3D 坐标轴约定。
 # 0 = 保持原始 Y
@@ -146,8 +167,11 @@ case "$DATASET" in
     ;;
   co3dv2)
     CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-7}"
-    CONFIG="${CONFIG:-configs/single_co3dv2.yaml}"
     CHECKPOINT="${CHECKPOINT:-/data/zbf/openclaw/d4rt/outputs/single_co3dv2/checkpoint_latest_20.pth}"
+    if [[ -z "${CONFIG:-}" ]]; then
+      CONFIG="$(auto_select_co3dv2_config "$SPLIT" "$CHECKPOINT")"
+      AUTO_SELECTED_CONFIG=1
+    fi
     PATCH_PROVIDER="${PATCH_PROVIDER:-sampled_resized}"
     RESOLUTION="${RESOLUTION:-256}"
     NUM_FRAMES="${NUM_FRAMES:-48}"
@@ -155,6 +179,9 @@ case "$DATASET" in
     ALLOW_NO_TRACKS="${ALLOW_NO_TRACKS:-1}"
     ;;
 esac
+
+# 在 case 之后设最终默认值，确保 co3dv2 的 ALLOW_NO_TRACKS=1 不被覆盖
+ALLOW_NO_TRACKS="${ALLOW_NO_TRACKS:-0}"
 
 # 从 CHECKPOINT 路径自动派生 OUTPUT_DIR：<checkpoint目录>/vis_<checkpoint名去掉.pth>
 if [[ -z "${OUTPUT_DIR:-}" ]]; then
@@ -189,7 +216,11 @@ echo "[$LOG_PREFIX] DENSE_PRED_QUERY_BATCH_SIZE=$DENSE_PRED_QUERY_BATCH_SIZE"
 echo "[$LOG_PREFIX] DENSE_PRED_DEPTH_PERCENTILE=$DENSE_PRED_DEPTH_PERCENTILE"
 echo "[$LOG_PREFIX] DENSE_PRED_QUERY_DEPTH_PERCENTILE=$DENSE_PRED_QUERY_DEPTH_PERCENTILE"
 echo "[$LOG_PREFIX] GIF_FPS=$GIF_FPS"
+echo "[$LOG_PREFIX] DEPTH_STRIDE=$DEPTH_STRIDE"
 echo "[$LOG_PREFIX] FLIP_Y_AXIS=$FLIP_Y_AXIS"
+if [[ "${AUTO_SELECTED_CONFIG:-0}" == "1" ]]; then
+  echo "[$LOG_PREFIX] CONFIG auto-selected from CHECKPOINT + SPLIT"
+fi
 
 if [[ ! -x "$PYTHON_BIN" && ! -f "$PYTHON_BIN" ]]; then
   echo "[$LOG_PREFIX] Python not found: $PYTHON_BIN" >&2
@@ -246,3 +277,22 @@ if [[ "$MAX_DEPTH" != "0" ]]; then
 fi
 
 CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" "$PYTHON_BIN" "${ARGS[@]}" "$@"
+
+# 所有数据集额外跑深度图可视化
+DEPTH_OUTPUT_DIR="${OUTPUT_DIR}_depth"
+echo "[$LOG_PREFIX] Running depth visualization -> $DEPTH_OUTPUT_DIR"
+CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" "$PYTHON_BIN" md/visualize_co3dv2_depth.py \
+  --config "$CONFIG" \
+  --checkpoint "$CHECKPOINT" \
+  --output-dir "$DEPTH_OUTPUT_DIR" \
+  --num-samples "$NUM_SAMPLES" \
+  --num-frames "$NUM_FRAMES" \
+  --resolution "$RESOLUTION" \
+  --patch-provider "$PATCH_PROVIDER" \
+  --stride "$DEPTH_STRIDE" \
+  --gif-fps "$GIF_FPS" \
+  --split "$SPLIT" \
+  --seed "$SEED" \
+  --start-index "$START_INDEX" \
+  --max-search "$MAX_SEARCH" \
+  --device "$DEVICE"

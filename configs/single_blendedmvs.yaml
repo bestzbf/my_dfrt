@@ -1,0 +1,22 @@
+mode: single
+name: blendedmvs
+root: /data2/d4rt/datasets/BlendedMVS
+
+adapter_kwargs:
+  use_masked: false
+
+clip_len: 48
+img_size: 256
+num_queries: 512
+use_augs: true
+boundary_ratio: 0.3
+t_tgt_eq_t_cam_ratio: 0.4
+seed: 42
+
+allow_track_fallback: true
+
+epoch_size: 2000
+precompute_patches: true
+precompute_from_highres: false
+
+index_cache_dir: /data1/zbf/my_dfrt/.index_cache

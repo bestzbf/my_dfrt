@@ -11,6 +11,8 @@ from .misc import farthest_point_sample_py
 
 from .metrics import (
     compute_depth_metrics,
+    compute_point_cloud_metrics,
+    compute_pose_auc,
     compute_pose_metrics,
     compute_tracking_metrics
 )
@@ -24,6 +26,8 @@ __all__ = [
     'project_points',
     'unproject_points',
     'compute_depth_metrics',
+    'compute_point_cloud_metrics',
+    'compute_pose_auc',
     'compute_pose_metrics',
     'compute_tracking_metrics',
     'visualize_depth',

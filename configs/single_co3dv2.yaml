@@ -7,6 +7,7 @@ adapter_kwargs:
   subset_name: fewview_train
   categories: null          # null = 全部 51 类别
   require_precomputed: false # 允许无 precomputed.npz 的序列（走静态路径）
+  sequence_denylist: /data/zbf/openclaw/d4rt/configs/co3dv2_denylist_degenerate_clips_20260422.txt
 
 clip_len: 48
 img_size: 256

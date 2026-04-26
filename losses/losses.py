@@ -588,6 +588,11 @@ class D4RTLoss(nn.Module):
         static_mask = targets.get('is_static_reprojection')
         if static_mask is not None:
             static_mask = static_mask.bool()
+        valid_mask_3d = mask_3d.bool() if mask_3d is not None else None
+        if mask_normal is not None:
+            mask_normal = mask_normal.bool()
+            if valid_mask_3d is not None:
+                mask_normal = mask_normal & valid_mask_3d
 
         metric_dtype = predictions['pos_3d'].dtype
         metric_device = predictions['pos_3d'].device
@@ -602,8 +607,6 @@ class D4RTLoss(nn.Module):
         losses['metric_normal_query_ratio'] = (
             mask_normal.float().mean().to(metric_dtype) if mask_normal is not None else zero_metric
         )
-
-        valid_mask_3d = mask_3d.bool() if mask_3d is not None else None
         point_loss_for_metrics: Optional[torch.Tensor] = None
 
         # Per-point weight for static reprojection queries (has_tracks=False).

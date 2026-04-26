@@ -32,6 +32,8 @@ class SamplerConfig:
     sampling_mode: Literal['random', 'sequential', 'stride'] = 'random'
     min_frames: int = 8
     sequence_weights: Optional[dict[str, float]] = None
+    sequence_locality_size: int = 1
+    frame_locality_radius: Optional[int] = None
 
 
 # Dataset-adaptive stride policy.
@@ -67,6 +69,16 @@ _DEFAULT_STRIDE_CANDIDATES = [1, 2, 3, 4]
 _DEFAULT_STRIDE_WEIGHTS = [0.50, 0.25, 0.15, 0.10]
 
 
+@dataclass
+class _SequenceBlockState:
+    """Worker-local reusable sequence block for short-term sampling locality."""
+    sequence_name: str
+    num_frames: int
+    remaining_uses: int
+    stride: Optional[int] = None
+    last_start_idx: Optional[int] = None
+
+
 class DatasetSampler:
     """
     Single-dataset sampler.
@@ -96,6 +108,8 @@ class DatasetSampler:
         sequence_weights: Optional[dict[str, float]] = None,
         allowed_sequences: Optional[list[str]] = None,
         custom_stride_range: Optional[tuple[int, int]] = None,
+        sequence_locality_size: int = 1,
+        frame_locality_radius: Optional[int] = None,
     ):
         self.adapter = adapter
         self.clip_len = clip_len
@@ -104,6 +118,11 @@ class DatasetSampler:
         self.sequence_weights = sequence_weights
         self.allowed_sequences_set = set(allowed_sequences) if allowed_sequences is not None else None
         self.custom_stride_range = custom_stride_range
+        self.sequence_locality_size = max(1, int(sequence_locality_size))
+        self.frame_locality_radius = (
+            None if frame_locality_radius is None else max(0, int(frame_locality_radius))
+        )
+        self._active_sequence: Optional[_SequenceBlockState] = None
 
         # Filter sequences by minimum frame count (and whitelist if given)
         self.valid_sequences = self._filter_sequences()
@@ -182,6 +201,42 @@ class DatasetSampler:
         valid_probs = [w / total for w in valid_weights]
         return rng.choices(valid_candidates, weights=valid_probs, k=1)[0]
 
+    def reset_locality_state(self) -> None:
+        """Drop any reusable sequence block for this worker-local sampler copy."""
+        self._active_sequence = None
+
+    def _sample_sequence_name(self, rng: _random_module.Random) -> str:
+        return rng.choices(self.valid_sequences, weights=self.sampling_probs, k=1)[0]
+
+    def _start_sequence_block(self, rng: _random_module.Random) -> _SequenceBlockState:
+        sequence_name = self._sample_sequence_name(rng)
+        num_frames = self.adapter.get_num_frames(sequence_name)
+        state = _SequenceBlockState(
+            sequence_name=sequence_name,
+            num_frames=num_frames,
+            remaining_uses=self.sequence_locality_size,
+        )
+        if self.sampling_mode == 'stride':
+            state.stride = self._sample_stride(num_frames, rng)
+        return state
+
+    def _sample_start_idx(
+        self,
+        max_start: int,
+        rng: _random_module.Random,
+        previous_start: Optional[int] = None,
+    ) -> int:
+        if max_start <= 0:
+            return 0
+        if previous_start is None or self.frame_locality_radius is None or self.frame_locality_radius <= 0:
+            return rng.randint(0, max_start)
+
+        low = max(0, previous_start - self.frame_locality_radius)
+        high = min(max_start, previous_start + self.frame_locality_radius)
+        if low > high:
+            low, high = 0, max_start
+        return rng.randint(low, high)
+
     def sample(self, rng: Optional[_random_module.Random] = None) -> tuple[str, list[int]]:
         """
         Sample a sequence and frame indices.
@@ -192,13 +247,21 @@ class DatasetSampler:
         if rng is None:
             rng = _random_module.Random()
 
-        sequence_name = rng.choices(self.valid_sequences, weights=self.sampling_probs, k=1)[0]
-        info = self.adapter.get_sequence_info(sequence_name)
-        num_frames = info['num_frames']
-        frame_indices = self._sample_frame_indices(num_frames, rng)
-        return sequence_name, frame_indices
+        block_state = self._active_sequence
+        if block_state is None or block_state.remaining_uses <= 0:
+            block_state = self._start_sequence_block(rng)
 
-    def _sample_frame_indices(self, num_frames: int, rng: _random_module.Random) -> list[int]:
+        frame_indices = self._sample_frame_indices(block_state.num_frames, rng, block_state=block_state)
+        block_state.remaining_uses -= 1
+        self._active_sequence = block_state if block_state.remaining_uses > 0 else None
+        return block_state.sequence_name, frame_indices
+
+    def _sample_frame_indices(
+        self,
+        num_frames: int,
+        rng: _random_module.Random,
+        block_state: Optional[_SequenceBlockState] = None,
+    ) -> list[int]:
         """Sample frame indices based on sampling mode."""
         if self.sampling_mode == 'random':
             # Random sampling with replacement.
@@ -208,22 +271,40 @@ class DatasetSampler:
         if self.sampling_mode == 'sequential':
             # Sample one contiguous temporal window.
             if num_frames == self.clip_len:
+                if block_state is not None:
+                    block_state.last_start_idx = 0
                 return list(range(num_frames))
-            start_idx = rng.randint(0, num_frames - self.clip_len)
+            start_idx = self._sample_start_idx(
+                num_frames - self.clip_len,
+                rng,
+                previous_start=None if block_state is None else block_state.last_start_idx,
+            )
+            if block_state is not None:
+                block_state.last_start_idx = start_idx
             return list(range(start_idx, start_idx + self.clip_len))
 
         if self.sampling_mode == 'stride':
             # Dataset-adaptive random stride sampling.
             # This keeps dynamic video clips temporally coherent while allowing
             # larger view spacing on static multi-view datasets.
-            stride = self._sample_stride(num_frames, rng)
+            stride = block_state.stride if block_state is not None and block_state.stride is not None else self._sample_stride(num_frames, rng)
+            if block_state is not None:
+                block_state.stride = stride
             max_start = num_frames - (self.clip_len - 1) * stride
 
             if max_start <= 0:
                 # Graceful fallback for very short sequences.
+                if block_state is not None:
+                    block_state.last_start_idx = 0
                 return list(range(min(self.clip_len, num_frames)))
 
-            start_idx = rng.randint(0, max_start - 1)
+            start_idx = self._sample_start_idx(
+                max_start - 1,
+                rng,
+                previous_start=None if block_state is None else block_state.last_start_idx,
+            )
+            if block_state is not None:
+                block_state.last_start_idx = start_idx
             return [start_idx + i * stride for i in range(self.clip_len)]
 
         raise ValueError(f"Unknown sampling_mode: {self.sampling_mode}")

@@ -3,6 +3,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -11,6 +12,14 @@ import numpy as np
 from PIL import Image
 
 from .base import BaseAdapter, UnifiedClip, load_precomputed_fast
+
+
+_MIN_TEMPORAL_TRACK_RATIO = 0.05
+_MIN_MEAN_VISIBLE_FRAMES = 1.5
+_TRACK_FAILURE_MARKER_NAME = "precomputed.failed.json"
+_FRAME_ANNO_CACHE_MAXSIZE = 4   # categories kept per DataLoader worker (~200 MB each)
+_TRACK_ARRAY_KEYS = ("trajs_2d", "trajs_3d_world", "valids", "visibs")
+_LOCAL_TRACK_OVERLAY_NAME = "precomputed.overlay.npz"
 
 
 # ---------------------------------------------------------------------------
@@ -42,6 +51,58 @@ class _Co3DSequenceRecord:
     def uid(self) -> str:
         """Globally unique sequence ID: '<category>/<sequence_name>'."""
         return f"{self.category}/{self.sequence_name}"
+
+
+def _overlay_npz_and_label(
+    *,
+    precompute_root: Path | None,
+    track_precompute_root: Path | None,
+    sequence_name: str,
+) -> tuple[Path | None, str | None]:
+    if track_precompute_root is not None:
+        return track_precompute_root / sequence_name / "precomputed.npz", "track_precompute_root"
+    if precompute_root is not None:
+        return precompute_root / sequence_name / _LOCAL_TRACK_OVERLAY_NAME, "local_track_overlay"
+    return None, None
+
+
+def _summarize_precomputed_track_validity(valids: Optional[np.ndarray]) -> dict[str, float]:
+    """Summarize how temporal a precomputed track set really is."""
+    if valids is None:
+        return {
+            "mean_visible_frames": 0.0,
+            "tracks_ge_2_ratio": 0.0,
+            "tracks_ge_4_ratio": 0.0,
+        }
+
+    valids_np = np.asarray(valids, dtype=bool)
+    if valids_np.ndim != 2 or valids_np.shape[1] == 0:
+        return {
+            "mean_visible_frames": 0.0,
+            "tracks_ge_2_ratio": 0.0,
+            "tracks_ge_4_ratio": 0.0,
+        }
+
+    per_track_visible = valids_np.sum(axis=0)
+    return {
+        "mean_visible_frames": float(per_track_visible.mean()),
+        "tracks_ge_2_ratio": float((per_track_visible >= 2).mean()),
+        "tracks_ge_4_ratio": float((per_track_visible >= 4).mean()),
+    }
+
+
+def _precomputed_tracks_look_temporal(
+    valids: Optional[np.ndarray],
+    *,
+    min_track_ge_2_ratio: float = _MIN_TEMPORAL_TRACK_RATIO,
+    min_mean_visible_frames: float = _MIN_MEAN_VISIBLE_FRAMES,
+) -> bool:
+    """Reject degenerate precomputed caches that only contain single-frame points."""
+    stats = _summarize_precomputed_track_validity(valids)
+    return (
+        stats["tracks_ge_2_ratio"] >= float(min_track_ge_2_ratio)
+        and stats["mean_visible_frames"] >= float(min_mean_visible_frames)
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -562,6 +623,7 @@ class Co3Dv2Adapter(BaseAdapter):
         strict: bool = False,
         verbose: bool = True,
         precompute_root: Optional[str] = None,
+        track_precompute_root: Optional[str] = None,
         cache_dir: Optional[str] = None,
         min_viewpoint_quality: Optional[float] = None,
         min_pointcloud_quality: Optional[float] = None,
@@ -645,6 +707,9 @@ class Co3Dv2Adapter(BaseAdapter):
         self.strict = strict
         self.verbose = verbose
         self.precompute_root = Path(precompute_root) if precompute_root else self.root
+        self.track_precompute_root = (
+            Path(track_precompute_root) if track_precompute_root else None
+        )
         self.min_viewpoint_quality = _safe_float(min_viewpoint_quality)
         self.min_pointcloud_quality = _safe_float(min_pointcloud_quality)
         self.min_pointcloud_n_points = _safe_int(min_pointcloud_n_points)
@@ -663,13 +728,27 @@ class Co3Dv2Adapter(BaseAdapter):
         self._filter_summary: dict[str, Any] = {}
 
         # category → {(seq_name, frame_number): frame_annotation_dict}
-        # Populated lazily on first access.
-        self._frame_anno_cache: dict[str, dict[tuple[str, int], dict]] = {}
+        # LRU-evicted OrderedDict, capped at _FRAME_ANNO_CACHE_MAXSIZE categories.
+        # Each decompressed jgz index is ~150-250 MB; keeping a few categories per
+        # worker avoids reloading 5-6 s on every category miss.
+        self._frame_anno_cache: OrderedDict[str, dict[tuple[str, int], dict]] = OrderedDict()
         # category → {sequence_name: sequence_annotation_dict}
+        # sequence_annotations.jgz is tiny (~50 KB), safe to keep all 51 categories.
         self._sequence_anno_cache: dict[str, dict[str, dict]] = {}
+
+        # Fast frame-annotation npz cache directory (built by build_co3dv2_frame_cache.py).
+        # When available, _get_frame_anno uses these ~0.2 ms npz files instead of
+        # the 14 s jgz → JSON → dict pipeline, eliminating the biggest data spike.
+        self._frame_anno_npz_dir: Optional[Path] = (
+            Path(cache_dir) / "co3dv2_frame_anno" if cache_dir is not None else None
+        )
+        # category → loaded NpzFile (lazy, kept open; OS page-cache means hot reads ~0.2 ms)
+        self._frame_anno_npz: dict[str, Any] = {}
 
         # sequence_uid → depth_scene_scale (estimated from PLY, cached in memory)
         self._depth_scale_cache: dict[str, float] = {}
+        self._degenerate_precomputed_warn_count = 0
+        self._track_failure_marker_warn_count = 0
 
 
         if cache_dir is not None:
@@ -723,10 +802,30 @@ class Co3Dv2Adapter(BaseAdapter):
 
         # Check whether precomputed tracks are available for this sequence.
         has_precomputed = False
+        base_has_precomputed = False
         if self.precompute_root is not None:
             npz_path = self.precompute_root / sequence_name / "precomputed.npz"
             h5_path  = npz_path.with_suffix(".h5")
-            has_precomputed = h5_path.exists() or npz_path.exists()
+            base_has_precomputed = h5_path.exists() or npz_path.exists()
+            has_precomputed = base_has_precomputed
+        track_has_precomputed = False
+        track_failure_marker = False
+        npz_path, _track_label = _overlay_npz_and_label(
+            precompute_root=self.precompute_root,
+            track_precompute_root=self.track_precompute_root,
+            sequence_name=sequence_name,
+        )
+        if npz_path is not None:
+            h5_path = npz_path.with_suffix(".h5")
+            track_has_precomputed = h5_path.exists() or npz_path.exists()
+            track_failure_marker = (
+                not track_has_precomputed
+                and npz_path.with_name(_TRACK_FAILURE_MARKER_NAME).exists()
+            )
+            has_precomputed = has_precomputed or track_has_precomputed
+
+        has_tracks = track_has_precomputed or (base_has_precomputed and not track_failure_marker)
+        has_normals = has_precomputed
 
         return {
             "dataset_name": self.dataset_name,
@@ -746,10 +845,10 @@ class Co3Dv2Adapter(BaseAdapter):
             "height": H,
             "width": W,
             "has_depth": True,
-            "has_normals": has_precomputed,
-            "has_tracks": has_precomputed,
-            "has_visibility": has_precomputed,
-            "has_trajs_3d_world": has_precomputed,
+            "has_normals": has_normals,
+            "has_tracks": has_tracks,
+            "has_visibility": has_tracks,
+            "has_trajs_3d_world": has_tracks,
             "extrinsics_convention": "w2c",
             "depth_unit": "co3d_scene_units",
         }
@@ -779,7 +878,6 @@ class Co3Dv2Adapter(BaseAdapter):
         # Clamp frame_indices to valid range for co3dv2 (precomputed data may have fewer frames)
         frame_indices = [max(0, min(i, r.num_frames - 1)) for i in frame_indices]
         self._check_indices(frame_indices, r.num_frames, sequence_name)
-
 
         def _load_one(idx):
             fn   = r.frame_numbers[idx]
@@ -820,36 +918,114 @@ class Co3Dv2Adapter(BaseAdapter):
         precomputed_ref_frame = None
         precomputed_num_points = None
         precomputed_track_source = None
+        precomputed_track_stats = _summarize_precomputed_track_validity(None)
+        precomputed_tracks_degenerate = False
+        base_cache = None
         if self.precompute_root is not None:
-            npz_path = self.precompute_root / sequence_name / "precomputed.npz"
-            cache = load_precomputed_fast(npz_path, frame_indices)
-            if cache is not None:
-                # load_precomputed_fast already reorders data to frame_indices order,
-                # so we index with consecutive [0, 1, ..., len-1] here.
-                T_clip = len(frame_indices)
-                # normals: shape (T_clip, H, W, 3) → list of (H,W,3)
-                normals_raw = cache["normals"]  # (T_clip, H, W, 3) float16
-                normals_out = [
-                    normals_raw[i].astype(np.float32) for i in range(T_clip)
-                ]
-                trajs_2d_out    = cache["trajs_2d"]       # (T_clip, N, 2)
-                trajs_3d_out    = cache["trajs_3d_world"]  # (T_clip, N, 3)
-                valids_out      = cache["valids"]          # (T_clip, N)
-                visibs_out      = cache["visibs"]          # (T_clip, N)
-                has_normals_out = True
-                has_tracks_out  = True
-                if "ref_frame" in cache:
-                    precomputed_ref_frame = int(cache["ref_frame"])
-                if "num_points" in cache:
-                    precomputed_num_points = int(cache["num_points"])
-                if "track_source" in cache:
-                    src = cache["track_source"]
-                    if isinstance(src, bytes):
-                        precomputed_track_source = src.decode("utf-8", errors="replace")
-                    elif isinstance(src, np.ndarray) and src.ndim == 0:
-                        precomputed_track_source = str(src.item())
-                    else:
-                        precomputed_track_source = str(src)
+            base_npz_path = self.precompute_root / sequence_name / "precomputed.npz"
+            # Skip "normals" on the first pass — it is the largest array in the
+            # npz (~2 s zlib decompress for a 50 MB file) and only needed if
+            # base_cache is actually selected for normal supervision.  We reload
+            # it below only when we confirm base_cache will supply normals.
+            base_cache = load_precomputed_fast(
+                base_npz_path, frame_indices, skip_keys={"normals"}
+            )
+
+        track_cache = None
+        track_failure_marker = False
+        track_npz_path, track_cache_label = _overlay_npz_and_label(
+            precompute_root=self.precompute_root,
+            track_precompute_root=self.track_precompute_root,
+            sequence_name=sequence_name,
+        )
+        if track_npz_path is not None:
+            track_cache = load_precomputed_fast(track_npz_path, frame_indices)
+            track_failure_marker = (
+                track_cache is None
+                and track_npz_path.with_name(_TRACK_FAILURE_MARKER_NAME).exists()
+            )
+
+        selected_track_cache = None
+        selected_track_cache_label = None
+        if track_cache is not None:
+            selected_track_cache = track_cache
+            selected_track_cache_label = track_cache_label
+        elif not track_failure_marker:
+            selected_track_cache = base_cache
+            selected_track_cache_label = "precompute_root"
+
+        if track_failure_marker and self.verbose and self._track_failure_marker_warn_count < 8:
+            self._track_failure_marker_warn_count += 1
+            print(
+                "[Co3Dv2Adapter] overlay failure marker blocks base precomputed tracks "
+                f"for {sequence_name}. Falling back to depth-only supervision until "
+                "a valid overlay precomputed.npz exists."
+            )
+
+        if base_cache is not None:
+            # Load normals lazily: only when the base precomputed file is
+            # actually the selected source (i.e. no track_cache overlay or
+            # track_failure_marker).  Normals are the largest array in the npz
+            # (~6 s of zlib decompress for a 50 MB file) so we skip them when
+            # they won't be used.
+            if selected_track_cache is base_cache or (
+                selected_track_cache is None and not track_failure_marker
+            ):
+                base_npz_path = self.precompute_root / sequence_name / "precomputed.npz"
+                normals_npz = load_precomputed_fast(
+                    base_npz_path, frame_indices, skip_keys={
+                        k for k in ("trajs_2d", "trajs_3d_world", "valids", "visibs",
+                                    "ref_frame", "num_points", "num_frames", "track_source")
+                    }
+                )
+                if normals_npz is not None and "normals" in normals_npz:
+                    T_clip = len(frame_indices)
+                    normals_raw = normals_npz["normals"]
+                    normals_out = [
+                        normals_raw[i].astype(np.float32) for i in range(T_clip)
+                    ]
+                    has_normals_out = True
+
+        if selected_track_cache is not None:
+            has_track_arrays = all(
+                key in selected_track_cache for key in _TRACK_ARRAY_KEYS
+            )
+            precomputed_track_stats = _summarize_precomputed_track_validity(
+                selected_track_cache.get("valids") if has_track_arrays else None
+            )
+            if has_track_arrays and _precomputed_tracks_look_temporal(
+                selected_track_cache.get("valids")
+            ):
+                trajs_2d_out = selected_track_cache["trajs_2d"]
+                trajs_3d_out = selected_track_cache["trajs_3d_world"]
+                valids_out = selected_track_cache["valids"]
+                visibs_out = selected_track_cache["visibs"]
+                has_tracks_out = True
+            elif has_track_arrays:
+                precomputed_tracks_degenerate = True
+                if self.verbose and self._degenerate_precomputed_warn_count < 8:
+                    self._degenerate_precomputed_warn_count += 1
+                    print(
+                        "[Co3Dv2Adapter] ignoring degenerate precomputed tracks "
+                        f"for {sequence_name} from {selected_track_cache_label}: "
+                        f"mean_visible_frames={precomputed_track_stats['mean_visible_frames']:.3f}, "
+                        f"tracks_ge_2_ratio={precomputed_track_stats['tracks_ge_2_ratio']:.3f}. "
+                        "Falling back to depth-only supervision for this clip."
+                    )
+
+            if "ref_frame" in selected_track_cache:
+                precomputed_ref_frame = int(selected_track_cache["ref_frame"])
+            if "num_points" in selected_track_cache:
+                precomputed_num_points = int(selected_track_cache["num_points"])
+            if "track_source" in selected_track_cache:
+                src = selected_track_cache["track_source"]
+                if isinstance(src, bytes):
+                    precomputed_track_source = src.decode("utf-8", errors="replace")
+                elif isinstance(src, np.ndarray) and src.ndim == 0:
+                    precomputed_track_source = str(src.item())
+                else:
+                    precomputed_track_source = str(src)
+
 
         return UnifiedClip(
             dataset_name=self.dataset_name,
@@ -886,6 +1062,14 @@ class Co3Dv2Adapter(BaseAdapter):
                 "has_tracks": has_tracks_out,
                 "has_visibility": has_tracks_out,
                 "has_trajs_3d_world": has_tracks_out,
+                "normal_convention": "camera_space_opencv_towards_camera" if has_normals_out else None,
+                "normal_supervision_compatible": has_normals_out,
+                "precomputed_mean_visible_frames": precomputed_track_stats["mean_visible_frames"],
+                "precomputed_tracks_ge_2_ratio": precomputed_track_stats["tracks_ge_2_ratio"],
+                "precomputed_tracks_ge_4_ratio": precomputed_track_stats["tracks_ge_4_ratio"],
+                "precomputed_tracks_degenerate": precomputed_tracks_degenerate,
+                "precomputed_track_failure_marker": track_failure_marker,
+                "precomputed_track_cache_layer": selected_track_cache_label if selected_track_cache is not None else None,
                 "pose_convention": "w2c",
                 "extrinsics_convention": "w2c",
                 "intrinsics_convention": "pinhole",
@@ -1457,34 +1641,139 @@ class Co3Dv2Adapter(BaseAdapter):
         return self._sequence_anno_cache[category].get(sequence_name)
 
     def _ensure_frame_anno_loaded(self, category: str) -> None:
-        """Load and cache frame_annotations.jgz for *category* if not already done."""
+        """Load and cache frame_annotations for *category* if not already done.
+
+        Fast path (≈23 ms one-time, ~0.01 ms per query): loads a pre-built
+        stacked .npz file from ``_frame_anno_npz_dir`` into RAM.  All viewpoint
+        and depth-scale arrays land in contiguous numpy memory, so per-frame
+        lookups use searchsorted rather than a 163 K-entry Python dict.
+        Falls back to the LRU-evicted jgz path (~14 s) if no pre-built npz exists.
+        """
         if category in self._frame_anno_cache:
+            self._frame_anno_cache.move_to_end(category)
             return
 
+        # ── Fast path: pre-built stacked npz ──────────────────────────────
+        if self._frame_anno_npz_dir is not None:
+            # Direct path construction instead of glob to avoid hot-path I/O
+            # Expected cache structure: frame_anno_{category}_v1.npz
+            npz_path = self._frame_anno_npz_dir / f"frame_anno_{category}_v1.npz"
+            if npz_path.exists():
+                if category not in self._frame_anno_npz:
+                    # np.load without mmap: all arrays land in RAM (~23 ms for
+                    # apple with 163 K frames, 13 MB).  Random index then costs
+                    # ~0.01 ms vs ~15 ms with mmap random access.
+                    z = np.load(npz_path)
+                    seq_names = z["seq_names"]
+                    offsets   = z["offsets"]
+                    self._frame_anno_npz[category] = {
+                        "seq_to_range": {
+                            str(name): (int(offsets[i]), int(offsets[i + 1]))
+                            for i, name in enumerate(seq_names)
+                        },
+                        "fns":       z["fns"],
+                        "R":         z["R"],
+                        "T":         z["T"],
+                        "focal":     z["focal"],
+                        "pp":        z["pp"],
+                        "imgsz":     z["imgsz"],
+                        "dscale":    z["dscale"],
+                        "img_stems": z["img_stems"] if "img_stems" in z else None,
+                    }
+                # Sentinel in LRU cache so move_to_end / eviction still works.
+                self._frame_anno_cache[category] = {"__npz__": True}
+                if len(self._frame_anno_cache) > _FRAME_ANNO_CACHE_MAXSIZE:
+                    evicted_cat = next(iter(self._frame_anno_cache))
+                    self._frame_anno_cache.popitem(last=False)
+                    self._frame_anno_npz.pop(evicted_cat, None)
+                return
+
+        # ── Slow path: jgz → JSON → dict (LRU-evicted) ────────────────────
         path = self.root / category / "frame_annotations.jgz"
         if not path.exists():
             raise FileNotFoundError(f"frame_annotations.jgz not found: {path}")
 
         annotations = _load_jgz(path)
-        # Index by (sequence_name, frame_number) for O(1) lookup.
         index: dict[tuple[str, int], dict] = {}
         for entry in annotations:
             key = (entry["sequence_name"], int(entry["frame_number"]))
             index[key] = entry
 
         self._frame_anno_cache[category] = index
+        if len(self._frame_anno_cache) > _FRAME_ANNO_CACHE_MAXSIZE:
+            self._frame_anno_cache.popitem(last=False)
 
     def _get_frame_anno(
         self, category: str, sequence_name: str, frame_number: int
     ) -> dict:
         self._ensure_frame_anno_loaded(category)
+        self._frame_anno_cache.move_to_end(category)
+        entry = self._frame_anno_cache[category]
+
+        # ── Fast path: npz-backed ──────────────────────────────────────────
+        if entry.get("__npz__"):
+            return self._lookup_frame_anno_from_npz(category, sequence_name, frame_number)
+
+        # ── Slow path: plain dict from jgz ─────────────────────────────────
         key = (sequence_name, int(frame_number))
-        cache = self._frame_anno_cache[category]
-        if key not in cache:
+        if key not in entry:
             raise KeyError(
                 f"No annotation for ({category}/{sequence_name}, frame {frame_number})"
             )
-        return cache[key]
+        return entry[key]
+
+    def _lookup_frame_anno_from_npz(
+        self, category: str, sequence_name: str, frame_number: int
+    ) -> dict:
+        """Look up a single frame's annotation from the in-memory npz arrays.
+
+        Cost: ~0.01 ms (dict lookup + searchsorted + 6 scalar index ops).
+        """
+        z = self._frame_anno_npz[category]
+        start, end = z["seq_to_range"][sequence_name]
+        fn_slice = z["fns"][start:end]
+        pos = int(np.searchsorted(fn_slice, frame_number))
+        fi  = start + pos
+        if fi >= end or int(z["fns"][fi]) != frame_number:
+            raise KeyError(
+                f"No annotation for ({category}/{sequence_name}, frame {frame_number})"
+            )
+
+        fn     = int(z["fns"][fi])
+        focal  = z["focal"][fi].tolist()
+        pp     = z["pp"][fi].tolist()
+        R_list = z["R"][fi].tolist()
+        T_list = z["T"][fi].tolist()
+        H, W   = int(z["imgsz"][fi, 0]), int(z["imgsz"][fi, 1])
+        dscale = float(z["dscale"][fi])
+
+        # Use stored image stem (e.g. "frame000025") to reconstruct paths.
+        # Co3D's frame_number is NOT always equal to the numeric part of the
+        # filename — for ~18 % of frames they diverge — so we must use the
+        # pre-stored stem rather than formatting frame_number directly.
+        # Fall back to formatting if img_stems is absent (old v1 npz).
+        img_stems = z.get("img_stems")
+        stem = str(img_stems[fi]) if img_stems is not None else f"frame{fn:06d}"
+        return {
+            "sequence_name": sequence_name,
+            "frame_number":  fn,
+            "image": {
+                "path": f"{category}/{sequence_name}/images/{stem}.jpg",
+                "size": [H, W],
+            },
+            "depth": {
+                "path": f"{category}/{sequence_name}/depths/{stem}.jpg.geometric.png",
+                "scale_adjustment": dscale,
+                "mask_path": f"{category}/{sequence_name}/depth_masks/{stem}.png",
+            },
+            "mask": {"path": f"{category}/{sequence_name}/masks/{stem}.png"},
+            "viewpoint": {
+                "focal_length":    focal,
+                "principal_point": pp,
+                "R": R_list,
+                "T": T_list,
+            },
+        }
 
     # ------------------------------------------------------------------
     # Helpers

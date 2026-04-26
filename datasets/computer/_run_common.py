@@ -78,6 +78,10 @@ def _process_sequence(args: tuple) -> tuple[str, str | None]:
             ref_frame       = np.array(tracks["ref_frame"],  dtype=np.int32),
             num_frames      = np.array(num_frames,           dtype=np.int32),
             num_points      = np.array(tracks["num_points"], dtype=np.int32),
+            track_semantics_version = np.array(
+                tracks.get("track_semantics_version", 0),
+                dtype=np.int32,
+            ),
         )
         return seq_name, None
 

@@ -63,30 +63,31 @@ def read_ply_pointcloud(ply_path: Path) -> np.ndarray:
         y_idx = prop_names.index('y')
         z_idx = prop_names.index('z')
 
-        # Read binary data
-        if format_type == 'binary_little_endian':
-            import struct
-            # Assume float for x,y,z and uchar for colors
-            vertex_size = 0
-            for prop_name, prop_type in properties:
-                if prop_type == 'float':
-                    vertex_size += 4
-                elif prop_type == 'uchar':
-                    vertex_size += 1
-
-            data = f.read()
-            points = []
-            for i in range(num_vertices):
-                offset = i * vertex_size
-                # Read x, y, z (first 3 floats)
-                x = struct.unpack('<f', data[offset:offset+4])[0]
-                y = struct.unpack('<f', data[offset+4:offset+8])[0]
-                z = struct.unpack('<f', data[offset+8:offset+12])[0]
-                points.append([x, y, z])
-
-            return np.array(points, dtype=np.float32)
-        else:
+        if format_type != 'binary_little_endian':
             raise ValueError(f"Unsupported PLY format: {format_type}")
+
+        ply_type_map = {
+            'char': np.int8,
+            'uchar': np.uint8,
+            'short': np.int16,
+            'ushort': np.uint16,
+            'int': np.int32,
+            'uint': np.uint32,
+            'float': np.float32,
+            'double': np.float64,
+        }
+        try:
+            dtype = np.dtype([
+                (prop_name, np.dtype(ply_type_map[prop_type]).newbyteorder('<'))
+                for prop_name, prop_type in properties
+            ])
+        except KeyError as exc:
+            raise ValueError(f"Unsupported PLY property type in {ply_path}: {exc}") from exc
+
+        vertices = np.fromfile(f, dtype=dtype, count=num_vertices)
+        return np.stack([vertices['x'], vertices['y'], vertices['z']], axis=1).astype(
+            np.float32, copy=False
+        )
 
 
 def project_pointcloud_to_frames(
@@ -104,28 +105,7 @@ def project_pointcloud_to_frames(
 
     trajs_2d = np.zeros((T, N, 2), dtype=np.float32)
     valids = np.zeros((T, N), dtype=bool)
-
-    # Find reference frame (most points visible)
-    ref_valid_counts = []
-    for t in range(T):
-        E_t = extrinsics[t]
-        K_t = intrinsics[t]
-
-        # World to camera
-        P_hom = np.concatenate([pointcloud, np.ones((N, 1), dtype=np.float32)], axis=1)
-        P_cam = (E_t @ P_hom.T).T[:, :3]
-        z = P_cam[:, 2]
-
-        # Project to 2D
-        fx, fy, cx, cy = K_t[0,0], K_t[1,1], K_t[0,2], K_t[1,2]
-        u = P_cam[:, 0] / z * fx + cx
-        v = P_cam[:, 1] / z * fy + cy
-
-        # In-bounds check
-        in_bounds = (u >= 0) & (u < W) & (v >= 0) & (v < H) & (z > 0)
-        ref_valid_counts.append(in_bounds.sum())
-
-    ref_frame = int(np.argmax(ref_valid_counts))
+    ref_valid_counts = np.zeros(T, dtype=np.int32)
 
     # Project to all frames
     for t in range(T):
@@ -134,25 +114,32 @@ def project_pointcloud_to_frames(
         depth_t = depths[t]
 
         # World to camera
-        P_hom = np.concatenate([pointcloud, np.ones((N, 1), dtype=np.float32)], axis=1)
-        P_cam = (E_t @ P_hom.T).T[:, :3]
+        P_cam = pointcloud @ E_t[:3, :3].T + E_t[:3, 3]
         z_proj = P_cam[:, 2]
 
         # Project to 2D
         fx, fy, cx, cy = K_t[0,0], K_t[1,1], K_t[0,2], K_t[1,2]
-        u = P_cam[:, 0] / z_proj * fx + cx
-        v = P_cam[:, 1] / z_proj * fy + cy
+        safe_z = np.maximum(z_proj, 1e-6)
+        u = P_cam[:, 0] / safe_z * fx + cx
+        v = P_cam[:, 1] / safe_z * fy + cy
 
         # In-bounds check
         in_bounds = (u >= 0) & (u < W) & (v >= 0) & (v < H) & (z_proj > 0)
+        ref_valid_counts[t] = int(in_bounds.sum())
 
         # Depth consistency check (relaxed for Co3D's sparse depth)
-        px = np.clip(np.round(u).astype(np.int32), 0, W - 1)
-        py = np.clip(np.round(v).astype(np.int32), 0, H - 1)
-        sampled_d = depth_t[py, px]
+        finite_uv = np.isfinite(u) & np.isfinite(v)
+        px = np.zeros(N, dtype=np.int32)
+        py = np.zeros(N, dtype=np.int32)
+        if np.any(finite_uv):
+            px[finite_uv] = np.clip(np.round(u[finite_uv]), 0, W - 1).astype(np.int32)
+            py[finite_uv] = np.clip(np.round(v[finite_uv]), 0, H - 1).astype(np.int32)
+        sampled_d = np.zeros(N, dtype=depth_t.dtype)
+        if np.any(finite_uv):
+            sampled_d[finite_uv] = depth_t[py[finite_uv], px[finite_uv]]
 
         # Only check if depth is valid (not zero)
-        depth_valid = (sampled_d > 0) & np.isfinite(sampled_d)
+        depth_valid = finite_uv & (sampled_d > 0) & np.isfinite(sampled_d)
         depth_ok = np.ones(N, dtype=bool)  # Default to True
         depth_ok[depth_valid] = (
             np.abs(sampled_d[depth_valid] - z_proj[depth_valid]) /
@@ -160,9 +147,11 @@ def project_pointcloud_to_frames(
         )
 
         valid_t = in_bounds & depth_ok
-        trajs_2d[t] = np.stack([u, v], axis=1)
+        trajs_2d[t, :, 0] = u
+        trajs_2d[t, :, 1] = v
         valids[t] = valid_t
 
+    ref_frame = int(np.argmax(ref_valid_counts))
     trajs_3d_world = np.broadcast_to(pointcloud[None], (T, N, 3)).copy()
     visibs = valids.copy()
 

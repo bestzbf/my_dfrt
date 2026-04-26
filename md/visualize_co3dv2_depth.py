@@ -6,6 +6,7 @@ import argparse
 import random
 from pathlib import Path
 import sys
+from typing import Any
 
 import cv2
 import matplotlib
@@ -28,6 +29,12 @@ def parse_args():
     p = argparse.ArgumentParser()
     p.add_argument("--config", required=True)
     p.add_argument("--checkpoint", required=True)
+    p.add_argument(
+        "--model-variant",
+        default="auto",
+        choices=("auto", "base", "large", "huge", "giant"),
+        help="模型尺寸。默认 auto 会从 checkpoint 张量形状自动推断。",
+    )
     p.add_argument("--output-dir", required=True)
     p.add_argument("--num-samples", type=int, default=3)
     p.add_argument("--num-frames", type=int, default=48)
@@ -43,17 +50,65 @@ def parse_args():
     return p.parse_args()
 
 
+VARIANT_BY_EMBED_DIM = {
+    768: "base",
+    1024: "large",
+    1280: "huge",
+    1408: "giant",
+}
+
+
+def extract_model_state(ckpt: dict[str, Any], checkpoint_path: str) -> dict[str, torch.Tensor]:
+    if "model" in ckpt:
+        return ckpt["model"]
+    if "model_state_dict" in ckpt:
+        return ckpt["model_state_dict"]
+    raise KeyError(f"Unsupported checkpoint format in {checkpoint_path}")
+
+
+def infer_model_variant_from_state(state: dict[str, torch.Tensor]) -> str:
+    preferred_suffixes = (
+        "encoder.patch_embed.proj.weight",
+        "encoder.norm.weight",
+        "decoder.norm.weight",
+    )
+    for suffix in preferred_suffixes:
+        for key, tensor in state.items():
+            if not key.endswith(suffix) or not hasattr(tensor, "shape") or len(tensor.shape) == 0:
+                continue
+            embed_dim = int(tensor.shape[0])
+            if embed_dim in VARIANT_BY_EMBED_DIM:
+                return VARIANT_BY_EMBED_DIM[embed_dim]
+            raise ValueError(
+                f"Cannot infer model variant: {key} has embed_dim={embed_dim}, "
+                f"expected one of {sorted(VARIANT_BY_EMBED_DIM)}"
+            )
+    raise ValueError("Cannot infer model variant: checkpoint has no recognizable encoder/decoder shape keys")
+
+
+def resolve_model_variant(requested_variant: str, state: dict[str, torch.Tensor]) -> str:
+    if requested_variant != "auto":
+        return requested_variant
+    inferred_variant = infer_model_variant_from_state(state)
+    print(f"[depth] Auto-detected model_variant={inferred_variant} from checkpoint tensor shapes", flush=True)
+    return inferred_variant
+
+
 def load_model(args, device):
+    ckpt = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    state = extract_model_state(ckpt, args.checkpoint)
+    model_variant = resolve_model_variant(args.model_variant, state)
+    args.model_variant = model_variant
     model = create_d4rt(
-        variant="base", decoder_depth=6,
+        variant=model_variant,
         img_size=args.resolution, temporal_size=args.num_frames,
         patch_size=(2, 16, 16), query_patch_size=9,
-        videomae_model="/data1/zbf/pretrained/videomae-base",
         patch_provider=args.patch_provider,
-    ).to(device)
-    ckpt = torch.load(args.checkpoint, map_location=device)
-    state = ckpt.get("model") or ckpt.get("model_state_dict")
+        encoder_pretrained=False,
+    )
     model.load_state_dict(state, strict=True)
+    del state, ckpt
+    model = model.to(device)
     model.eval()
     return model
 
@@ -327,6 +382,7 @@ def main():
         config = yaml.safe_load(f)
     dataset = create_training_dataset(config, split=args.split)
     model = load_model(args, device)
+    print(f"[depth] Model loaded on {device} (variant={args.model_variant})", flush=True)
     S = args.resolution  # 256
 
     found = 0

@@ -127,7 +127,7 @@ def _umeyama_native(
     R = U @ Vh
 
     # Handle reflection (ensure proper rotation)
-    if torch.det(R) < 0:
+    if torch.det(R.cpu()) < 0:
         Vh[-1] *= -1
         S[-1] *= -1
         R = U @ Vh

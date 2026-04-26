@@ -19,6 +19,7 @@ import time
 import os
 import contextlib
 import math
+from datetime import timedelta
 
 
 def unwrap_model(model: nn.Module) -> nn.Module:
@@ -84,6 +85,8 @@ def main():
     parser.add_argument("--val-config", type=str, default=None, help="Separate val config YAML (optional, defaults to --config)")
     parser.add_argument("--batch-size", type=int, default=8)
     parser.add_argument("--num-workers", type=int, default=16)
+    parser.add_argument("--prefetch-factor", type=int, default=4)
+    parser.add_argument("--compile", action="store_true", help="torch.compile the model (faster steady-state, slow first-batch)")
     parser.add_argument("--epochs", type=int, default=10000)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lr-min", type=float, default=1e-6)
@@ -117,12 +120,48 @@ def main():
     parser.add_argument("--output-dir", type=str, default="outputs/mixture")
     parser.add_argument("--pretrain", type=str, default=None, help="Path to pretrained checkpoint")
     parser.add_argument("--resume", type=str, default=None, help="Path to checkpoint to resume training from")
+    parser.add_argument(
+        "--reset-confidence-head-on-pretrain",
+        action="store_true",
+        help=(
+            "Zero-init decoder confidence head after loading --pretrain. "
+            "Useful when transferring from a checkpoint whose uncertainty calibration "
+            "does not match the new dataset mix."
+        ),
+    )
     parser.add_argument("--quick-test", action="store_true", help="Quick test mode with only 10 samples")
     parser.add_argument("--save-interval", type=int, default=1, help="Save checkpoint every N epochs")
     parser.add_argument("--val-interval", type=int, default=1, help="Run validation every N epochs")
     parser.add_argument("--val-samples", type=int, default=200, help="Number of val samples per validation run")
     parser.add_argument("--keep-checkpoints", type=int, default=10, help="Keep last N checkpoints (except milestone)")
     parser.add_argument("--grad-accum", type=int, default=2, help="Gradient accumulation steps (effective batch = batch_size * grad_accum)")
+    parser.add_argument("--log-interval", type=int, default=50, help="Print training logs every N batches")
+    parser.add_argument("--variant", type=str, default="large", choices=["base", "large"], help="Model variant: base or large")
+    parser.add_argument(
+        "--dist-timeout-minutes",
+        type=int,
+        default=60,
+        help="Distributed process group timeout in minutes.",
+    )
+    parser.add_argument(
+        "--broadcast-buffers",
+        action="store_true",
+        help=(
+            "Enable DDP buffer broadcasts before each forward pass. Disabled by default "
+            "because this model has no batch-norm style running stats that need syncing."
+        ),
+    )
+    parser.add_argument(
+        "--use-videomae-v2-init",
+        action="store_true",
+        help="Initialize the encoder from VideoMAE V2 weights instead of VideoMAE V1.",
+    )
+    parser.add_argument(
+        "--videomae-model",
+        type=str,
+        default=None,
+        help="Optional HuggingFace model ID or local path for encoder VideoMAE initialization.",
+    )
     parser.add_argument(
         "--patch-provider", type=str, default="auto",
         help=(
@@ -134,6 +173,23 @@ def main():
             "  use --patch-provider sampled_highres with a config that sets precompute_patches: false."
         )
     )
+    parser.add_argument(
+        "--planned-mode",
+        action="store_true",
+        help="Use planned sample-bundle prefetch mode (for COS acceleration)",
+    )
+    parser.add_argument(
+        "--builder-workers",
+        type=int,
+        default=2,
+        help="Number of background sample builder processes in planned mode",
+    )
+    parser.add_argument(
+        "--prefetch-depth",
+        type=int,
+        default=32,
+        help="Number of samples to prefetch ahead in planned mode",
+    )
     args = parser.parse_args()
 
     # Distributed setup
@@ -141,12 +197,23 @@ def main():
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     distributed = world_size > 1
     if distributed:
-        dist.init_process_group(backend="nccl")
+        dist.init_process_group(
+            backend="nccl",
+            timeout=timedelta(minutes=args.dist_timeout_minutes),
+        )
     torch.cuda.set_device(local_rank)
 
     # Load config
     with open(args.config) as f:
         config = yaml.safe_load(f)
+
+    # Inject planned mode settings into config
+    if args.planned_mode:
+        config['planned_mode'] = True
+        config['builder_workers'] = args.builder_workers
+        config['prefetch_depth'] = args.prefetch_depth
+        if local_rank == 0:
+            print(f"[Planned Mode] Enabled with {args.builder_workers} builder workers, prefetch depth {args.prefetch_depth}")
 
     # Load val config (if separate)
     val_config = config
@@ -155,10 +222,11 @@ def main():
             val_config = yaml.safe_load(f)
 
     # Create dataset
-    train_dataset = create_training_dataset(config, split='train')
+    rank = dist.get_rank() if distributed else 0
+    train_dataset = create_training_dataset(config, split='train', rank=rank, world_size=world_size)
     val_loader = None
     if args.val_interval > 0 and args.val_samples > 0:
-        val_dataset = create_training_dataset(val_config, split='val')
+        val_dataset = create_training_dataset(val_config, split='val', rank=rank, world_size=world_size)
         from torch.utils.data import Subset
         val_dataset = Subset(val_dataset, range(min(args.val_samples, len(val_dataset))))
     else:
@@ -183,18 +251,37 @@ def main():
     else:
         train_sampler = RandomSampler(train_dataset)
 
+    train_drop_last = len(train_dataset) >= args.batch_size
+    if local_rank == 0 and not train_drop_last:
+        print(
+            "[DataLoader] train_dataset is smaller than batch_size; "
+            "disabling drop_last so quick/small sanity runs still produce batches."
+        )
+
+    # Adjust num_workers for planned mode (samples are pre-built)
+    train_num_workers = args.num_workers
+    if args.planned_mode:
+        train_num_workers = 0  # No workers needed, samples are pre-built
+        if local_rank == 0:
+            print(f"[Planned Mode] Setting DataLoader num_workers=0 (samples pre-built by {args.builder_workers} builder processes)")
+
     train_loader_kwargs = dict(
         batch_size=args.batch_size,
-        num_workers=args.num_workers,
+        num_workers=train_num_workers,
         collate_fn=d4rt_collate_fn,
         sampler=train_sampler,
         pin_memory=True,
-        persistent_workers=args.num_workers > 0,
-        drop_last=True,
+        persistent_workers=train_num_workers > 0,
+        drop_last=train_drop_last,
     )
-    if args.num_workers > 0:
-        train_loader_kwargs["prefetch_factor"] = 2
+    if train_num_workers > 0:
+        train_loader_kwargs["prefetch_factor"] = args.prefetch_factor
     train_loader = DataLoader(train_dataset, **train_loader_kwargs)
+    if len(train_loader) == 0:
+        raise RuntimeError(
+            "Train loader is empty. Check dataset size, batch size, and drop_last "
+            f"(samples={len(train_dataset)}, batch_size={args.batch_size}, drop_last={train_drop_last})."
+        )
     if val_dataset is not None:
         val_num_workers = max(2, args.num_workers // 2)
         if distributed:
@@ -211,22 +298,39 @@ def main():
             drop_last=False,
         )
         if val_num_workers > 0:
-            val_loader_kwargs["prefetch_factor"] = 2
+            val_loader_kwargs["prefetch_factor"] = args.prefetch_factor
         val_loader = DataLoader(val_dataset, **val_loader_kwargs)
 
     # Setup device and model
     device = torch.device(f"cuda:{local_rank}")
     amp_enabled = (device.type == "cuda")
-    model = create_d4rt(variant="base", decoder_depth=6, img_size=args.resolution,
+    videomae_model = args.videomae_model
+    if videomae_model is None and not args.use_videomae_v2_init:
+        _videomae_roots = {
+            "large": "/data1/zbf/pretrained/videomae-large",
+            "base": "/data1/zbf/pretrained/videomae-base",
+        }
+        videomae_model = _videomae_roots[args.variant]
+    if local_rank == 0:
+        init_family = "VideoMAE V2" if args.use_videomae_v2_init else "VideoMAE V1"
+        print(f"Encoder init: {init_family} ({videomae_model or 'variant default'})")
+    model = create_d4rt(variant=args.variant, img_size=args.resolution,
                         temporal_size=args.num_frames, patch_size=(2, 16, 16),
-                        query_patch_size=9, videomae_model="/data1/zbf/pretrained/videomae-base",
+                        query_patch_size=9, videomae_model=videomae_model,
+                        use_videomae_v2=args.use_videomae_v2_init,
                         patch_provider=args.patch_provider,).to(device)
     if distributed:
         model = nn.parallel.DistributedDataParallel(
             model,
             device_ids=[local_rank],
             find_unused_parameters=False,
+            broadcast_buffers=args.broadcast_buffers,
         )
+
+    if args.compile:
+        if local_rank == 0:
+            print("torch.compile: compiling model (mode=default, dynamic=True)...")
+        model = torch.compile(model, mode="default", dynamic=True)
 
     # Load pretrained weights
     if args.pretrain:
@@ -239,6 +343,15 @@ def main():
                 f"Checkpoint {args.pretrain} missing both 'model_state_dict' and 'model' keys"
             )
         unwrap_model(model).load_state_dict(state_dict, strict=True)
+        if args.reset_confidence_head_on_pretrain:
+            decoder = unwrap_model(model).decoder
+            torch.nn.init.zeros_(decoder.head_conf.weight)
+            torch.nn.init.zeros_(decoder.head_conf.bias)
+            if local_rank == 0:
+                print(
+                    "Reset decoder.head_conf after loading pretrained weights "
+                    "to avoid stale uncertainty calibration."
+                )
 
     # Optimizer and loss - separate weight decay for bias/norm
     decay_params = []
@@ -268,8 +381,12 @@ def main():
     optimizer_steps_per_epoch = math.ceil(len(train_loader) / args.grad_accum)
     total_steps = args.epochs * optimizer_steps_per_epoch
     def lr_lambda(step):
-        if step < args.lr_warmup_steps:
+        if args.lr_warmup_steps > 0 and step < args.lr_warmup_steps:
             return step / args.lr_warmup_steps
+        # Short sanity runs can legitimately have total_steps <= warmup_steps.
+        # In that case keep a pure warmup schedule and skip the cosine phase.
+        if total_steps <= args.lr_warmup_steps:
+            return 1.0
         progress = (step - args.lr_warmup_steps) / (total_steps - args.lr_warmup_steps)
         return args.lr_min / args.lr + (1 - args.lr_min / args.lr) * 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)))
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
@@ -306,6 +423,11 @@ def main():
         print(f"Starting training for {args.epochs} epochs")
         effective_batch = args.batch_size * args.grad_accum * (world_size if distributed else 1)
         print(f"Distributed: {distributed}, world_size: {world_size}")
+        if distributed:
+            print(
+                f"DDP settings: timeout={args.dist_timeout_minutes}min, "
+                f"broadcast_buffers={args.broadcast_buffers}"
+            )
         print(f"Grad accum steps: {args.grad_accum}, effective batch size: {effective_batch}")
         print(f"Steps per epoch: {len(train_loader)}, samples per epoch: {len(train_dataset)}")
         print(f"Optimizer steps per epoch: {optimizer_steps_per_epoch}")
@@ -373,7 +495,7 @@ def main():
 
             real_loss = loss.item() * args.grad_accum  # 还原除法，得到真实loss值
             epoch_loss += real_loss
-            if batch_idx % 50 == 0:
+            if batch_idx % args.log_interval == 0:
                 current_lr = optimizer.param_groups[0]['lr']
                 lr_info = f"LR: {current_lr:.2e} (warmup {global_step}/{args.lr_warmup_steps} → {args.lr:.2e})" \
                     if global_step < args.lr_warmup_steps else f"LR: {current_lr:.2e}"

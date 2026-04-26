@@ -6,6 +6,7 @@ adapter_kwargs:
   subset_name: fewview_dev
   categories: [vase, bench, toaster, orange, apple]
   require_precomputed: false
+  sequence_denylist: /data/zbf/openclaw/d4rt/configs/co3dv2_denylist_degenerate_clips_20260422.txt
 
 clip_len: 48
 img_size: 256

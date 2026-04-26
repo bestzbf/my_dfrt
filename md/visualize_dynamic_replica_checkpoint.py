@@ -38,6 +38,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--config", type=str, required=True, help="数据集配置 YAML。脚本会从这里读取 validation split。")
     parser.add_argument("--checkpoint", type=str, required=True, help="checkpoint 路径。支持键 'model' 或 'model_state_dict'。")
+    parser.add_argument(
+        "--model-variant",
+        type=str,
+        default="auto",
+        choices=("auto", "base", "large", "huge", "giant"),
+        help="模型尺寸。默认 auto 会从 checkpoint 张量形状自动推断。",
+    )
     parser.add_argument("--output-dir", type=str, required=True, help="输出目录。所有可视化文件和 summary.json 都会写到这里。")
     parser.add_argument(
         "--patch-provider",
@@ -137,29 +144,71 @@ def select_device(device_arg: str) -> torch.device:
     return torch.device("cpu")
 
 
-def load_model_weights(model: torch.nn.Module, checkpoint_path: str, device: torch.device) -> None:
-    ckpt = torch.load(checkpoint_path, map_location=device)
+VARIANT_BY_EMBED_DIM = {
+    768: "base",
+    1024: "large",
+    1280: "huge",
+    1408: "giant",
+}
+
+
+def extract_model_state(ckpt: dict[str, Any], checkpoint_path: str) -> dict[str, torch.Tensor]:
     if "model" in ckpt:
-        state = ckpt["model"]
-    elif "model_state_dict" in ckpt:
-        state = ckpt["model_state_dict"]
-    else:
-        raise KeyError(f"Unsupported checkpoint format in {checkpoint_path}")
-    model.load_state_dict(state, strict=True)
+        return ckpt["model"]
+    if "model_state_dict" in ckpt:
+        return ckpt["model_state_dict"]
+    raise KeyError(f"Unsupported checkpoint format in {checkpoint_path}")
+
+
+def infer_model_variant_from_state(state: dict[str, torch.Tensor]) -> str:
+    preferred_suffixes = (
+        "encoder.patch_embed.proj.weight",
+        "encoder.norm.weight",
+        "decoder.norm.weight",
+    )
+    for suffix in preferred_suffixes:
+        for key, tensor in state.items():
+            if not key.endswith(suffix) or not hasattr(tensor, "shape") or len(tensor.shape) == 0:
+                continue
+            embed_dim = int(tensor.shape[0])
+            if embed_dim in VARIANT_BY_EMBED_DIM:
+                return VARIANT_BY_EMBED_DIM[embed_dim]
+            raise ValueError(
+                f"Cannot infer model variant: {key} has embed_dim={embed_dim}, "
+                f"expected one of {sorted(VARIANT_BY_EMBED_DIM)}"
+            )
+    raise ValueError("Cannot infer model variant: checkpoint has no recognizable encoder/decoder shape keys")
+
+
+def load_checkpoint_state(checkpoint_path: str) -> dict[str, torch.Tensor]:
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    return extract_model_state(ckpt, checkpoint_path)
+
+
+def resolve_model_variant(requested_variant: str, state: dict[str, torch.Tensor]) -> str:
+    if requested_variant != "auto":
+        return requested_variant
+    inferred_variant = infer_model_variant_from_state(state)
+    print(f"[vis] Auto-detected model_variant={inferred_variant} from checkpoint tensor shapes", flush=True)
+    return inferred_variant
 
 
 def load_model(args: argparse.Namespace, device: torch.device) -> torch.nn.Module:
+    state = load_checkpoint_state(args.checkpoint)
+    model_variant = resolve_model_variant(args.model_variant, state)
+    args.model_variant = model_variant
     model = create_d4rt(
-        variant="base",
-        decoder_depth=6,
+        variant=model_variant,
         img_size=args.resolution,
         temporal_size=args.num_frames,
         patch_size=(2, 16, 16),
         query_patch_size=9,
-        videomae_model="/data1/zbf/pretrained/videomae-base",
         patch_provider=args.patch_provider,
-    ).to(device)
-    load_model_weights(model, args.checkpoint, device)
+        encoder_pretrained=False,
+    )
+    model.load_state_dict(state, strict=True)
+    del state
+    model = model.to(device)
     model.eval()
     return model
 
@@ -1644,7 +1693,7 @@ def main() -> None:
     print(f"[vis] Dataset loaded: {len(dataset.adapters)} adapter(s)", flush=True)
     print(f"[vis] Loading model from {args.checkpoint} ...", flush=True)
     model = load_model(args, device)
-    print(f"[vis] Model loaded on {device}", flush=True)
+    print(f"[vis] Model loaded on {device} (variant={args.model_variant})", flush=True)
 
     print(f"[vis] Finding {args.num_samples} samples (start={args.start_index}, max_search={args.max_search}) ...", flush=True)
     samples = find_samples(
@@ -1658,6 +1707,7 @@ def main() -> None:
     summary: dict[str, Any] = {
         "config": args.config,
         "checkpoint": args.checkpoint,
+        "model_variant": args.model_variant,
         "patch_provider": args.patch_provider,
         "dense_gt_point_source": args.dense_gt_point_source,
         "dense_pred_point_cloud_stride": args.dense_pred_point_cloud_stride,

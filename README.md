@@ -4,6 +4,30 @@ This directory contains the current D4RT training/inference code and a few proje
 
 ## Training: important current defaults
 
+### 0) Current 4-dataset / Co3D incident record
+
+If you are working on:
+
+- `configs/mixture_4datasets.yaml`
+- `train_mixture_4datasets_single_gpu.sh`
+
+read this first:
+
+- `md/4datasets_Co3D训练问题与修复记录_2026-04-21.md`
+
+It records:
+
+- the Co3D degenerate-precompute issue
+- the 2026-04-23 Co3D clip-quality audit and denylist rollout
+- the 2026-04-23 overlay merge-back into the base Co3D tree
+- the track overlay rebuild workflow
+- the `pretrain` confidence-head mismatch
+- the current recommended training path
+
+Related archive:
+
+- `md/Co3Dv2_clip质量审计与denylist记录_2026-04-23.md`
+
 ### 1) Default training is **not** the paper's strongest high-res setting
 
 `train_mixture.py` defaults to:

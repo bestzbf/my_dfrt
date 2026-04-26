@@ -25,12 +25,20 @@ LOSS_W_NORMAL="${LOSS_W_NORMAL:-0.5}"
 LOSS_W_STATIC_REPROJ="${LOSS_W_STATIC_REPROJ:-1.0}"
 LOSS_3D_MODE="${LOSS_3D_MODE:-scale_invariant}"
 LR_WARMUP_STEPS="${LR_WARMUP_STEPS:-200}"
+RESET_CONF_HEAD_ON_PRETRAIN="${RESET_CONF_HEAD_ON_PRETRAIN:-1}"
 
 export PYTORCH_CUDA_ALLOC_CONF="${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}"
 
 echo "[single_blendedmvs] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "[single_blendedmvs] CONFIG=$CONFIG"
 echo "[single_blendedmvs] OUTPUT_DIR=$OUTPUT_DIR"
+echo "[single_blendedmvs] PATCH_PROVIDER=$PATCH_PROVIDER"
+echo "[single_blendedmvs] RESET_CONF_HEAD_ON_PRETRAIN=$RESET_CONF_HEAD_ON_PRETRAIN"
 if [[ -n "$PRETRAIN" ]]; then
+  if [[ ! -f "$PRETRAIN" ]]; then
+    echo "[single_blendedmvs] PRETRAIN not found: $PRETRAIN" >&2
+    exit 1
+  fi
   echo "[single_blendedmvs] PRETRAIN=$PRETRAIN"
 fi
 
@@ -55,6 +63,7 @@ CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" /root/miniconda3/envs/d4rt/bin/pyth
   --loss-w-static-reprojection "$LOSS_W_STATIC_REPROJ" \
   --loss-3d-mode "$LOSS_3D_MODE" \
   --lr-warmup-steps "$LR_WARMUP_STEPS" \
+  $( [[ "$RESET_CONF_HEAD_ON_PRETRAIN" == "1" ]] && printf '%s' "--reset-confidence-head-on-pretrain" ) \
   ${PRETRAIN:+--pretrain "$PRETRAIN"} \
   ${RESUME:+--resume "$RESUME"} \
   "$@"

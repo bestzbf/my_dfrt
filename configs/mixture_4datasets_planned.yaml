@@ -31,4 +31,9 @@ boundary_ratio: 0.3
 t_tgt_eq_t_cam_ratio: 0.4
 seed: 42
 allow_track_fallback: true
-index_cache_dir: /data1/zbf/my_dfrt/.index_cache_4datasets
+index_cache_dir: /data1/zbf/my_dfrt/.index_cache_4datasets_planned
+
+# Planned mode settings (will be overridden by command-line args)
+planned_mode: true
+builder_workers: 2
+prefetch_depth: 32

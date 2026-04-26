@@ -8,9 +8,51 @@ from typing import Any, Optional
 import numpy as np
 
 
+def h5_read_frame_slice(
+    h5file: Any,
+    frame_indices: list[int],
+    keys: Optional[list[str]] = None,
+) -> dict:
+    """Read only the requested frame indices from an already-open h5py.File.
+
+    h5py fancy indexing requires sorted, unique indices.  This helper handles
+    the sort → read → reorder dance so callers don't duplicate it.
+
+    Per-frame arrays (``ds.shape[0] > 1``) are indexed to ``frame_indices``
+    order; scalar / metadata arrays are loaded in full.
+
+    Args:
+        h5file:        An open ``h5py.File`` (or any mapping with h5py Dataset
+                       values that support ``ds[list_of_ints]`` and ``ds[()]``).
+        frame_indices: Requested frame positions (may be unsorted or repeated).
+        keys:          If provided, only these keys are read.  Defaults to all
+                       keys in ``h5file``.
+
+    Returns:
+        dict mapping key → numpy array, already in ``frame_indices`` order.
+    """
+    sorted_idx = sorted(set(frame_indices))
+    idx_map = {v: pos for pos, v in enumerate(sorted_idx)}
+    reorder = [idx_map[i] for i in frame_indices]
+    needs_reorder = reorder != list(range(len(frame_indices)))
+
+    result: dict = {}
+    for key in (keys if keys is not None else h5file.keys()):
+        ds = h5file[key]
+        if ds.ndim >= 1 and ds.shape[0] > 1:
+            # Guard against frame_indices that exceed this dataset's length.
+            clipped = [i for i in sorted_idx if i < ds.shape[0]]
+            data = ds[clipped]              # reads only the needed chunks
+            result[key] = data[reorder] if needs_reorder else data
+        else:
+            result[key] = ds[()]            # scalar / metadata
+    return result
+
+
 def load_precomputed_fast(
     npz_path: Path,
     frame_indices: list[int],
+    skip_keys: Optional[set[str]] = None,
 ) -> Optional[dict]:
     """
     Load precomputed tracks/normals for specific frame indices.
@@ -22,36 +64,29 @@ def load_precomputed_fast(
     Returns a dict with arrays already indexed to frame_indices order,
     or None if neither .h5 nor .npz exists.
 
+    Args:
+        skip_keys: Set of array keys to skip entirely.  Use this to avoid
+                   decompressing expensive arrays that the caller does not
+                   need (e.g. ``{"normals"}`` saves ~2 s for a 50 MB npz).
+
     Run computer/convert_precomputed_to_h5.py once to generate .h5 files.
     """
     npz_path = Path(npz_path)
     h5_path = npz_path.with_suffix('.h5')
+    _skip = skip_keys or set()
 
     if h5_path.exists():
         import h5py
-        # h5py fancy indexing requires sorted unique indices
-        sorted_idx = sorted(set(frame_indices))
-        idx_map = {v: i for i, v in enumerate(sorted_idx)}
-        reorder = [idx_map[i] for i in frame_indices]
-        needs_reorder = reorder != list(range(len(frame_indices)))
-
-        result: dict = {}
         with h5py.File(h5_path, 'r') as f:
-            for key in f.keys():
-                ds = f[key]
-                if ds.ndim >= 1 and ds.shape[0] > 1:
-                    data = ds[sorted_idx]       # reads only the needed chunks
-                    if needs_reorder:
-                        data = data[reorder]
-                    result[key] = data
-                else:
-                    result[key] = ds[()]        # scalar / metadata
-        return result
+            keys = [k for k in f.keys() if k not in _skip]
+            return h5_read_frame_slice(f, frame_indices, keys=keys)
 
     elif npz_path.exists():
         raw = np.load(npz_path, allow_pickle=True)
         result = {}
         for k in raw.files:
+            if k in _skip:
+                continue
             arr = raw[k]
             if arr.ndim >= 1 and arr.shape[0] > 1:
                 result[k] = arr[np.array(frame_indices)]

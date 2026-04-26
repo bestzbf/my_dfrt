@@ -118,6 +118,29 @@ def test_static_semantic_metrics_present_and_finite() -> None:
     print("✓ test_static_semantic_metrics_present_and_finite passed")
 
 
+def test_normal_loss_uses_effective_valid_3d_mask() -> None:
+    predictions = {
+        "pos_3d": torch.zeros(1, 2, 3),
+        "normal": torch.tensor([[[1.0, 0.0, 0.0], [1.0, 0.0, 0.0]]]),
+        "uncertainty": torch.zeros(1, 2, 1),
+    }
+    targets = {
+        "pos_3d": torch.zeros(1, 2, 3),
+        "normal": torch.tensor([[[1.0, 0.0, 0.0], [-1.0, 0.0, 0.0]]]),
+        "mask_3d": torch.tensor([[True, False]]),
+        "mask_normal": torch.tensor([[True, True]]),
+    }
+
+    out = D4RTLoss()(predictions, targets)
+
+    assert torch.isclose(out["loss_normal"], torch.tensor(0.0)), out["loss_normal"]
+    assert torch.isclose(out["metric_normal_query_ratio"], torch.tensor(0.5)), out["metric_normal_query_ratio"]
+    assert torch.isclose(out["metric_normal_valid3d_ratio"], torch.tensor(1.0)), out["metric_normal_valid3d_ratio"]
+
+    print("✓ test_normal_loss_uses_effective_valid_3d_mask passed")
+
+
 if __name__ == "__main__":
     test_static_semantic_metrics_present_and_finite()
+    test_normal_loss_uses_effective_valid_3d_mask()
     print("All static semantic metric tests passed.")

@@ -63,6 +63,7 @@ class ScanNetAdapter(BaseAdapter):
             depth_scale: Scale factor for depth values
             default_pose_convention: Default pose convention
             precompute_root: Optional precomputed data root
+            cache_dir: Optional cache directory for index
         """
         self.split = split  # Store but don't use
         self.root = Path(root)
@@ -75,12 +76,31 @@ class ScanNetAdapter(BaseAdapter):
         self.depth_scale = float(depth_scale)
         self.default_pose_convention = default_pose_convention
         self.precompute_root = Path(precompute_root) if precompute_root else self.root
+
+        # Build index with caching support (ScanNetPP pattern)
         if cache_dir is not None:
             from datasets.index_cache import load_or_build
-            _cache_path = Path(cache_dir) / f"{self.dataset_name}_{split}.pkl"
-            self.sequence_names = load_or_build(self._build_index, _cache_path)
+            import hashlib
+            import json
+
+            cache_key = {
+                "dataset": self.dataset_name,
+                "split": self.split,
+                "root": str(self.root.resolve()),
+                "cache_schema": 1,  # Increment when changing index structure
+            }
+            suffix = hashlib.sha1(
+                json.dumps(cache_key, sort_keys=True).encode()
+            ).hexdigest()[:12]
+            cache_path = Path(cache_dir) / f"{self.dataset_name}_{self.split}_{suffix}.pkl"
+            index = load_or_build(self._build_index, cache_path)
         else:
-            self.sequence_names = self._build_index()
+            index = self._build_index()
+
+        # Split index into sequence names and num_frames map
+        self.sequence_names: list[str] = [name for name, _, _ in index]
+        self._num_frames_map: dict[str, int] = {name: nf for name, nf, _ in index}
+        self._scene_file_cache: dict[str, dict] = {name: files for name, _, files in index}
 
     def __len__(self) -> int:
         return len(self.sequence_names)
@@ -92,12 +112,63 @@ class ScanNetAdapter(BaseAdapter):
         return self.sequence_names[index]
 
     def get_num_frames(self, sequence_name: str) -> int:
-        """Skip per-sequence metadata/glob; assume sequences have sufficient frames.
+        """O(1) lookup from pre-built index — avoids re-reading scene files."""
+        if sequence_name in self._num_frames_map:
+            return self._num_frames_map[sequence_name]
+        # Fallback: compute on-demand (should rarely happen)
+        return self.get_sequence_info(sequence_name)["num_frames"]
 
-        ScanNet scenes are guaranteed to have enough frames for the configured
-        clip_len.  Short sequences will fail-and-retry in MixtureDataset.__getitem__.
+    def _build_index(self) -> list[tuple[str, int, dict]]:
+        """Build index of (scene_name, num_frames, file_cache) for all valid scenes.
+
+        This method scans all scenes once and caches:
+        - num_frames: actual frame count (not fake 10_000)
+        - image_paths: sorted list of image file paths
+        - depth_paths: sorted list of depth file paths
+
+        Returns:
+            List of (scene_name, num_frames, file_cache_dict) tuples
         """
-        return 10_000
+        results: list[tuple[str, int, dict]] = []
+        if not self.root.exists():
+            return results
+
+        for scene_dir in sorted(self.root.iterdir()):
+            if not scene_dir.is_dir():
+                continue
+
+            # Check required structure
+            if not (scene_dir / "images").exists():
+                continue
+            if not (scene_dir / "depths").exists():
+                continue
+            if not (scene_dir / "metadata.json").exists():
+                continue
+
+            try:
+                # Load metadata and find files
+                metadata = self._load_metadata(scene_dir / "metadata.json")
+                image_files = self._find_image_files(scene_dir / "images")
+                depth_files = self._find_depth_files(scene_dir / "depths")
+
+                if len(image_files) == 0 or len(depth_files) == 0:
+                    continue
+
+                # Infer actual num_frames
+                num_frames = self._infer_num_frames(metadata, image_files, depth_files)
+
+                # Cache file lists for fast load_clip
+                file_cache = {
+                    "image_paths": image_files,
+                    "depth_paths": depth_files,
+                }
+
+                results.append((scene_dir.name, num_frames, file_cache))
+            except Exception:
+                # Skip malformed scenes
+                pass
+
+        return results
 
     def get_sequence_info(self, sequence_name: str) -> dict[str, Any]:
         scene_dir = self.root / sequence_name
@@ -153,8 +224,16 @@ class ScanNetAdapter(BaseAdapter):
         scene_dir = self.root / sequence_name
         self._check_scene_exists(scene_dir, sequence_name)
 
-        image_files = self._find_image_files(scene_dir / "images")
-        depth_files = self._find_depth_files(scene_dir / "depths")
+        # Use cached file lists if available (from _build_index)
+        if sequence_name in self._scene_file_cache:
+            file_cache = self._scene_file_cache[sequence_name]
+            image_files = file_cache["image_paths"]
+            depth_files = file_cache["depth_paths"]
+        else:
+            # Fallback: glob on-demand (should rarely happen)
+            image_files = self._find_image_files(scene_dir / "images")
+            depth_files = self._find_depth_files(scene_dir / "depths")
+
         metadata = self._load_metadata(scene_dir / "metadata.json")
 
         if len(image_files) == 0:
@@ -343,12 +422,23 @@ class ScanNetAdapter(BaseAdapter):
             if not p.is_dir():
                 continue
 
+            # Check if already extracted
             if (
                 (p / "images").exists()
                 and (p / "depths").exists()
                 and (p / "metadata.json").exists()
             ):
                 sequence_names.append(p.name)
+            else:
+                # Try to extract from .sens file
+                sens_file = p / f"{p.name}.sens"
+                if sens_file.exists():
+                    print(f"[ScanNet] Extracting {p.name} from .sens file...")
+                    try:
+                        self._extract_from_sens(sens_file, p)
+                        sequence_names.append(p.name)
+                    except Exception as e:
+                        print(f"[ScanNet] Failed to extract {p.name}: {e}")
 
         if len(sequence_names) == 0:
             raise RuntimeError(f"No valid ScanNet scenes found under: {self.root}")
@@ -357,6 +447,14 @@ class ScanNetAdapter(BaseAdapter):
     def _check_scene_exists(self, scene_dir: Path, sequence_name: str) -> None:
         if not scene_dir.exists():
             raise FileNotFoundError(f"[{sequence_name}] scene dir not found: {scene_dir}")
+
+        # Auto-extract from .sens if needed
+        if not (scene_dir / "images").exists() or not (scene_dir / "depths").exists():
+            sens_file = scene_dir / f"{sequence_name}.sens"
+            if sens_file.exists():
+                print(f"[ScanNet] Extracting {sequence_name} from .sens file...")
+                self._extract_from_sens(sens_file, scene_dir)
+
         if not (scene_dir / "images").exists():
             raise FileNotFoundError(f"[{sequence_name}] missing images dir: {scene_dir / 'images'}")
         if not (scene_dir / "depths").exists():
@@ -994,3 +1092,10 @@ class ScanNetAdapter(BaseAdapter):
             else:
                 out.append(p)
         return out
+
+    def _extract_from_sens(self, sens_file: Path, output_dir: Path) -> None:
+        """Extract images, depths, and metadata from .sens file."""
+        from .sens_reader import SensReader
+
+        reader = SensReader(sens_file)
+        reader.extract_all(output_dir)

@@ -1,12 +1,46 @@
 # from __future__ import annotations
 
+import hashlib
+import json
+import os
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
 import numpy as np
 from PIL import Image
 
 from .base import BaseAdapter, UnifiedClip
+
+
+@dataclass(slots=True)
+class _KubricSceneRecord:
+    sequence_name: str
+    scene_dir: Path
+    ann_path: Path
+    rank_path: Path
+    h5_path: Path | None
+    trajs_2d_path: Path | None
+    frame_names: list[str] | None
+    depth_names: list[str] | None
+    num_frames: int
+    num_tracks: int
+    height: int
+    width: int
+    frame_file_count: int
+    frame_name_width: int = 3
+    frame_name_suffix: str = ".png"
+    depth_name_width: int = 3
+    depth_name_suffix: str = ".npy"
+
+    @property
+    def frame_dir(self) -> Path:
+        return self.scene_dir / "frames"
+
+    @property
+    def depth_dir(self) -> Path:
+        return self.scene_dir / "depths"
 
 
 class KubricAdapter(BaseAdapter):
@@ -43,24 +77,57 @@ class KubricAdapter(BaseAdapter):
 
     dataset_name = "kubric"
 
-    def __init__(self, root: str, split: str = "train", cache_dir: str | None = None, **kwargs):
+    def __init__(
+        self,
+        root: str,
+        split: str = "train",
+        cache_dir: str | None = None,
+        verbose: bool = True,
+        index_workers: int = 8,
+        **kwargs,
+    ):
         """
         Args:
             root: Root directory containing Kubric scenes
             split: Split name (ignored, Kubric doesn't have splits)
-            cache_dir: Ignored, accepted for API compatibility with other adapters
+            cache_dir: Optional directory for a pickled scene index cache
+            verbose: Print a short summary after initialization
         """
         self.root = Path(root)
         self.split = split
+        self.verbose = verbose
+        self.index_workers = index_workers
         if not self.root.exists():
             raise FileNotFoundError(f"Kubric root not found: {self.root}")
-        all_sequences = self._build_index()
-        # Deterministic train/val split: last 5% as val
-        n_val = max(1, len(all_sequences) // 20)
-        if split == 'val':
-            self.sequence_names = all_sequences[-n_val:]
+        if cache_dir is not None:
+            from datasets.index_cache import load_or_build
+
+            cache_key = {
+                "dataset": self.dataset_name,
+                "root": str(self.root.resolve()),
+                "cache_schema": 4,
+            }
+            cache_suffix = hashlib.sha1(
+                json.dumps(cache_key, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:12]
+            cache_path = Path(cache_dir) / f"{self.dataset_name}_all_{cache_suffix}.pkl"
+            all_records = load_or_build(self._build_index, cache_path)
         else:
-            self.sequence_names = all_sequences[:-n_val]
+            all_records = self._build_index()
+        # Deterministic train/val split: last 5% as val
+        n_val = max(1, len(all_records) // 20)
+        if split == 'val':
+            self._records = all_records[-n_val:]
+        else:
+            self._records = all_records[:-n_val]
+        self._name_to_record = {r.sequence_name: r for r in self._records}
+        self.sequence_names = [r.sequence_name for r in self._records]
+        if self.verbose:
+            print(
+                f"[KubricAdapter] split={self.split!r}, "
+                f"num_sequences={len(self.sequence_names)} "
+                f"(total_indexed={len(all_records)})"
+            )
 
     def __len__(self) -> int:
         return len(self.sequence_names)
@@ -69,54 +136,45 @@ class KubricAdapter(BaseAdapter):
         return self.sequence_names
 
     def get_sequence_name(self, index: int) -> str:
-        return self.sequence_names[index]
+        return self._records[index].sequence_name
+
+    def get_num_frames(self, sequence_name: str) -> int:
+        """Fast path: read from cached record, no annotation I/O."""
+        return self._get_record(sequence_name).num_frames
 
     def get_sequence_info(self, sequence_name: str) -> dict[str, Any]:
-        scene_dir = self.root / sequence_name
-        # Support nested structure
-        if (scene_dir / sequence_name).is_dir():
-            scene_dir = scene_dir / sequence_name
-        self._check_scene_exists(scene_dir, sequence_name)
-
-        ann = np.load(scene_dir / f"{sequence_name}.npy", allow_pickle=True).item()
-        rank = np.load(scene_dir / f"{sequence_name}_with_rank.npz", allow_pickle=True)
-
-        coords = np.asarray(ann["coords"])          # [N,T,2]
-        depth = np.asarray(ann["depth"])            # [T,H,W,1]
-        frame_files = self._find_frame_files(scene_dir / "frames")
+        record = self._get_record(sequence_name)
+        if record.height <= 0 or record.width <= 0:
+            height, width = self._resolve_record_image_size(record)
+            record.height = height
+            record.width = width
 
         info = {
             "dataset_name": self.dataset_name,
             "sequence_name": sequence_name,
-            "path": str(scene_dir),
-            "num_frames": int(coords.shape[1]),
-            "num_tracks": int(coords.shape[0]),
-            "height": int(depth.shape[1]),
-            "width": int(depth.shape[2]),
-            "frame_file_count": len(frame_files),
+            "path": str(record.scene_dir),
+            "num_frames": record.num_frames,
+            "num_tracks": record.num_tracks,
+            "height": record.height,
+            "width": record.width,
+            "frame_file_count": record.frame_file_count,
             "has_depth": True,
             "has_normals": False,
             "has_tracks": True,
             "has_visibility": True,
             "has_trajs_3d_world": True,
-            "intrinsics_shape": tuple(rank["shared_intrinsics"].shape),
-            "extrinsics_shape": tuple(rank["extrinsics"].shape),
+            "intrinsics_shape": (3, 3),
+            "extrinsics_shape": (record.num_frames, 3, 4),
             "extrinsics_convention": "w2c",
         }
         return info
 
     def load_clip(self, sequence_name: str, frame_indices: list[int]) -> UnifiedClip:
-        scene_dir = self.root / sequence_name
-        # Support nested structure
-        if (scene_dir / sequence_name).is_dir():
-            scene_dir = scene_dir / sequence_name
-        self._check_scene_exists(scene_dir, sequence_name)
-
-        ann_path = scene_dir / f"{sequence_name}.npy"
-        rank_path = scene_dir / f"{sequence_name}_with_rank.npz"
-
-        h5_path = ann_path.with_suffix('.h5')
-        if h5_path.exists():
+        record = self._get_record(sequence_name)
+        ann_path = record.ann_path
+        rank_path = record.rank_path
+        h5_path = record.h5_path
+        if h5_path is not None:
             import h5py
             with h5py.File(h5_path, 'r') as hf:
                 T_total = hf['trajs_2d'].shape[0]
@@ -126,10 +184,12 @@ class KubricAdapter(BaseAdapter):
                 visibs       = hf['visibility'][idx]     # [T,N]
 
             # depth still comes from per-frame .npy files in depths/
-            depth_dir = scene_dir / "depths"
-            depth_files = sorted(depth_dir.glob("*.npy")) if depth_dir.exists() else []
-            if depth_files:
-                depths = [np.load(depth_files[i]).astype(np.float32).squeeze() for i in frame_indices]
+            if record.depth_names is not None or record.depth_dir.exists():
+                depth_paths = [self._depth_path_for_index(record, i) for i in frame_indices]
+                depths = [
+                    np.load(path).astype(np.float32).squeeze()
+                    for path in depth_paths
+                ]
             else:
                 depths = []
 
@@ -167,15 +227,15 @@ class KubricAdapter(BaseAdapter):
         # else T_total was already set from h5 header
         self._check_indices(frame_indices, T_total, sequence_name)
 
-        frame_files = self._find_frame_files(scene_dir / "frames")
-        if len(frame_files) != T_total:
+        if record.frame_file_count != T_total:
             raise ValueError(
                 f"[{sequence_name}] frame file count mismatch: "
-                f"frames/ has {len(frame_files)}, annotations have {T_total}"
+                f"frames/ has {record.frame_file_count}, annotations have {T_total}"
             )
 
-        selected_frame_paths = [str(frame_files[i]) for i in frame_indices]
-        images = [self._read_image(frame_files[i]) for i in frame_indices]
+        frame_paths = [self._frame_path_for_index(record, i) for i in frame_indices]
+        selected_frame_paths = [str(path) for path in frame_paths]
+        images = [self._read_image(path) for path in frame_paths]
 
         # trajs_2d, coords_depth, visibs already set (both paths produce [T,N,*])
 
@@ -203,6 +263,8 @@ class KubricAdapter(BaseAdapter):
             "has_tracks": True,
             "has_visibility": True,
             "has_trajs_3d_world": True,
+            "normal_convention": None,
+            "normal_supervision_compatible": False,
             "num_frames_total": int(T_total),
             "num_frames_clip": int(len(frame_indices)),
             "coords_depth": coords_depth,  # [T,N], useful for debug / reprojection checks
@@ -230,14 +292,9 @@ class KubricAdapter(BaseAdapter):
         )
 
     def sanity_check(self, sequence_name: str) -> dict[str, Any]:
-        scene_dir = self.root / sequence_name
-        # Support nested structure
-        if (scene_dir / sequence_name).is_dir():
-            scene_dir = scene_dir / sequence_name
-        self._check_scene_exists(scene_dir, sequence_name)
-
-        ann = np.load(scene_dir / f"{sequence_name}.npy", allow_pickle=True).item()
-        rank = np.load(scene_dir / f"{sequence_name}_with_rank.npz", allow_pickle=True)
+        record = self._get_record(sequence_name)
+        ann = np.load(record.ann_path, allow_pickle=True).item()
+        rank = np.load(record.rank_path, allow_pickle=True)
 
         msgs: list[str] = []
         ok = True
@@ -277,11 +334,10 @@ class KubricAdapter(BaseAdapter):
             ok = False
             msgs.append(f"shared_intrinsics shape invalid: {K.shape}")
 
-        frame_files = self._find_frame_files(scene_dir / "frames")
-        if len(frame_files) != coords.shape[1]:
+        if record.frame_file_count != coords.shape[1]:
             ok = False
             msgs.append(
-                f"frames/ count {len(frame_files)} != annotation num_frames {coords.shape[1]}"
+                f"frames/ count {record.frame_file_count} != annotation num_frames {coords.shape[1]}"
             )
 
         # Confirm extrinsics convention using camera positions.
@@ -306,26 +362,217 @@ class KubricAdapter(BaseAdapter):
     # helpers
     # ------------------------------------------------------------------
 
-    def _build_index(self) -> list[str]:
-        sequence_names: list[str] = []
-        for p in sorted(self.root.iterdir()):
-            if not p.is_dir():
-                continue
-            seq = p.name
-            # Check both flat and nested structure
-            # Flat: kubric/0001/0001.npy
-            # Nested: kubric/0001/0001/0001.npy
-            seq_dir = p / seq if (p / seq).is_dir() else p
-            if (
-                (seq_dir / f"{seq}.npy").exists()
-                and (seq_dir / f"{seq}_with_rank.npz").exists()
-                and (seq_dir / "frames").exists()
-            ):
-                sequence_names.append(seq)
+    def _build_index(self) -> list[_KubricSceneRecord]:
+        scene_dirs = sorted(
+            [Path(e.path) for e in os.scandir(self.root) if e.is_dir()],
+            key=lambda p: p.name,
+        )
 
-        if len(sequence_names) == 0:
+        def _index_one(p: Path) -> Optional[_KubricSceneRecord]:
+            seq = p.name
+            # os.scandir() returns DirEntry with cached type — no extra stat per entry.
+            try:
+                top_entries = {e.name: e for e in os.scandir(p)}
+            except Exception:
+                return None
+
+            nested_entry = top_entries.get(seq)
+            if nested_entry is not None and nested_entry.is_dir():
+                seq_dir = Path(nested_entry.path)
+                try:
+                    present = {e.name: Path(e.path) for e in os.scandir(seq_dir)}
+                except Exception:
+                    return None
+            else:
+                seq_dir = p
+                present = {name: Path(e.path) for name, e in top_entries.items()}
+
+            ann_name = f"{seq}.npy"
+            rank_name = f"{seq}_with_rank.npz"
+            if ann_name not in present or rank_name not in present or "frames" not in present:
+                return None
+
+            ann_path = present[ann_name]
+            rank_path = present[rank_name]
+            frame_dir = present["frames"]
+
+            h5_name = f"{seq}.h5"
+            h5_path = present[h5_name] if h5_name in present else None
+
+            trajs_2d_name = f"{seq}_trajs_2d.npy"
+            trajs_2d_path = present[trajs_2d_name] if trajs_2d_name in present else None
+
+            num_frames, num_tracks, height, width = self._probe_scene_metadata(
+                scene_dir=seq_dir,
+                sequence_name=seq,
+                ann_path=ann_path,
+                h5_path=h5_path,
+                trajs_2d_path=trajs_2d_path,
+            )
+            frame_names, frame_name_width, frame_name_suffix = self._maybe_build_sequential_names(
+                suffix_candidates=(".png", ".jpg", ".jpeg"),
+            )
+            depth_dir = present.get("depths")
+            if depth_dir is not None:
+                depth_names, depth_name_width, depth_name_suffix = self._maybe_build_sequential_names(
+                    suffix_candidates=(".npy",),
+                )
+            else:
+                depth_names = None
+                depth_name_width = 3
+                depth_name_suffix = ".npy"
+            return _KubricSceneRecord(
+                sequence_name=seq,
+                scene_dir=seq_dir,
+                ann_path=ann_path,
+                rank_path=rank_path,
+                h5_path=h5_path,
+                trajs_2d_path=trajs_2d_path,
+                frame_names=frame_names,
+                depth_names=depth_names,
+                num_frames=num_frames,
+                num_tracks=num_tracks,
+                height=height,
+                width=width,
+                frame_file_count=num_frames,
+                frame_name_width=frame_name_width,
+                frame_name_suffix=frame_name_suffix,
+                depth_name_width=depth_name_width,
+                depth_name_suffix=depth_name_suffix,
+            )
+
+        n_workers = min(self.index_workers, len(scene_dirs))
+        if n_workers > 1:
+            results: list[Optional[_KubricSceneRecord]] = [None] * len(scene_dirs)
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                future_to_idx = {executor.submit(_index_one, p): i for i, p in enumerate(scene_dirs)}
+                for fut in as_completed(future_to_idx):
+                    results[future_to_idx[fut]] = fut.result()
+            records = [r for r in results if r is not None]
+        else:
+            records = [r for p in scene_dirs if (r := _index_one(p)) is not None]
+
+        if len(records) == 0:
             raise RuntimeError(f"No valid Kubric scenes found under: {self.root}")
-        return sequence_names
+        return records
+
+    def _get_record(self, sequence_name: str) -> _KubricSceneRecord:
+        if sequence_name not in self._name_to_record:
+            raise KeyError(f"Unknown sequence_name: {sequence_name}")
+        return self._name_to_record[sequence_name]
+
+    def _resolve_scene_dir(self, scene_root: Path, sequence_name: str) -> Path:
+        nested_dir = scene_root / sequence_name
+        return nested_dir if nested_dir.is_dir() else scene_root
+
+    def _probe_scene_metadata(
+        self,
+        scene_dir: Path,
+        sequence_name: str,
+        ann_path: Path,
+        h5_path: Optional[Path],
+        trajs_2d_path: Optional[Path],
+    ) -> tuple[int, int, int, int]:
+        if trajs_2d_path is not None:
+            try:
+                num_frames, num_tracks = self._probe_track_array_metadata(trajs_2d_path)
+                return num_frames, num_tracks, -1, -1
+            except Exception:
+                pass
+
+        if h5_path is not None:
+            try:
+                num_frames, num_tracks = self._probe_h5_metadata(h5_path)
+                return num_frames, num_tracks, -1, -1
+            except Exception:
+                pass
+
+        ann = np.load(ann_path, allow_pickle=True).item()
+        coords = np.asarray(ann["coords"])
+        depth = np.asarray(ann["depth"])
+        return (
+            int(coords.shape[1]),
+            int(coords.shape[0]),
+            int(depth.shape[1]),
+            int(depth.shape[2]),
+        )
+
+    def _probe_track_array_metadata(self, trajs_2d_path: Path) -> tuple[int, int]:
+        # Read only numpy header (first ~128 bytes) instead of mmap entire file.
+        import struct
+        with open(trajs_2d_path, "rb") as f:
+            magic = f.read(6)
+            if magic[:6] != b"\x93NUMPY":
+                raise ValueError(f"Not a numpy file: {trajs_2d_path}")
+            major, minor = struct.unpack("BB", f.read(2))
+            if major == 1:
+                header_len = struct.unpack("<H", f.read(2))[0]
+            elif major in (2, 3):
+                header_len = struct.unpack("<I", f.read(4))[0]
+            else:
+                raise ValueError(f"Unsupported numpy version {major}.{minor}")
+            header_bytes = f.read(header_len)
+            header_str = header_bytes.decode("latin1")
+            # Parse shape from header dict string like "{'descr': '<f4', 'fortran_order': False, 'shape': (T, N, 2)}"
+            import ast
+            header_dict = ast.literal_eval(header_str)
+            shape = header_dict["shape"]
+        if len(shape) != 3 or shape[-1] != 2:
+            raise ValueError(f"Invalid trajs_2d shape in {trajs_2d_path}: {shape}")
+        dim0, dim1 = int(shape[0]), int(shape[1])
+        if dim0 > dim1:
+            # Kubric *_trajs_2d.npy stores [N, T, 2], while .h5 stores [T, N, 2].
+            return dim1, dim0
+        return dim0, dim1
+
+    def _probe_h5_metadata(self, h5_path: Path) -> tuple[int, int]:
+        import h5py
+
+        with h5py.File(h5_path, "r") as hf:
+            trajs_2d = hf["trajs_2d"]
+            num_frames = int(hf["num_frames"][()]) if "num_frames" in hf else int(trajs_2d.shape[0])
+            return num_frames, int(trajs_2d.shape[1])
+
+    def _maybe_build_sequential_names(
+        self,
+        suffix_candidates: tuple[str, ...],
+    ) -> tuple[list[str] | None, int, str]:
+        return None, 3, suffix_candidates[0]
+
+    def _frame_name_for_index(self, record: _KubricSceneRecord, index: int) -> str:
+        if record.frame_names is not None:
+            return record.frame_names[index]
+        return f"{index:0{record.frame_name_width}d}{record.frame_name_suffix}"
+
+    def _depth_name_for_index(self, record: _KubricSceneRecord, index: int) -> str:
+        if record.depth_names is not None:
+            return record.depth_names[index]
+        return f"{index:0{record.depth_name_width}d}{record.depth_name_suffix}"
+
+    def _frame_path_for_index(self, record: _KubricSceneRecord, index: int) -> Path:
+        path = record.frame_dir / self._frame_name_for_index(record, index)
+        if path.exists():
+            return path
+        if record.frame_names is None:
+            record.frame_names = self._list_matching_names(record.frame_dir, {".png", ".jpg", ".jpeg"})
+            record.frame_file_count = len(record.frame_names)
+        return record.frame_dir / record.frame_names[index]
+
+    def _depth_path_for_index(self, record: _KubricSceneRecord, index: int) -> Path:
+        path = record.depth_dir / self._depth_name_for_index(record, index)
+        if path.exists():
+            return path
+        if record.depth_names is None:
+            record.depth_names = self._list_matching_names(record.depth_dir, {".npy"})
+        return record.depth_dir / record.depth_names[index]
+
+    def _resolve_record_image_size(self, record: _KubricSceneRecord) -> tuple[int, int]:
+        try:
+            return self._read_image_size(self._frame_path_for_index(record, 0))
+        except Exception:
+            ann = np.load(record.ann_path, allow_pickle=True).item()
+            depth = np.asarray(ann["depth"])
+            return int(depth.shape[1]), int(depth.shape[2])
 
     def _check_scene_exists(self, scene_dir: Path, sequence_name: str) -> None:
         if not scene_dir.exists():
@@ -339,14 +586,55 @@ class KubricAdapter(BaseAdapter):
         if not (scene_dir / "frames").exists():
             raise FileNotFoundError(f"[{sequence_name}] missing frames dir: {scene_dir / 'frames'}")
 
-    def _find_frame_files(self, frame_dir: Path) -> list[Path]:
-        files: list[Path] = []
-        for ext in ("*.png", "*.jpg", "*.jpeg"):
-            files.extend(frame_dir.glob(ext))
-        return sorted(files)
+    def _list_matching_names(self, directory: Path, suffixes: set[str]) -> list[str]:
+        names: list[str] = []
+        for entry in os.scandir(directory):
+            if os.path.splitext(entry.name)[1].lower() in suffixes:
+                names.append(entry.name)
+        return sorted(names)
 
     def _read_image(self, path: Path) -> np.ndarray:
-        return np.asarray(Image.open(path).convert("RGB"))
+        with Image.open(path) as image:
+            return np.asarray(image.convert("RGB"))
+
+    def _read_image_size(self, path: Path) -> tuple[int, int]:
+        # Read only image header to get dimensions, not the full image data.
+        with open(path, "rb") as f:
+            header = f.read(24)
+
+        # PNG: starts with \x89PNG, size at bytes 16-23
+        if header[:8] == b'\x89PNG\r\n\x1a\n':
+            import struct
+            width, height = struct.unpack(">II", header[16:24])
+            return height, width
+
+        # JPEG: scan for SOF0/SOF2 marker
+        if header[:2] == b'\xff\xd8':
+            with open(path, "rb") as f:
+                f.seek(2)
+                while True:
+                    marker = f.read(2)
+                    if len(marker) != 2:
+                        break
+                    if marker[0] != 0xff:
+                        break
+                    marker_type = marker[1]
+                    if marker_type in (0xc0, 0xc2):  # SOF0 or SOF2
+                        f.read(3)  # skip length + precision
+                        import struct
+                        height, width = struct.unpack(">HH", f.read(4))
+                        return int(height), int(width)
+                    elif marker_type in (0xd8, 0xd9, 0x01):  # SOI, EOI, TEM
+                        continue
+                    else:
+                        import struct
+                        length = struct.unpack(">H", f.read(2))[0]
+                        f.seek(length - 2, 1)
+
+        # Fallback to PIL for other formats
+        with Image.open(path) as image:
+            width, height = image.size
+        return height, width
 
     def _check_indices(self, frame_indices: list[int], num_frames: int, sequence_name: str) -> None:
         if len(frame_indices) == 0:

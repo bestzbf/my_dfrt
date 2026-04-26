@@ -18,25 +18,31 @@ Usage:
 """
 
 from __future__ import annotations
+import os
 from typing import Union
 
 from datasets.registry import create_adapter
 from datasets.mixture import MixtureDataset
+from datasets.planned_dataset import PlannedMixtureDataset
 
 
 def create_training_dataset(
     config: dict,
     split: str = 'train',
-) -> MixtureDataset:
+    rank: int = 0,
+    world_size: int = 1,
+) -> Union[MixtureDataset, PlannedMixtureDataset]:
     """
     Create dataset from config.
 
     Args:
         config: Dataset configuration dict
         split: 'train', 'val', or 'test'
+        rank: DDP rank (for planned mode)
+        world_size: DDP world size (for planned mode)
 
     Returns:
-        MixtureDataset
+        MixtureDataset or PlannedMixtureDataset
 
     ---
     Config format for single dataset (all sequences):
@@ -79,19 +85,24 @@ def create_training_dataset(
     mode = config.get('mode', 'single')
 
     if mode == 'single':
-        return _create_single_dataset(config, split)
+        return _create_single_dataset(config, split, rank, world_size)
     elif mode == 'scene':
-        return _create_scene_dataset(config, split)
+        return _create_scene_dataset(config, split, rank, world_size)
     elif mode == 'mixture':
-        return _create_mixture_dataset(config, split)
+        return _create_mixture_dataset(config, split, rank, world_size)
     else:
         raise ValueError(f"Unknown mode: '{mode}'. Use 'single', 'scene', or 'mixture'")
 
 
-def _create_single_dataset(config: dict, split: str) -> MixtureDataset:
+def _create_single_dataset(config: dict, split: str, rank: int = 0, world_size: int = 1) -> Union[MixtureDataset, PlannedMixtureDataset]:
     """Train on all sequences of one dataset."""
     index_cache_dir = config.get('index_cache_dir', None)
-    extra = {'cache_dir': index_cache_dir} if index_cache_dir else {}
+    index_workers = config.get('index_workers', None)
+    extra = {}
+    if index_cache_dir:
+        extra['cache_dir'] = index_cache_dir
+    if index_workers is not None:
+        extra['index_workers'] = index_workers
     adapter = create_adapter(
         name=config['name'],
         root=config['root'],
@@ -119,7 +130,7 @@ def _create_single_dataset(config: dict, split: str) -> MixtureDataset:
     )
 
 
-def _create_scene_dataset(config: dict, split: str) -> MixtureDataset:
+def _create_scene_dataset(config: dict, split: str, rank: int = 0, world_size: int = 1) -> Union[MixtureDataset, PlannedMixtureDataset]:
     """Train on specific sequences (scenes) from one dataset."""
     sequences = config.get('sequences')
     if not sequences:
@@ -129,7 +140,12 @@ def _create_scene_dataset(config: dict, split: str) -> MixtureDataset:
         )
 
     index_cache_dir = config.get('index_cache_dir', None)
-    extra = {'cache_dir': index_cache_dir} if index_cache_dir else {}
+    index_workers = config.get('index_workers', None)
+    extra = {}
+    if index_cache_dir:
+        extra['cache_dir'] = index_cache_dir
+    if index_workers is not None:
+        extra['index_workers'] = index_workers
     adapter = create_adapter(
         name=config['name'],
         root=config['root'],
@@ -165,21 +181,25 @@ def _create_scene_dataset(config: dict, split: str) -> MixtureDataset:
     )
 
 
-def _create_mixture_dataset(config: dict, split: str) -> MixtureDataset:
+def _create_mixture_dataset(config: dict, split: str, rank: int = 0, world_size: int = 1) -> Union[MixtureDataset, PlannedMixtureDataset]:
     """Train on multiple datasets mixed by weight."""
-    adapters = []
-    weights = []
-    allowed_per_adapter = []
     index_cache_dir = config.get('index_cache_dir', None)
+    index_workers = config.get('index_workers', None)
     custom_stride_range = None
     if 'stride_range' in config:
         stride_range = config['stride_range']
         if isinstance(stride_range, list) and len(stride_range) == 2:
             custom_stride_range = tuple(stride_range)
 
-    for ds_config in config['datasets']:
+    ds_configs = config['datasets']
+
+    def _build_one(ds_config):
         actual_split = ds_config.get('val_split', split) if split == 'val' else ds_config.get('split', split)
-        extra = {'cache_dir': index_cache_dir} if index_cache_dir else {}
+        extra = {}
+        if index_cache_dir:
+            extra['cache_dir'] = index_cache_dir
+        if index_workers is not None:
+            extra['index_workers'] = index_workers
         adapter = create_adapter(
             name=ds_config['name'],
             root=ds_config['root'],
@@ -187,32 +207,118 @@ def _create_mixture_dataset(config: dict, split: str) -> MixtureDataset:
             **ds_config.get('adapter_kwargs', {}),
             **extra,
         )
-        adapters.append(adapter)
-        weights.append(ds_config.get('weight', 1.0))
-        # Each dataset entry may optionally restrict to specific sequences
         if split == 'val' and 'val_sequences' in ds_config:
-            allowed_per_adapter.append(ds_config['val_sequences'])
+            allowed = ds_config['val_sequences']
         elif split == 'train' and 'train_sequences' in ds_config:
-            allowed_per_adapter.append(ds_config['train_sequences'])
+            allowed = ds_config['train_sequences']
         else:
-            allowed_per_adapter.append(ds_config.get('sequences', None))
+            allowed = ds_config.get('sequences', None)
+        return adapter, ds_config.get('weight', 1.0), allowed
 
-    return MixtureDataset(
-        adapters=adapters,
-        dataset_weights=weights,
-        clip_len=config.get('clip_len', 48),
-        img_size=config.get('img_size', 256),
-        use_augs=config.get('use_augs', True) if split == 'train' else False,
-        num_queries=config.get('num_queries', 2048),
-        boundary_ratio=config.get('boundary_ratio', 0.3),
-        t_tgt_eq_t_cam_ratio=config.get('t_tgt_eq_t_cam_ratio', 0.4),
-        seed=config.get('seed', 42),
-        allowed_sequences_per_adapter=allowed_per_adapter,
-        sampling_mode=config.get('sampling_mode', 'stride'),
-        epoch_size=config.get('epoch_size', 10000),
-        custom_stride_range=custom_stride_range,
-        precompute_patches=config.get('precompute_patches', True),
-        precompute_from_highres=config.get('precompute_from_highres', False),
-        allow_track_fallback=config.get('allow_track_fallback', False),
-        reshuffle_each_epoch=config.get('reshuffle_each_epoch', split == 'train'),
-    )
+    serialize_build = os.getenv("D4RT_SERIALIZE_ADAPTER_INIT", "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    results = [None] * len(ds_configs)
+    if serialize_build or len(ds_configs) <= 1:
+        for idx, ds_config in enumerate(ds_configs):
+            results[idx] = _build_one(ds_config)
+    else:
+        from concurrent.futures import ThreadPoolExecutor, as_completed as _as_completed
+
+        with ThreadPoolExecutor(max_workers=len(ds_configs)) as executor:
+            future_to_idx = {executor.submit(_build_one, dc): i for i, dc in enumerate(ds_configs)}
+            for fut in _as_completed(future_to_idx):
+                results[future_to_idx[fut]] = fut.result()
+
+    adapters = [r[0] for r in results]
+    weights = [r[1] for r in results]
+    allowed_per_adapter = [r[2] for r in results]
+
+    # Check if planned mode is enabled
+    planned_mode = config.get('planned_mode', False)
+
+    if planned_mode:
+        # Create PlannedMixtureDataset
+        from datasets.mixture import MixtureSampler
+        from datasets.sampling import DatasetSampler
+        from datasets.query_builder import D4RTQueryBuilder
+        from datasets.transforms import GeometryTransformPipeline
+
+        # Build dataset samplers
+        dataset_samplers = []
+        for adapter, allowed_seqs in zip(adapters, allowed_per_adapter):
+            sampler = DatasetSampler(
+                adapter=adapter,
+                clip_len=config.get('clip_len', 48),
+                sampling_mode=config.get('sampling_mode', 'stride'),
+                min_frames=config.get('clip_len', 48),
+                allowed_sequences=allowed_seqs,
+                custom_stride_range=custom_stride_range,
+                sequence_locality_size=config.get('sequence_locality_size', 3),
+                frame_locality_radius=config.get('frame_locality_radius', config.get('clip_len', 48)),
+            )
+            dataset_samplers.append(sampler)
+
+        # Build mixture sampler
+        mixture_sampler = MixtureSampler(
+            dataset_samplers=dataset_samplers,
+            dataset_weights=weights,
+            dataset_locality_size=config.get('dataset_locality_size', 2),
+        )
+
+        # Build transform pipeline
+        transform = GeometryTransformPipeline(
+            img_size=config.get('img_size', 256),
+            use_augs=config.get('use_augs', True) if split == 'train' else False,
+        )
+
+        # Build query builder
+        query_builder = D4RTQueryBuilder(
+            num_queries=config.get('num_queries', 2048),
+            boundary_ratio=config.get('boundary_ratio', 0.3),
+            t_tgt_eq_t_cam_ratio=config.get('t_tgt_eq_t_cam_ratio', 0.4),
+            precompute_patches=config.get('precompute_patches', True),
+            precompute_from_highres=config.get('precompute_from_highres', False),
+            allow_track_fallback=config.get('allow_track_fallback', False),
+        )
+
+        return PlannedMixtureDataset(
+            adapters=adapters,
+            dataset_weights=weights,
+            transform=transform,
+            query_builder=query_builder,
+            mixture_sampler=mixture_sampler,
+            clip_len=config.get('clip_len', 48),
+            seed=config.get('seed', 42),
+            epoch_size=config.get('epoch_size', 10000),
+            reshuffle_each_epoch=config.get('reshuffle_each_epoch', split == 'train'),
+            builder_workers=config.get('builder_workers', 2),
+            prefetch_depth=config.get('prefetch_depth', 32),
+            spool_dir=config.get('spool_dir', None),
+            rank=rank,
+            world_size=world_size,
+        )
+    else:
+        # Create standard MixtureDataset
+        return MixtureDataset(
+            adapters=adapters,
+            dataset_weights=weights,
+            clip_len=config.get('clip_len', 48),
+            img_size=config.get('img_size', 256),
+            use_augs=config.get('use_augs', True) if split == 'train' else False,
+            num_queries=config.get('num_queries', 2048),
+            boundary_ratio=config.get('boundary_ratio', 0.3),
+            t_tgt_eq_t_cam_ratio=config.get('t_tgt_eq_t_cam_ratio', 0.4),
+            seed=config.get('seed', 42),
+            allowed_sequences_per_adapter=allowed_per_adapter,
+            sampling_mode=config.get('sampling_mode', 'stride'),
+            epoch_size=config.get('epoch_size', 10000),
+            custom_stride_range=custom_stride_range,
+            precompute_patches=config.get('precompute_patches', True),
+            precompute_from_highres=config.get('precompute_from_highres', False),
+            allow_track_fallback=config.get('allow_track_fallback', False),
+            reshuffle_each_epoch=config.get('reshuffle_each_epoch', split == 'train'),
+        )

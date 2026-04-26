@@ -1,8 +1,11 @@
 from __future__ import annotations
 
 import gzip
+import hashlib
 import json
+import os
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Optional
 
@@ -96,6 +99,19 @@ def _load_rgb(path: Path) -> np.ndarray:
     return np.asarray(Image.open(path).convert("RGB"))
 
 
+def _load_depth_raw(path: Path) -> np.ndarray:
+    """Load a raw Dynamic_Replica depth PNG as float32."""
+    return np.array(Image.open(path), dtype=np.float32)
+
+
+def _decode_depth_raw(raw: np.ndarray, scale: float, offset: float) -> np.ndarray:
+    """Convert a raw Dynamic_Replica depth buffer to metric depth."""
+    depth = (raw - offset) * scale
+    depth[raw >= 32768] = 0.0
+    depth[depth < 0] = 0.0
+    return depth
+
+
 def _load_depth(path: Path, scale: float, offset: float) -> np.ndarray:
     """Load a 16-bit PNG depth map and convert to metric depth.
 
@@ -107,11 +123,7 @@ def _load_depth(path: Path, scale: float, offset: float) -> np.ndarray:
     Returns:
         (H, W) float32 depth array in world units.  Zero indicates invalid depth.
     """
-    raw = np.array(Image.open(path), dtype=np.float32)
-    depth = (raw - offset) * scale
-    depth[raw >= 32768] = 0.0
-    depth[depth < 0] = 0.0
-    return depth
+    return _decode_depth_raw(_load_depth_raw(path), scale, offset)
 
 
 def _collect_raw_z_pairs(
@@ -185,7 +197,7 @@ def _calibrate_depth_linear(
 
 
 def _calibrate_depth_linear_multiframe(
-    dep_paths: list[Path],
+    raw_depths: list[np.ndarray],
     trajs_3d_world: np.ndarray,
     trajs_2d: np.ndarray,
     visibs: np.ndarray,
@@ -200,15 +212,14 @@ def _calibrate_depth_linear_multiframe(
     Returns:
         (scale, offset) tuple.
     """
-    T = len(dep_paths)
+    T = len(raw_depths)
     num_frames = min(max_frames, T)
 
     all_raw = []
     all_z = []
     for t in range(num_frames):
-        raw_depth = np.array(Image.open(dep_paths[t]), dtype=np.float32)
         result = _collect_raw_z_pairs(
-            raw_depth, trajs_3d_world[t], trajs_2d[t], visibs[t], extrinsics[t]
+            raw_depths[t], trajs_3d_world[t], trajs_2d[t], visibs[t], extrinsics[t]
         )
         if result is not None:
             all_raw.append(result[0])
@@ -269,6 +280,17 @@ def _load_trajectory_pth(path: Path) -> dict[str, np.ndarray]:
     }
 
 
+@lru_cache(maxsize=128)
+def _load_trajectory_pth_cached(path_str: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Process-local cache for per-frame trajectory files."""
+    data = _load_trajectory_pth(Path(path_str))
+    return (
+        data["traj_3d_world"],
+        data["traj_2d"],
+        data["verts_inds_vis"],
+    )
+
+
 # ---------------------------------------------------------------------------
 # Sequence index record
 # ---------------------------------------------------------------------------
@@ -282,7 +304,13 @@ class _DRSequenceRecord:
     camera_name: str          # "left" or "right"
     split: str                # "train", "valid", or "test"
     sequence_dir: Path        # absolute path to the sequence directory
-    frame_numbers: list[int]  # sorted ascending list of annotation frame numbers
+    frame_numbers: tuple[int, ...]  # sorted ascending list of annotation frame numbers
+    image_size: tuple[int, int]     # (H, W) from the first frame annotation
+    image_rel_paths: tuple[str, ...]
+    depth_rel_paths: tuple[str, ...]
+    traj_rel_paths: tuple[Optional[str], ...]
+    intrinsics: np.ndarray          # (T, 3, 3) float32
+    extrinsics: np.ndarray          # (T, 4, 4) float32
     has_trajectories: bool    # True only for "left" camera sequences
 
     @property
@@ -351,6 +379,7 @@ class DynamicReplicaAdapter(BaseAdapter):
     """
 
     dataset_name: str = "dynamic_replica"
+    _CACHE_SCHEMA_VERSION = 2
 
     def __init__(
         self,
@@ -380,6 +409,11 @@ class DynamicReplicaAdapter(BaseAdapter):
             If False, skip broken sequences with a warning.
         verbose :
             Print a summary after index construction.
+        cache_dir :
+            Optional local cache directory. When set, the adapter stores the
+            fully parsed per-sequence metadata index and per-sequence depth
+            calibration on local disk, which avoids repeated remote reads of
+            ``frame_annotations_<split>.jgz`` on COS-backed mounts.
         """
         self.root = Path(root)
         if not self.root.exists():
@@ -397,20 +431,30 @@ class DynamicReplicaAdapter(BaseAdapter):
         self.min_frames = min_frames
         self.strict = strict
         self.verbose = verbose
+        self.cache_dir = Path(cache_dir) if cache_dir is not None else None
+        self._cache_suffix = self._build_cache_suffix()
+        self._depth_calibration_cache: dict[str, tuple[float, float]] = {}
+        self._depth_calibration_cache_dir = (
+            self.cache_dir / f"{self.dataset_name}_{self.split}_{self._cache_suffix}_depth_calibration"
+            if self.cache_dir is not None
+            else None
+        )
 
-        # Lazily loaded frame annotation index.
-        # Maps (base_seq_name, camera_name, frame_number) -> annotation dict.
-        self._anno_index: Optional[dict[tuple[str, str, int], dict]] = None
-
-        if cache_dir is not None:
+        if self.cache_dir is not None:
             from datasets.index_cache import load_or_build
-            _cache_path = Path(cache_dir) / f"{self.dataset_name}_{split}.pkl"
+            _cache_path = (
+                self.cache_dir
+                / f"{self.dataset_name}_{self.split}_{self._cache_suffix}.pkl"
+            )
             self._records: list[_DRSequenceRecord] = load_or_build(self._build_index, _cache_path)
         else:
             self._records: list[_DRSequenceRecord] = self._build_index()
         self._name_to_record: dict[str, _DRSequenceRecord] = {
             r.sequence_name: r for r in self._records
         }
+        self._left_records: list[_DRSequenceRecord] = [
+            r for r in self._records if r.camera_name == "left"
+        ]
 
         if not self._records:
             raise RuntimeError(
@@ -432,25 +476,21 @@ class DynamicReplicaAdapter(BaseAdapter):
     # ------------------------------------------------------------------
 
     def __len__(self) -> int:
-        return sum(1 for r in self._records if r.camera_name == "left")
+        return len(self._left_records)
 
     def list_sequences(self) -> list[str]:
-        return [r.sequence_name for r in self._records if r.camera_name == "left"]
+        return [r.sequence_name for r in self._left_records]
 
     def get_sequence_name(self, index: int) -> str:
-        left_records = [r for r in self._records if r.camera_name == "left"]
-        return left_records[index].sequence_name
+        return self._left_records[index].sequence_name
 
     def get_num_frames(self, sequence_name: str) -> int:
-        """Fast path: read from cached record, no .jgz loading."""
+        """Fast path: read from cached record, no annotation reload."""
         return self._get_record(sequence_name).num_frames
 
     def get_sequence_info(self, sequence_name: str) -> dict[str, Any]:
         r = self._get_record(sequence_name)
-        self._ensure_anno_loaded()
-        first_fn = r.frame_numbers[0]
-        anno = self._get_frame_anno(r.base_seq_name, r.camera_name, first_fn)
-        H, W = anno["image"]["size"]
+        H, W = r.image_size
         has_tracks = r.has_trajectories and self.load_trajectories
         return {
             "dataset_name": self.dataset_name,
@@ -493,49 +533,33 @@ class DynamicReplicaAdapter(BaseAdapter):
         """
         r = self._get_record(sequence_name)
         self._check_indices(frame_indices, r.num_frames, sequence_name)
-        self._ensure_anno_loaded()
 
         images: list[np.ndarray] = []
         dep_paths: list[Path] = []
-        intrinsics_list: list[np.ndarray] = []
-        extrinsics_list: list[np.ndarray] = []
         frame_paths: list[str] = []
         frame_numbers_clip: list[int] = []
         traj_paths_clip: list[Optional[Path]] = []
+        selected_positions: list[int] = []
 
         for idx in frame_indices:
+            selected_positions.append(idx)
             fn = r.frame_numbers[idx]
-            anno = self._get_frame_anno(r.base_seq_name, r.camera_name, fn)
-
-            img_path = self.split_root / anno["image"]["path"]
-            dep_path = self.split_root / anno["depth"]["path"]
+            img_path = self.split_root / r.image_rel_paths[idx]
+            dep_path = self.split_root / r.depth_rel_paths[idx]
 
             frame_paths.append(str(img_path))
             frame_numbers_clip.append(fn)
             images.append(_load_rgb(img_path))
             dep_paths.append(dep_path)
 
-            K = _ndc_to_pinhole(
-                anno["viewpoint"]["focal_length"],
-                anno["viewpoint"]["principal_point"],
-                anno["image"]["size"],
-            )
-            intrinsics_list.append(K)
-
-            E = _p3d_to_opencv_extrinsics(
-                anno["viewpoint"]["R"],
-                anno["viewpoint"]["T"],
-            )
-            extrinsics_list.append(E)
-
-            traj_rel = anno["trajectories"].get("path")
+            traj_rel = r.traj_rel_paths[idx]
             if traj_rel is not None:
                 traj_paths_clip.append(self.split_root / traj_rel)
             else:
                 traj_paths_clip.append(None)
 
-        intrinsics = np.stack(intrinsics_list, axis=0)   # (T, 3, 3) float32
-        extrinsics = np.stack(extrinsics_list, axis=0)   # (T, 4, 4) float32
+        intrinsics = r.intrinsics[selected_positions].copy()
+        extrinsics = r.extrinsics[selected_positions].copy()
 
         # Load trajectories if enabled and available
         has_tracks = (
@@ -555,25 +579,32 @@ class DynamicReplicaAdapter(BaseAdapter):
             vis_list: list[np.ndarray] = []
 
             for p in traj_paths_clip:
-                traj_data = _load_trajectory_pth(p)
-                traj_3d_list.append(traj_data["traj_3d_world"])   # (N, 3)
-                traj_2d_list.append(traj_data["traj_2d"][:, :2])  # (N, 2) – drop 3rd col
-                vis_list.append(traj_data["verts_inds_vis"])       # (N,)
+                traj_3d, traj_2d, traj_vis = _load_trajectory_pth_cached(str(p))
+                traj_3d_list.append(traj_3d)        # (N, 3)
+                traj_2d_list.append(traj_2d[:, :2]) # (N, 2) – drop 3rd col
+                vis_list.append(traj_vis)           # (N,)
 
             trajs_3d_world = np.stack(traj_3d_list, axis=0)  # (T, N, 3)
             trajs_2d = np.stack(traj_2d_list, axis=0)        # (T, N, 2)
             visibs = np.stack(vis_list, axis=0)               # (T, N)
             valids = visibs.copy()                            # visible = valid
 
+        raw_depths = [_load_depth_raw(p) for p in dep_paths]
+
         # Calibrate depth linear parameters (scale, offset) from trajectory GT
         # depth = (raw - offset) * scale  — both are per-sequence
         depth_scale, depth_offset = 0.00142, 14800.0  # fallback
         if has_tracks and trajs_3d_world is not None:
-            depth_scale, depth_offset = _calibrate_depth_linear_multiframe(
-                dep_paths, trajs_3d_world, trajs_2d, visibs, extrinsics, max_frames=5
+            depth_scale, depth_offset = self._get_depth_calibration(
+                sequence_name=sequence_name,
+                raw_depths=raw_depths,
+                trajs_3d_world=trajs_3d_world,
+                trajs_2d=trajs_2d,
+                visibs=visibs,
+                extrinsics=extrinsics,
             )
 
-        depths = [_load_depth(p, depth_scale, depth_offset) for p in dep_paths]
+        depths = [_decode_depth_raw(raw, depth_scale, depth_offset) for raw in raw_depths]
 
         return UnifiedClip(
             dataset_name=self.dataset_name,
@@ -602,6 +633,8 @@ class DynamicReplicaAdapter(BaseAdapter):
                 "has_tracks": has_tracks,
                 "has_visibility": has_tracks,
                 "has_trajs_3d_world": has_tracks,
+                "normal_convention": None,
+                "normal_supervision_compatible": False,
                 "pose_convention": "w2c",
                 "extrinsics_convention": "w2c",
                 "intrinsics_convention": "pinhole",
@@ -632,22 +665,14 @@ class DynamicReplicaAdapter(BaseAdapter):
         msgs: list[str] = []
         ok = True
 
-        self._ensure_anno_loaded()
         probe_count = min(5, r.num_frames)
 
         # ── 1. File existence ────────────────────────────────────────────
         for i in range(probe_count):
             fn = r.frame_numbers[i]
-            try:
-                anno = self._get_frame_anno(r.base_seq_name, r.camera_name, fn)
-            except KeyError as exc:
-                ok = False
-                msgs.append(f"frame {fn}: annotation lookup failed: {exc}")
-                continue
-
             for key, rel in [
-                ("image", anno["image"]["path"]),
-                ("depth", anno["depth"]["path"]),
+                ("image", r.image_rel_paths[i]),
+                ("depth", r.depth_rel_paths[i]),
             ]:
                 p = self.split_root / rel
                 if not p.exists():
@@ -812,90 +837,7 @@ class DynamicReplicaAdapter(BaseAdapter):
     # ------------------------------------------------------------------
 
     def _build_index(self) -> list[_DRSequenceRecord]:
-        self._ensure_anno_loaded()
-
-        records: list[_DRSequenceRecord] = []
-        skipped: list[str] = []
-
-        for seq_dir in sorted(self.split_root.iterdir()):
-            if not seq_dir.is_dir():
-                continue
-            try:
-                rec = self._index_sequence(seq_dir)
-                if rec is not None and rec.num_frames >= self.min_frames:
-                    records.append(rec)
-            except Exception as exc:
-                if self.strict:
-                    raise
-                skipped.append(f"{seq_dir.name}: {exc}")
-                if self.verbose:
-                    print(f"[DynamicReplicaAdapter][WARN] skip {seq_dir.name}: {exc}")
-
-        if self.verbose and skipped:
-            print(
-                f"[DynamicReplicaAdapter] skipped {len(skipped)} directories "
-                "(non-strict mode)"
-            )
-
-        return records
-
-    def _index_sequence(self, seq_dir: Path) -> Optional[_DRSequenceRecord]:
-        """Parse one sequence directory and build a record."""
-        name = seq_dir.name
-
-        # Parse base name and camera side from directory name.
-        # Expected pattern: "<base_name>_source_<camera>" e.g. "009850-3_obj_source_left"
-        if "_source_" not in name:
-            return None  # skip annotation files and unrecognised dirs
-
-        base_name, _, camera = name.rpartition("_source_")
-        if camera not in ("left", "right"):
-            return None
-
-        images_dir = seq_dir / "images"
-        if not images_dir.exists():
-            return None
-
-        # Look up frame numbers from the annotation index.
-        all_anno = self._anno_index
-        frame_numbers = sorted(
-            fn
-            for (bsn, cam, fn), _ in all_anno.items()
-            if bsn == base_name and cam == camera
-        )
-
-        if len(frame_numbers) == 0:
-            return None
-
-        # Check whether this sequence has trajectory files.
-        has_traj = False
-        if camera == "left":
-            first_fn = frame_numbers[0]
-            anno = all_anno.get((base_name, camera, first_fn))
-            if anno is not None:
-                traj_rel = anno["trajectories"].get("path")
-                has_traj = traj_rel is not None
-
-        return _DRSequenceRecord(
-            sequence_name=name,
-            base_seq_name=base_name,
-            camera_name=camera,
-            split=self.split,
-            sequence_dir=seq_dir,
-            frame_numbers=frame_numbers,
-            has_trajectories=has_traj,
-        )
-
-    # ------------------------------------------------------------------
-    # Annotation cache
-    # ------------------------------------------------------------------
-
-    def _ensure_anno_loaded(self) -> None:
-        """Load and index the split annotation file on first call."""
-        if self._anno_index is not None:
-            return
-
-        anno_file = self.split_root / f"frame_annotations_{self.split}.jgz"
+        anno_file = self._annotation_file()
         if not anno_file.exists():
             raise FileNotFoundError(
                 f"Annotation file not found: {anno_file}. "
@@ -903,35 +845,225 @@ class DynamicReplicaAdapter(BaseAdapter):
             )
 
         raw = _load_jgz(anno_file)
+        grouped: dict[tuple[str, str, str], dict[int, dict[str, Any]]] = {}
+        records: list[_DRSequenceRecord] = []
+        skipped: list[str] = []
 
-        index: dict[tuple[str, str, int], dict] = {}
         for entry in raw:
-            key = (
-                entry["sequence_name"],
-                entry["camera_name"],
-                int(entry["frame_number"]),
-            )
-            index[key] = entry
+            try:
+                base_seq_name = str(entry["sequence_name"])
+                camera_name = str(entry["camera_name"])
+                if camera_name not in ("left", "right"):
+                    raise ValueError(f"unsupported camera_name={camera_name!r}")
 
-        self._anno_index = index
+                image_rel_path = str(entry["image"]["path"])
+                path_parts = Path(image_rel_path).parts
+                if not path_parts:
+                    raise ValueError("empty image path in annotation")
+                sequence_name = path_parts[0]
 
-    def _get_frame_anno(
-        self,
-        base_seq_name: str,
-        camera_name: str,
-        frame_number: int,
-    ) -> dict:
-        key = (base_seq_name, camera_name, int(frame_number))
-        if key not in self._anno_index:
-            raise KeyError(
-                f"No annotation for ({base_seq_name!r}, {camera_name!r}, "
-                f"frame {frame_number})"
+                frame_number = int(entry["frame_number"])
+                frame_map = grouped.setdefault(
+                    (sequence_name, base_seq_name, camera_name),
+                    {},
+                )
+                frame_map[frame_number] = {
+                    "image_rel_path": image_rel_path,
+                    "depth_rel_path": str(entry["depth"]["path"]),
+                    "traj_rel_path": (
+                        None
+                        if entry.get("trajectories", {}).get("path") is None
+                        else str(entry["trajectories"]["path"])
+                    ),
+                    "image_size": tuple(int(v) for v in entry["image"]["size"]),
+                    "intrinsics": _ndc_to_pinhole(
+                        entry["viewpoint"]["focal_length"],
+                        entry["viewpoint"]["principal_point"],
+                        entry["image"]["size"],
+                    ),
+                    "extrinsics": _p3d_to_opencv_extrinsics(
+                        entry["viewpoint"]["R"],
+                        entry["viewpoint"]["T"],
+                    ),
+                }
+            except Exception as exc:
+                if self.strict:
+                    raise
+                skipped.append(f"annotation entry {entry!r}: {exc}")
+                if self.verbose:
+                    print(f"[DynamicReplicaAdapter][WARN] skip malformed entry: {exc}")
+
+        for (sequence_name, base_seq_name, camera_name), frame_map in sorted(grouped.items()):
+            try:
+                if not frame_map:
+                    continue
+
+                ordered_items = sorted(frame_map.items())
+                frame_numbers = tuple(fn for fn, _ in ordered_items)
+                if len(frame_numbers) < self.min_frames:
+                    continue
+
+                sequence_dir = self.split_root / sequence_name
+                if self.strict:
+                    images_dir = sequence_dir / "images"
+                    if not images_dir.exists():
+                        raise FileNotFoundError(f"missing images dir: {images_dir}")
+
+                first_frame = ordered_items[0][1]
+                image_rel_paths = tuple(item["image_rel_path"] for _, item in ordered_items)
+                depth_rel_paths = tuple(item["depth_rel_path"] for _, item in ordered_items)
+                traj_rel_paths = tuple(item["traj_rel_path"] for _, item in ordered_items)
+                intrinsics = np.stack(
+                    [item["intrinsics"] for _, item in ordered_items],
+                    axis=0,
+                ).astype(np.float32, copy=False)
+                extrinsics = np.stack(
+                    [item["extrinsics"] for _, item in ordered_items],
+                    axis=0,
+                ).astype(np.float32, copy=False)
+
+                records.append(
+                    _DRSequenceRecord(
+                        sequence_name=sequence_name,
+                        base_seq_name=base_seq_name,
+                        camera_name=camera_name,
+                        split=self.split,
+                        sequence_dir=sequence_dir,
+                        frame_numbers=frame_numbers,
+                        image_size=first_frame["image_size"],
+                        image_rel_paths=image_rel_paths,
+                        depth_rel_paths=depth_rel_paths,
+                        traj_rel_paths=traj_rel_paths,
+                        intrinsics=intrinsics,
+                        extrinsics=extrinsics,
+                        has_trajectories=(
+                            camera_name == "left"
+                            and any(path is not None for path in traj_rel_paths)
+                        ),
+                    )
+                )
+            except Exception as exc:
+                if self.strict:
+                    raise
+                skipped.append(f"{sequence_name}: {exc}")
+                if self.verbose:
+                    print(f"[DynamicReplicaAdapter][WARN] skip {sequence_name}: {exc}")
+
+        if self.verbose and skipped:
+            print(
+                f"[DynamicReplicaAdapter] skipped {len(skipped)} malformed entries/sequences "
+                "(non-strict mode)"
             )
-        return self._anno_index[key]
+
+        return records
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    def _annotation_file(self) -> Path:
+        return self.split_root / f"frame_annotations_{self.split}.jgz"
+
+    def _build_cache_suffix(self) -> str:
+        anno_file = self._annotation_file()
+        stat_size = None
+        stat_mtime_ns = None
+        try:
+            stat = anno_file.stat()
+        except OSError:
+            stat = None
+        if stat is not None:
+            stat_size = stat.st_size
+            stat_mtime_ns = stat.st_mtime_ns
+
+        cache_key = {
+            "dataset": self.dataset_name,
+            "split": self.split,
+            "root": str(self.root),
+            "min_frames": self.min_frames,
+            "strict": self.strict,
+            "schema": self._CACHE_SCHEMA_VERSION,
+            "annotation_file": str(anno_file),
+            "annotation_size": stat_size,
+            "annotation_mtime_ns": stat_mtime_ns,
+        }
+        return hashlib.sha1(
+            json.dumps(cache_key, sort_keys=True).encode("utf-8")
+        ).hexdigest()[:12]
+
+    def _depth_calibration_cache_path(self, sequence_name: str) -> Optional[Path]:
+        if self._depth_calibration_cache_dir is None:
+            return None
+        return self._depth_calibration_cache_dir / f"{sequence_name}.json"
+
+    def _load_cached_depth_calibration(
+        self,
+        sequence_name: str,
+    ) -> Optional[tuple[float, float]]:
+        cache_path = self._depth_calibration_cache_path(sequence_name)
+        if cache_path is None or not cache_path.exists():
+            return None
+        try:
+            payload = json.loads(cache_path.read_text())
+            scale = float(payload["scale"])
+            offset = float(payload["offset"])
+        except Exception:
+            return None
+        if scale <= 0 or not np.isfinite(scale) or not np.isfinite(offset):
+            return None
+        return (scale, offset)
+
+    def _store_depth_calibration(
+        self,
+        sequence_name: str,
+        scale: float,
+        offset: float,
+    ) -> None:
+        cache_path = self._depth_calibration_cache_path(sequence_name)
+        if cache_path is None:
+            return
+        tmp_path: Optional[Path] = None
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_path = cache_path.with_suffix(f".tmp{os.getpid()}")
+            tmp_path.write_text(json.dumps({"scale": scale, "offset": offset}))
+            os.replace(tmp_path, cache_path)
+        except OSError:
+            try:
+                if tmp_path is not None:
+                    tmp_path.unlink()
+            except Exception:
+                pass
+
+    def _get_depth_calibration(
+        self,
+        sequence_name: str,
+        raw_depths: list[np.ndarray],
+        trajs_3d_world: np.ndarray,
+        trajs_2d: np.ndarray,
+        visibs: np.ndarray,
+        extrinsics: np.ndarray,
+    ) -> tuple[float, float]:
+        cached = self._depth_calibration_cache.get(sequence_name)
+        if cached is not None:
+            return cached
+
+        cached = self._load_cached_depth_calibration(sequence_name)
+        if cached is not None:
+            self._depth_calibration_cache[sequence_name] = cached
+            return cached
+
+        calibration = _calibrate_depth_linear_multiframe(
+            raw_depths=raw_depths,
+            trajs_3d_world=trajs_3d_world,
+            trajs_2d=trajs_2d,
+            visibs=visibs,
+            extrinsics=extrinsics,
+            max_frames=5,
+        )
+        self._depth_calibration_cache[sequence_name] = calibration
+        self._store_depth_calibration(sequence_name, *calibration)
+        return calibration
 
     def _get_record(self, sequence_name: str) -> _DRSequenceRecord:
         if sequence_name not in self._name_to_record:

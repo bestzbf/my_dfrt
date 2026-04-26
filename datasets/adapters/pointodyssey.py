@@ -14,10 +14,30 @@ from typing import Any, Optional
 import cv2
 import numpy as np
 
-from .base import BaseAdapter, UnifiedClip
+from .base import BaseAdapter, UnifiedClip, h5_read_frame_slice
 
 
 VALID_SUFFIXES = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".exr", ".npy"}
+
+# PointOdyssey official export code applies a fixed basis change R1 when it
+# writes the released extrinsics:
+#   RT_saved = R3 @ R2 @ RT @ R1
+# but the released normal PNG/JPG files are copied directly from the rendered
+# normal pass after visualization encoding, without the same camera-basis
+# correction. After decoding those images back to unit vectors, we therefore
+# need to rotate them into the released camera space using:
+#   normal_cam = normal_saved_basis @ (R_saved @ R1^T)^T
+# where R_saved is the 3x3 rotation block of the released world-to-camera
+# extrinsic. See PointOdyssey official `utils/gen_tracking*.py` and
+# `utils/openexr_utils.py`.
+POINTODYSSEY_R1 = np.array(
+    [
+        [1.0, 0.0, 0.0],
+        [0.0, 0.0, -1.0],
+        [0.0, 1.0, 0.0],
+    ],
+    dtype=np.float32,
+)
 
 FAST_ANNOTATION_DIRNAME = "anno_fast"
 FAST_REQUIRED_ANNO_FILES = ("trajs_2d", "trajs_3d", "valids", "intrinsics", "extrinsics")
@@ -121,7 +141,6 @@ class PointOdysseyAdapter(BaseAdapter):
         if len(self.records) == 0:
             raise RuntimeError(f"No valid PointOdyssey sequences found under {split_root}")
 
-        self._anno_cache: dict[str, dict[str, Any]] = {}
         self._scene_info_cache: dict[str, Optional[dict[str, Any]]] = {}
         # Cache for open memmap handles (avoids re-opening on every load_clip call)
         self._encoded_cache_store: dict[str, dict[str, Any]] = {}
@@ -258,7 +277,7 @@ class PointOdysseyAdapter(BaseAdapter):
                 f"valid range = [0, {r.num_frames - 1}]"
             )
 
-        anno = self._load_anno(sequence_name)
+        anno = self._load_anno(sequence_name, frame_indices_np)
         scene_info = self._load_scene_info(sequence_name)
 
         if r.encoded_cache_paths is not None:
@@ -292,18 +311,21 @@ class PointOdysseyAdapter(BaseAdapter):
         if depths is not None:
             depths = [d * (1000.0 / 65535.0) if d is not None else None for d in depths]
 
-        trajs_2d = anno["trajs_2d"][frame_indices_np].astype(np.float32)          # [T,N,2]
+        # _load_anno pre-slices all paths to frame_indices_np, so index with [:].
+        trajs_2d = anno["trajs_2d"][:].astype(np.float32)               # [T,N,2]
 
         trajs_3d_raw = anno["trajs_3d"]
         if trajs_3d_raw.ndim == 0 or trajs_3d_raw.shape[0] == 0:
             trajs_3d_world = None
         else:
-            trajs_3d_world = trajs_3d_raw[frame_indices_np].astype(np.float32)    # [T,N,3]
+            trajs_3d_world = trajs_3d_raw[:].astype(np.float32)         # [T,N,3]
 
-        valids = anno["valids"][frame_indices_np].astype(bool)                    # [T,N]
-        visibs = anno["visibs"][frame_indices_np].astype(bool)                    # [T,N]
-        intrinsics = anno["intrinsics"][frame_indices_np].astype(np.float32)      # [T,3,3]
-        extrinsics = anno["extrinsics"][frame_indices_np].astype(np.float32)      # [T,4,4]
+        valids = anno["valids"][:].astype(bool)                         # [T,N]
+        visibs = anno["visibs"][:].astype(bool)                         # [T,N]
+        intrinsics = anno["intrinsics"][:].astype(np.float32)           # [T,3,3]
+        extrinsics = anno["extrinsics"][:].astype(np.float32)           # [T,4,4]
+        if normals is not None:
+            normals = self._convert_released_normals_to_camera_space(normals, extrinsics)
 
         clip = UnifiedClip(
             dataset_name=self.dataset_name,
@@ -334,7 +356,9 @@ class PointOdysseyAdapter(BaseAdapter):
                 "pose_convention": "world_to_camera",
                 "trajs_3d_convention": "world",
                 "intrinsics_convention": "pinhole",
-                "normal_convention": "blender_pass_decoded",
+                "normal_source_convention": "pointodyssey_released_normal_pass_decoded",
+                "normal_convention": "camera_space_opencv_towards_camera" if normals is not None else None,
+                "normal_supervision_compatible": normals is not None,
                 "depth_unit": "unknown",
                 "raw_mask_semantics": "unknown",
                 "scene_info_keys": list(scene_info.keys()) if scene_info is not None else None,
@@ -630,39 +654,65 @@ class PointOdysseyAdapter(BaseAdapter):
     #  Annotation loading                                                  #
     # ------------------------------------------------------------------ #
 
-    def _load_anno(self, sequence_name: str) -> dict[str, Any]:
-        if sequence_name in self._anno_cache:
-            return self._anno_cache[sequence_name]
+    def _load_anno(
+        self,
+        sequence_name: str,
+        frame_indices: Optional[np.ndarray] = None,
+    ) -> dict[str, Any]:
+        """Load annotation arrays for *sequence_name*.
 
+        Parameters
+        ----------
+        frame_indices:
+            If provided (1-D int64 array), per-frame arrays are sliced to
+            exactly these positions before returning.  All three backing
+            formats (fast_anno mmap, .h5, .npz) return pre-sliced arrays so
+            the caller can unconditionally index with ``[:]``.
+            Pass ``None`` to load all frames (used by sanity_check /
+            probe_sequence_meta).
+        """
         r = self.get_record(sequence_name)
+        idx: list[int] | None = (
+            [int(i) for i in frame_indices] if frame_indices is not None else None
+        )
 
-        # Fast path: individual .npy files with memory-mapped lazy loading
+        # Fast path: individual .npy files with memory-mapped lazy loading.
         if r.fast_anno_paths:
             anno: dict[str, Any] = {}
             for key in FAST_REQUIRED_ANNO_FILES:
                 if key in r.fast_anno_paths:
-                    anno[key] = np.load(r.fast_anno_paths[key], mmap_mode="r", allow_pickle=False)
+                    arr = np.load(r.fast_anno_paths[key], mmap_mode="r", allow_pickle=False)
+                    anno[key] = arr[idx] if idx is not None else arr
             if "visibs" in r.fast_anno_paths:
-                anno["visibs"] = np.load(r.fast_anno_paths["visibs"], mmap_mode="r", allow_pickle=False)
+                arr = np.load(r.fast_anno_paths["visibs"], mmap_mode="r", allow_pickle=False)
+                anno["visibs"] = arr[idx] if idx is not None else arr
             elif "valids" in anno:
                 anno["visibs"] = anno["valids"]
-            self._anno_cache[sequence_name] = anno
             return anno
 
         if r.anno_path is None:
             raise FileNotFoundError(f"Missing anno.npz for sequence: {sequence_name}")
 
-        # HDF5 chunked format (faster random-access than npz)
+        # HDF5 chunked format: O(frames) random access vs full zlib decompress for npz.
         h5_path = r.anno_path.with_suffix(".h5")
         if h5_path.exists():
             import h5py
             with h5py.File(h5_path, "r") as f:
-                anno = {k: f[k][()] for k in f.keys()}
+                if idx is not None:
+                    anno = h5_read_frame_slice(f, idx)
+                else:
+                    anno = {k: f[k][()] for k in f.keys()}
         else:
             z = np.load(r.anno_path, allow_pickle=True)
-            anno = {k: z[k] for k in z.files}
+            if idx is not None:
+                idx_np = np.asarray(idx)
+                anno = {
+                    k: (z[k][idx_np] if z[k].ndim >= 1 and z[k].shape[0] > 1 else z[k][()])
+                    for k in z.files
+                }
+            else:
+                anno = {k: z[k] for k in z.files}
 
-        self._anno_cache[sequence_name] = anno
         return anno
 
     def _load_scene_info(self, sequence_name: str) -> Optional[dict[str, Any]]:
@@ -798,33 +848,70 @@ class PointOdysseyAdapter(BaseAdapter):
         [-1, 1], converts them to uint16 PNG, and later re-saves those PNGs
         as JPG for the released dataset. The loader therefore needs to invert
         that visualization encoding instead of treating the file as plain RGB.
+
+        Normalization uses einsum for the squared-norm (single pass) and a
+        float mask multiply instead of np.where to avoid branched allocations.
         """
         arr = normal.astype(np.float32, copy=False)
         if arr.ndim != 3 or arr.shape[-1] != 3:
-            return arr.astype(np.float32, copy=False)
+            return arr
 
-        valid_threshold = 1e-6
+        valid_threshold_sq: float
         if np.issubdtype(normal.dtype, np.integer):
             max_val = 65535.0 if normal.dtype == np.uint16 else 255.0
-            arr = arr / max_val
-            arr = arr * 2.0 - 1.0
-            # JPG re-encoding perturbs true zero-vectors to a tiny shell around 0.
-            valid_threshold = 5e-2
+            arr = arr * (2.0 / max_val) - 1.0
+            # JPG re-encoding perturbs true zero-vectors; use a larger threshold.
+            valid_threshold_sq = (5e-2) ** 2
         else:
             if arr.size == 0:
-                return arr.astype(np.float32, copy=False)
+                return arr
             if arr.min() >= 0.0 and arr.max() <= 1.0:
                 arr = arr * 2.0 - 1.0
             elif arr.min() < -1.0 or arr.max() > 1.0:
-                arr = arr / 255.0
-                arr = arr * 2.0 - 1.0
+                arr = arr * (2.0 / 255.0) - 1.0
+            valid_threshold_sq = (1e-6) ** 2
 
-        norm = np.linalg.norm(arr, axis=-1, keepdims=True)
-        finite = np.isfinite(arr).all(axis=-1, keepdims=True)
-        valid = finite & (norm > valid_threshold)
-        safe_norm = np.where(valid, norm, 1.0)
-        decoded = np.where(valid, arr / safe_norm, 0.0)
-        return decoded.astype(np.float32, copy=False)
+        # Squared L2 norm per pixel — single pass, no keepdims overhead.
+        norm_sq = np.einsum("hwc,hwc->hw", arr, arr)  # (H, W)
+        safe_norm = np.sqrt(norm_sq.clip(min=valid_threshold_sq))
+        # Zero background pixels (norm below threshold) via float multiply.
+        valid = (norm_sq >= valid_threshold_sq).astype(np.float32)
+        return (arr / safe_norm[:, :, np.newaxis] * valid[:, :, np.newaxis]).astype(
+            np.float32, copy=False
+        )
+
+    def _convert_released_normals_to_camera_space(
+        self,
+        normals: list[np.ndarray],
+        extrinsics: np.ndarray,
+    ) -> list[np.ndarray]:
+        """Rotate released PointOdyssey normals into the released camera space.
+
+        The released normal images are copied from the rendered Blender normal
+        pass after visualization encoding, while the released extrinsics are
+        transformed by the official export code using R3 @ R2 @ RT @ R1.
+        After decoding a normal map back to unit vectors, each frame therefore
+        needs the per-frame rotation R_saved @ R1^T to align with the released
+        world-to-camera extrinsic convention used elsewhere in D4RT.
+
+        The input normals are already unit vectors (_decode_normal_map).
+        A rotation preserves vector length, so renormalization is unnecessary.
+
+        Note: a batched np.stack + reshape + matmul approach is ~4× slower
+        than the per-frame loop here because np.stack must allocate a single
+        (T, H, W, 3) contiguous buffer (~300 MB for T=48, H=540, W=960),
+        which exceeds CPU cache and dominates over Python loop overhead.
+        """
+        converted: list[np.ndarray] = []
+        for normal, extrinsic in zip(normals, extrinsics):
+            arr = normal.astype(np.float32, copy=False)
+            if arr.ndim != 3 or arr.shape[-1] != 3:
+                converted.append(arr)
+                continue
+            transform = extrinsic[:3, :3].astype(np.float32, copy=False) @ POINTODYSSEY_R1.T
+            # (H, W, 3) @ (3, 3).T — rotation preserves unit length; no renorm needed.
+            converted.append((arr @ transform.T).astype(np.float32, copy=False))
+        return converted
 
     # ------------------------------------------------------------------ #
     #  Index helpers                                                       #

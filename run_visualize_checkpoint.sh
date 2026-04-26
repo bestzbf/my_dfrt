@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-CUDA_VISIBLE_DEVICES=5
+CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
 
 set -euo pipefail
@@ -7,8 +7,8 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT_DIR"
 
-# CHECKPOINT=/data/zbf/openclaw/d4rt/outputs/single_co3dv2_5cat/checkpoint_latest_195.pth \
-# bash run_visualize_checkpoint.sh DATASET="pointodyssey"
+# CHECKPOINT=/data/zbf/openclaw/d4rt/outputs/mixture_5datasets_blendedmvs_large_3gpu_bs5/checkpoint_latest_41.pth \
+# bash run_visualize_checkpoint.sh
 
 # 统一 checkpoint 可视化包装脚本。
 #
@@ -45,7 +45,7 @@ cd "$ROOT_DIR"
 
 DATASET_ARG="${1:-}"
 case "$DATASET_ARG" in
-  pointodyssey|dynamic_replica|kubric|co3dv2)
+  pointodyssey|dynamic_replica|kubric|co3dv2|mixture|mixture_5datasets|mixture_5datasets_blendedmvs)
     DATASET="${DATASET:-$DATASET_ARG}"
     shift
     ;;
@@ -58,7 +58,11 @@ esac
 
 # 如果用户指定了 CHECKPOINT 但没有指定 DATASET，从路径自动推断
 if [[ -z "${DATASET:-}" && -n "${CHECKPOINT:-}" ]]; then
-  if [[ "$CHECKPOINT" == *kubric* ]]; then
+  if [[ "$CHECKPOINT" == *mixture_5datasets_blendedmvs* ]]; then
+    DATASET="mixture_5datasets_blendedmvs"
+  elif [[ "$CHECKPOINT" == *mixture* ]]; then
+    DATASET="mixture"
+  elif [[ "$CHECKPOINT" == *kubric* ]]; then
     DATASET="kubric"
   elif [[ "$CHECKPOINT" == *dynamic_replica* ]]; then
     DATASET="dynamic_replica"
@@ -71,8 +75,8 @@ fi
 
 DATASET="${DATASET:-pointodyssey}"
 
-if [[ "$DATASET" != "pointodyssey" && "$DATASET" != "dynamic_replica" && "$DATASET" != "kubric" && "$DATASET" != "co3dv2" ]]; then
-  echo "Usage: bash run_visualize_checkpoint.sh [pointodyssey|dynamic_replica|kubric|co3dv2] [extra args...]" >&2
+if [[ "$DATASET" != "pointodyssey" && "$DATASET" != "dynamic_replica" && "$DATASET" != "kubric" && "$DATASET" != "co3dv2" && "$DATASET" != "mixture" && "$DATASET" != "mixture_5datasets" && "$DATASET" != "mixture_5datasets_blendedmvs" ]]; then
+  echo "Usage: bash run_visualize_checkpoint.sh [pointodyssey|dynamic_replica|kubric|co3dv2|mixture] [extra args...]" >&2
   echo "   or: CHECKPOINT=/path/to/co3dv2_xxx/ckpt.pth bash run_visualize_checkpoint.sh" >&2
   echo "Unknown DATASET: $DATASET" >&2
   exit 1
@@ -80,6 +84,7 @@ fi
 
 PYTHON_BIN="${PYTHON_BIN:-/root/miniconda3/envs/d4rt/bin/python}"
 DEVICE="${DEVICE:-cuda}"
+MODEL_VARIANT="${MODEL_VARIANT:-auto}"
 
 # 样本选择参数。
 NUM_SAMPLES="${NUM_SAMPLES:-3}"
@@ -178,6 +183,15 @@ case "$DATASET" in
     DENSE_GT_POINT_SOURCE="${DENSE_GT_POINT_SOURCE:-all_finite}"
     ALLOW_NO_TRACKS="${ALLOW_NO_TRACKS:-1}"
     ;;
+  mixture|mixture_5datasets|mixture_5datasets_blendedmvs)
+    CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+    CONFIG="${CONFIG:-configs/mixture_5datasets_blendedmvs.yaml}"
+    CHECKPOINT="${CHECKPOINT:-/data/zbf/openclaw/d4rt/outputs/mixture_5datasets_blendedmvs_large_3gpu_bs5/checkpoint_latest_41.pth}"
+    PATCH_PROVIDER="${PATCH_PROVIDER:-sampled_highres}"
+    RESOLUTION="${RESOLUTION:-256}"
+    NUM_FRAMES="${NUM_FRAMES:-48}"
+    DENSE_GT_POINT_SOURCE="${DENSE_GT_POINT_SOURCE:-all_finite}"
+    ;;
 esac
 
 # 在 case 之后设最终默认值，确保 co3dv2 的 ALLOW_NO_TRACKS=1 不被覆盖
@@ -198,6 +212,7 @@ echo "[$LOG_PREFIX] PYTHON_BIN=$PYTHON_BIN"
 echo "[$LOG_PREFIX] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "[$LOG_PREFIX] CONFIG=$CONFIG"
 echo "[$LOG_PREFIX] CHECKPOINT=$CHECKPOINT"
+echo "[$LOG_PREFIX] MODEL_VARIANT=$MODEL_VARIANT"
 echo "[$LOG_PREFIX] OUTPUT_DIR=$OUTPUT_DIR"
 echo "[$LOG_PREFIX] PATCH_PROVIDER=$PATCH_PROVIDER"
 echo "[$LOG_PREFIX] RESOLUTION=$RESOLUTION"
@@ -241,6 +256,7 @@ ARGS=(
   md/visualize_dynamic_replica_checkpoint.py
   --config "$CONFIG"
   --checkpoint "$CHECKPOINT"
+  --model-variant "$MODEL_VARIANT"
   --output-dir "$OUTPUT_DIR"
   --patch-provider "$PATCH_PROVIDER"
   --resolution "$RESOLUTION"
@@ -284,6 +300,7 @@ echo "[$LOG_PREFIX] Running depth visualization -> $DEPTH_OUTPUT_DIR"
 CUDA_VISIBLE_DEVICES="$CUDA_VISIBLE_DEVICES" "$PYTHON_BIN" md/visualize_co3dv2_depth.py \
   --config "$CONFIG" \
   --checkpoint "$CHECKPOINT" \
+  --model-variant "$MODEL_VARIANT" \
   --output-dir "$DEPTH_OUTPUT_DIR" \
   --num-samples "$NUM_SAMPLES" \
   --num-frames "$NUM_FRAMES" \

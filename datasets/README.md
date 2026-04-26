@@ -133,6 +133,28 @@ for batch in loader:
 > - **所有预计算数据现已自动加载**（默认 `precompute_root=root`）
 > - Co3Dv2 的 `precomputed.npz` 直接存放在各序列目录下（`<root>/<category>/<seq>/precomputed.npz`），与其他数据集相同
 
+### Co3Dv2 当前默认过滤（2026-04-23）
+
+- 训练配置当前默认同时使用：
+  - 本地 sibling overlay：`<root>/<category>/<seq>/precomputed.overlay.npz`
+  - `sequence_denylist: /data/zbf/openclaw/d4rt/configs/co3dv2_denylist_degenerate_clips_20260422.txt`
+- 2026-04-23 已把外部 overlay 根目录中的文件搬回 Co3D 数据集目录中：
+  - 原路径：`/data2/d4rt/datasets/Co3Dv2_track_overlay_20260421/<category>/<seq>/precomputed.npz`
+  - 当前路径：`/data2/d4rt/datasets/Co3Dv2/<category>/<seq>/precomputed.overlay.npz`
+- 对失败序列，marker 也已搬回 base 目录：
+  - `precomputed.failed.json`
+- denylist 来自两层审计：
+  - 序列级旧缓存审计：`datasets/computer/co3d_audit_precomputed.py`
+  - clip 级随机采样审计：`datasets/computer/co3d_audit_clip_quality.py`
+- clip 级审计按真实训练设定评估：`clip_len=48`、`sampling_mode=stride`、`num_samples=32`。
+- 当前保守阈值为：
+  - `sampled_bad_clip_ratio >= 0.9`
+  - `sampled_zero_clip_ratio >= 0.3`
+- 2026-04-23 这轮全量审计筛出 `780` 条序列；再与人工复核的日志问题样本并集后，当前 denylist 共 `788` 条。
+- 在 `fewview_train/train + require_pointcloud=true` 下，Co3Dv2 可训练序列当前为 `31046` 条。
+- 归档说明见：
+  - `md/Co3Dv2_clip质量审计与denylist记录_2026-04-23.md`
+
 > **注意**: Waymo 需要安装 `tensorflow`（`pip install tensorflow`），其余数据集无额外依赖。
 
 ---

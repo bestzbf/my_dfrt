@@ -116,7 +116,14 @@ def compute_normals(
     # ------------------------------------------------------------------ #
     norm = np.linalg.norm(normal, axis=-1, keepdims=True)   # [H,W,1]
     valid_normal = (norm[..., 0] > 1e-6) & valid
-    normal = np.where(norm > 1e-6, normal / norm, 0.0).astype(np.float32)
+    # Use masked division so invalid / zero-norm pixels stay zero without
+    # emitting RuntimeWarning from the inactive branch.
+    normal = np.divide(
+        normal,
+        norm,
+        out=np.zeros_like(normal, dtype=np.float32),
+        where=norm > 1e-6,
+    ).astype(np.float32, copy=False)
 
     # ------------------------------------------------------------------ #
     # 6. Ensure normals point toward camera (Z < 0 in camera space)        #

@@ -4,6 +4,7 @@ Precompute normals + tracks for BlendedMVS sequences.
 Usage:
     python run_blendedmvs.py \\
         --root /data2/d4rt/datasets/BlendedMVS \\
+        [--split all] \\
         [--output-root /data2/d4rt/datasets/BlendedMVS] \\
         [--num-points 8000] \\
         [--workers 4] \\
@@ -26,22 +27,34 @@ from adapters.blendedmvs import BlendedMVSAdapter
 def main() -> None:
     parser = argparse.ArgumentParser(description="Precompute BlendedMVS normals + tracks")
     parser.add_argument("--root", required=True, help="BlendedMVS root directory")
+    parser.add_argument(
+        "--split",
+        default="all",
+        choices=["train", "val", "all"],
+        help=(
+            "Which split to precompute. "
+            "'all' is the safe default so validation scenes do not silently miss precomputed caches."
+        ),
+    )
     parser.add_argument("--output-root", default=None)
     parser.add_argument("--num-points", type=int, default=8000)
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--overwrite", action="store_true")
     args = parser.parse_args()
 
-    adapter = BlendedMVSAdapter(root=args.root, verbose=False)
     output_root = Path(args.output_root) if args.output_root else Path(args.root)
+    splits = ["train", "val"] if args.split == "all" else [args.split]
 
-    run_precompute(
-        adapter=adapter,
-        output_root=output_root,
-        num_points=args.num_points,
-        workers=args.workers,
-        overwrite=args.overwrite,
-    )
+    for split in splits:
+        adapter = BlendedMVSAdapter(root=args.root, split=split, verbose=False)
+        print(f"[run_blendedmvs] split={split} -> output_root={output_root}")
+        run_precompute(
+            adapter=adapter,
+            output_root=output_root,
+            num_points=args.num_points,
+            workers=args.workers,
+            overwrite=args.overwrite,
+        )
 
 
 if __name__ == "__main__":

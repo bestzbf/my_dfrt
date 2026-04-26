@@ -194,6 +194,12 @@ def _build_empty_targets(num_queries: int) -> dict:
     }
 
 
+def _normalize_crop_coords(xy: np.ndarray, crop_w: int, crop_h: int) -> np.ndarray:
+    """Normalize crop-plane pixel coords to [0,1] and clamp subpixel edge spill."""
+    norm = np.array([max(crop_w - 1, 1), max(crop_h - 1, 1)], dtype=np.float32)
+    return np.clip(xy.astype(np.float32) / norm, 0.0, 1.0)
+
+
 # ---------------------------------------------------------------------------
 # Per-dataset camera-space Z thresholds for mask_3d gating
 # ---------------------------------------------------------------------------
@@ -624,13 +630,14 @@ class D4RTQueryBuilder:
         src_is_mbnd = mbnd_stack[src_frames, src_iy, src_ix]
 
         # 6. 一次性写入输出 tensor
-        norm    = np.array([max(cw - 1, 1), max(ch - 1, 1)], dtype=np.float32)
-        coords  = torch.from_numpy((src_xy / norm).astype(np.float32))
+        src_xy_norm = _normalize_crop_coords(src_xy, crop_w=cw, crop_h=ch)
+        tgt_xy_norm = _normalize_crop_coords(tgt_xy, crop_w=cw, crop_h=ch)
+        coords  = torch.from_numpy(src_xy_norm.astype(np.float32))
         t_src_t = torch.from_numpy(src_frames.astype(np.int64))
         t_tgt_t = torch.from_numpy(tgt_frames.astype(np.int64))
         t_cam_t = torch.from_numpy(cam_frames.astype(np.int64))
 
-        targets["pos_2d"][:]                     = torch.from_numpy((tgt_xy / norm).astype(np.float32))
+        targets["pos_2d"][:]                     = torch.from_numpy(tgt_xy_norm.astype(np.float32))
         targets["pos_3d"][:]                     = torch.from_numpy(tgt_cam.astype(np.float32))
         targets["visibility"][:]                 = torch.from_numpy(vis_flag.astype(np.float32))
         targets["displacement"][:]               = torch.from_numpy((tgt_cam - src_cam).astype(np.float32))
@@ -649,11 +656,14 @@ class D4RTQueryBuilder:
 
         # ---- normal（向量化批量查表） ----
         # 只有 t_cam == t_tgt 时，normal 才与目标 3D 监督处于同一相机坐标系。
-        if result.normals is not None and result.normal_valids is not None:
+        normal_supervision_compatible = bool(
+            result.metadata.get("normal_supervision_compatible", result.normals is not None)
+        )
+        if normal_supervision_compatible and result.normals is not None and result.normal_valids is not None:
             normals_arr = np.stack(result.normals, axis=0)             # [T,S,S,3]
             valid_nf    = np.array(result.normal_valids, dtype=bool)   # [T]
             cam_eq_tgt  = cam_frames == tgt_frames
-            active      = vis_flag & valid_nf[tgt_frames] & cam_eq_tgt
+            active      = vis_flag & valid_nf[tgt_frames] & cam_eq_tgt & has_valid_3d
             if active.any():
                 qi  = np.where(active)[0]
                 uv  = targets["pos_2d"][qi].numpy()                    # [M,2]
@@ -763,8 +773,8 @@ class D4RTQueryBuilder:
             px_x, px_y = int(chosen[0]), int(chosen[1])
 
             # 坐标归一化到 crop 空间 [0,1]，与 tracks 路径一致。
-            coords[qi, 0] = px_x / max(cw - 1, 1)
-            coords[qi, 1] = px_y / max(ch - 1, 1)
+            coords[qi, 0] = min(max(px_x / max(cw - 1, 1), 0.0), 1.0)
+            coords[qi, 1] = min(max(px_y / max(ch - 1, 1), 0.0), 1.0)
             t_src_t[qi]   = src_fi
             t_tgt_t[qi]   = tgt_fi
             t_cam_t[qi]   = cam_fi
@@ -814,8 +824,13 @@ class D4RTQueryBuilder:
                             u_c = u * scale_x
                             v_c = v * scale_y
                             if 0 <= u_c < cw and 0 <= v_c < ch:
-                                targets["pos_2d"][qi, 0] = u_c / max(cw - 1, 1)
-                                targets["pos_2d"][qi, 1] = v_c / max(ch - 1, 1)
+                                uv_norm = _normalize_crop_coords(
+                                    np.array([[u_c, v_c]], dtype=np.float32),
+                                    crop_w=cw,
+                                    crop_h=ch,
+                                )[0]
+                                targets["pos_2d"][qi, 0] = float(uv_norm[0])
+                                targets["pos_2d"][qi, 1] = float(uv_norm[1])
                                 targets["mask_2d"][qi]   = True
 
         # mask_2d set above when t_tgt=t_cam and pos_2d in bounds; others remain False

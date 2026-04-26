@@ -25,6 +25,7 @@ Single-scene usage (only one sequence):
 from __future__ import annotations
 
 import multiprocessing as _mp
+import os
 import random as _random_module
 from typing import Optional
 
@@ -32,6 +33,39 @@ from datasets.adapters.base import BaseAdapter
 from datasets.query_builder import D4RTQueryBuilder, QuerySample
 from datasets.sampling import DatasetSampler
 from datasets.transforms import GeometryTransformPipeline
+
+
+def _resolve_positive_int(
+    explicit_value: Optional[int],
+    env_name: str,
+    default_value: int,
+) -> int:
+    raw_value = explicit_value
+    if raw_value is None:
+        raw_env = os.getenv(env_name)
+        raw_value = default_value if raw_env is None else raw_env
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{env_name} must be an integer, got {raw_value!r}") from exc
+    return max(1, value)
+
+
+def _resolve_optional_nonnegative_int(
+    explicit_value: Optional[int],
+    env_name: str,
+    default_value: Optional[int],
+) -> Optional[int]:
+    raw_value = explicit_value
+    if raw_value is None:
+        raw_value = os.getenv(env_name, default_value)
+    if raw_value is None:
+        return None
+    try:
+        value = int(raw_value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{env_name} must be an integer, got {raw_value!r}") from exc
+    return None if value <= 0 else value
 
 
 class MixtureSampler:
@@ -47,11 +81,15 @@ class MixtureSampler:
         self,
         samplers: list[DatasetSampler],
         dataset_weights: Optional[list[float]] = None,
+        dataset_locality_size: int = 1,
     ):
         if len(samplers) == 0:
             raise ValueError("samplers cannot be empty")
 
         self.samplers = samplers
+        self.dataset_locality_size = max(1, int(dataset_locality_size))
+        self._active_dataset_idx: Optional[int] = None
+        self._remaining_dataset_uses = 0
 
         # Normalize weights
         if dataset_weights is None:
@@ -65,6 +103,31 @@ class MixtureSampler:
         total = sum(dataset_weights)
         self.dataset_probs = [w / total for w in dataset_weights]
 
+    def reset_locality_state(self, dataset_idx: Optional[int] = None) -> None:
+        """Reset short-lived dataset / sequence reuse state."""
+        if dataset_idx is None or dataset_idx == self._active_dataset_idx:
+            self._active_dataset_idx = None
+            self._remaining_dataset_uses = 0
+        if dataset_idx is None:
+            for sampler in self.samplers:
+                sampler.reset_locality_state()
+            return
+        self.samplers[dataset_idx].reset_locality_state()
+
+    def _sample_dataset_idx(self, rng: _random_module.Random) -> int:
+        if self._active_dataset_idx is not None and self._remaining_dataset_uses > 0:
+            dataset_idx = self._active_dataset_idx
+            self._remaining_dataset_uses -= 1
+            if self._remaining_dataset_uses <= 0:
+                self._active_dataset_idx = None
+            return dataset_idx
+
+        dataset_idx = rng.choices(range(len(self.samplers)), weights=self.dataset_probs, k=1)[0]
+        if self.dataset_locality_size > 1:
+            self._active_dataset_idx = dataset_idx
+            self._remaining_dataset_uses = self.dataset_locality_size - 1
+        return dataset_idx
+
     def sample(self, rng: Optional[_random_module.Random] = None) -> tuple[int, str, list[int]]:
         """
         Sample a dataset, sequence, and frame indices.
@@ -75,8 +138,7 @@ class MixtureSampler:
         if rng is None:
             rng = _random_module.Random()
 
-        # Sample dataset
-        dataset_idx = rng.choices(range(len(self.samplers)), weights=self.dataset_probs, k=1)[0]
+        dataset_idx = self._sample_dataset_idx(rng)
 
         # Sample from that dataset
         sequence_name, frame_indices = self.samplers[dataset_idx].sample(rng)
@@ -129,15 +191,37 @@ class MixtureDataset:
         precompute_from_highres: bool = False,
         allow_track_fallback: bool = False,
         reshuffle_each_epoch: bool = False,
+        dataset_locality_size: Optional[int] = None,
+        sequence_locality_size: Optional[int] = None,
+        frame_locality_radius: Optional[int] = None,
     ):
         self.adapters = adapters
         self.clip_len = clip_len
         self.seed = seed
         self.epoch_size = epoch_size
         self.reshuffle_each_epoch = reshuffle_each_epoch
+        default_dataset_locality = 2 if use_augs and len(adapters) > 1 else 1
+        self.dataset_locality_size = _resolve_positive_int(
+            dataset_locality_size,
+            "D4RT_DATASET_LOCALITY_SIZE",
+            default_dataset_locality,
+        )
+        default_sequence_locality = 3 if use_augs else 1
+        self.sequence_locality_size = _resolve_positive_int(
+            sequence_locality_size,
+            "D4RT_SEQUENCE_LOCALITY_SIZE",
+            default_sequence_locality,
+        )
+        default_frame_locality = clip_len if use_augs and sampling_mode != 'random' and self.sequence_locality_size > 1 else None
+        self.frame_locality_radius = _resolve_optional_nonnegative_int(
+            frame_locality_radius,
+            "D4RT_FRAME_LOCALITY_RADIUS",
+            default_frame_locality,
+        )
         # Keep epoch visible across worker-local dataset copies when DataLoader
         # uses persistent workers.
         self._shared_epoch = _mp.Value("q", 0, lock=False)
+        self._local_epoch = self.current_epoch
 
         # Build samplers for each dataset
         samplers = []
@@ -152,6 +236,8 @@ class MixtureDataset:
                     allowed_sequences=allowed,
                     sampling_mode=sampling_mode,
                     custom_stride_range=custom_stride_range,
+                    sequence_locality_size=self.sequence_locality_size,
+                    frame_locality_radius=self.frame_locality_radius,
                 )
             )
 
@@ -159,6 +245,7 @@ class MixtureDataset:
         self.mixture_sampler = MixtureSampler(
             samplers=samplers,
             dataset_weights=dataset_weights,
+            dataset_locality_size=self.dataset_locality_size,
         )
 
         # Build transform pipeline
@@ -184,6 +271,14 @@ class MixtureDataset:
     def set_epoch(self, epoch: int) -> None:
         self._shared_epoch.value = int(epoch)
 
+    def _reset_worker_locality_state(self) -> None:
+        self.mixture_sampler.reset_locality_state()
+        self._local_epoch = self.current_epoch
+
+    def _sync_epoch_state(self) -> None:
+        if self._local_epoch != self.current_epoch:
+            self._reset_worker_locality_state()
+
     def __getitem__(self, index: int) -> QuerySample:
         """
         Get a training sample.
@@ -194,6 +289,8 @@ class MixtureDataset:
         Returns:
             QuerySample with video, coords, targets, masks, etc.
         """
+        self._sync_epoch_state()
+
         # Create RNG from index + seed
         sample_index = index
         if self.reshuffle_each_epoch:
@@ -212,9 +309,10 @@ class MixtureDataset:
                     raise RuntimeError(f"Sample has {sample.video.shape[0]} frames, expected {self.clip_len}")
                 break
             except Exception as e:
+                self.mixture_sampler.reset_locality_state(dataset_idx)
                 if attempt >= 2:
                     print(f"Warning: skipping bad sample (attempt {attempt+1}): {e}")
-                rng = _random_module.Random(self.seed + index + attempt + 1)
+                rng = _random_module.Random(self.seed + sample_index + attempt + 1)
         else:
             raise RuntimeError(f"Failed to load a valid sample after 10 attempts at index {index}")
 

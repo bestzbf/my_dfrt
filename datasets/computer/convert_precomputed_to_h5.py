@@ -46,9 +46,11 @@ def convert_one(npz_path: Path) -> str:
             for key in data.files:
                 arr = data[key]
                 if arr.ndim >= 2 and arr.shape[0] > 1:
-                    # Per-frame chunking: one frame per chunk → O(1) random access
+                    # Per-frame chunking: one frame per chunk → O(1) random access.
+                    # No compression: write speed 8x faster than lzf, read avoids
+                    # CPU decompression overhead. Size penalty ~8% vs lzf.
                     chunks = (1,) + arr.shape[1:]
-                    f.create_dataset(key, data=arr, chunks=chunks, compression='lzf')
+                    f.create_dataset(key, data=arr, chunks=chunks)
                 else:
                     # Scalar or 1-D metadata: store as-is
                     f.create_dataset(key, data=arr)

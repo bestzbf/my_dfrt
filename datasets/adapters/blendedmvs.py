@@ -1,12 +1,20 @@
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import struct
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Optional
 
 import numpy as np
 from PIL import Image
+
+from datasets.computer.depth_to_tracks import (
+    TRACK_SEMANTICS_VERSION,
+    recompute_track_projection_masks,
+)
 
 from .base import BaseAdapter, UnifiedClip
 
@@ -226,6 +234,7 @@ class BlendedMVSAdapter(BaseAdapter):
         verbose: bool = True,
         precompute_root: Optional[str] = None,
         cache_dir: Optional[str] = None,
+        index_workers: int = 8,
     ) -> None:
         """
         Parameters
@@ -257,11 +266,24 @@ class BlendedMVSAdapter(BaseAdapter):
         self.use_masked = use_masked
         self.strict = strict
         self.verbose = verbose
+        self.index_workers = index_workers
         self.precompute_root = Path(precompute_root) if precompute_root else self.root
 
         if cache_dir is not None:
             from datasets.index_cache import load_or_build
-            _cache_path = Path(cache_dir) / f"{self.dataset_name}_{self.split}.pkl"
+            cache_key = {
+                "dataset": self.dataset_name,
+                "split": self.split,
+                "root": str(self.root.resolve()),
+                "precompute_root": str(self.precompute_root.resolve()),
+                "use_masked": self.use_masked,
+                "strict": self.strict,
+                "cache_schema": 2,
+            }
+            cache_suffix = hashlib.sha1(
+                json.dumps(cache_key, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:12]
+            _cache_path = Path(cache_dir) / f"{self.dataset_name}_{self.split}_{cache_suffix}.pkl"
             self._records: list[_SequenceRecord] = load_or_build(self._build_index, _cache_path)
         else:
             self._records: list[_SequenceRecord] = self._build_index()
@@ -367,10 +389,15 @@ class BlendedMVSAdapter(BaseAdapter):
         intrinsics = np.stack(intrinsics_list, axis=0)   # (T, 3, 3) float32
         extrinsics = np.stack(extrinsics_list, axis=0)   # (T, 4, 4) float32 w2c
 
-        # Load precomputed normals / tracks if available
+        # Load precomputed normals / tracks if available.
+        # Old BlendedMVS caches used visibs == valids, which destroys visibility
+        # supervision. Refresh those semantics online from cached world points.
         normals_out, trajs_2d_out, trajs_3d_out, valids_out, visibs_out = \
             None, None, None, None, None
         has_normals_out, has_tracks_out = False, False
+        precomputed_track_semantics_version: Optional[int] = None
+        active_track_semantics_version: Optional[int] = None
+        precomputed_track_semantics_refreshed = False
         if self.precompute_root is not None:
             cache = self._load_precomputed(sequence_name, frame_indices)
             if cache is not None:
@@ -379,6 +406,26 @@ class BlendedMVSAdapter(BaseAdapter):
                 trajs_3d_out    = cache["trajs_3d_world"]
                 valids_out      = cache["valids"]
                 visibs_out      = cache["visibs"]
+                raw_semantics_version = cache.get("track_semantics_version", 0)
+                precomputed_track_semantics_version = int(np.asarray(raw_semantics_version).item())
+                active_track_semantics_version = precomputed_track_semantics_version
+
+                if (
+                    trajs_3d_out is not None
+                    and precomputed_track_semantics_version < TRACK_SEMANTICS_VERSION
+                ):
+                    refreshed = recompute_track_projection_masks(
+                        depths=depths,
+                        intrinsics=intrinsics,
+                        extrinsics=extrinsics,
+                        trajs_3d_world=trajs_3d_out,
+                    )
+                    trajs_2d_out = refreshed["trajs_2d"]
+                    valids_out = refreshed["valids"]
+                    visibs_out = refreshed["visibs"]
+                    active_track_semantics_version = TRACK_SEMANTICS_VERSION
+                    precomputed_track_semantics_refreshed = True
+
                 has_normals_out = True
                 has_tracks_out  = True
 
@@ -408,9 +455,14 @@ class BlendedMVSAdapter(BaseAdapter):
                 "has_tracks": has_tracks_out,
                 "has_visibility": has_tracks_out,
                 "has_trajs_3d_world": has_tracks_out,
+                "normal_convention": "camera_space_opencv_towards_camera" if has_normals_out else None,
+                "normal_supervision_compatible": has_normals_out,
                 "pose_convention": "w2c",
                 "extrinsics_convention": "w2c",
                 "intrinsics_convention": "pinhole",
+                "precomputed_track_semantics_version": precomputed_track_semantics_version,
+                "track_semantics_version": active_track_semantics_version,
+                "precomputed_track_semantics_refreshed": precomputed_track_semantics_refreshed,
                 "depth_unit": "meters",
                 "depth_ranges": depth_ranges,  # [(depth_min, depth_max), ...]
                 "use_masked": self.use_masked,
@@ -621,18 +673,41 @@ class BlendedMVSAdapter(BaseAdapter):
         records: list[_SequenceRecord] = []
         skipped: list[str] = []
 
-        for scene_id in scene_ids:
+        def _index_one(scene_id: str) -> tuple[str, Optional[_SequenceRecord], Optional[Exception]]:
             scene_dir = self.root / scene_id
             try:
-                rec = self._index_scene(scene_id, scene_dir)
-                if rec is not None:
-                    records.append(rec)
+                return scene_id, self._index_scene(scene_id, scene_dir), None
             except Exception as exc:
-                if self.strict:
-                    raise
-                skipped.append(f"{scene_id}: {exc}")
-                if self.verbose:
-                    print(f"[BlendedMVSAdapter][WARN] skip {scene_id}: {exc}")
+                return scene_id, None, exc
+
+        n_workers = min(self.index_workers, len(scene_ids))
+        if n_workers > 1:
+            order = {sid: i for i, sid in enumerate(scene_ids)}
+            tmp: list[tuple[int, Optional[_SequenceRecord]]] = []
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                futures = {executor.submit(_index_one, sid): sid for sid in scene_ids}
+                for fut in as_completed(futures):
+                    sid, rec, exc = fut.result()
+                    if exc is not None:
+                        if self.strict:
+                            raise exc
+                        skipped.append(f"{sid}: {exc}")
+                        if self.verbose:
+                            print(f"[BlendedMVSAdapter][WARN] skip {sid}: {exc}")
+                    elif rec is not None:
+                        tmp.append((order[sid], rec))
+            records = [r for _, r in sorted(tmp)]
+        else:
+            for scene_id in scene_ids:
+                sid, rec, exc = _index_one(scene_id)
+                if exc is not None:
+                    if self.strict:
+                        raise exc
+                    skipped.append(f"{sid}: {exc}")
+                    if self.verbose:
+                        print(f"[BlendedMVSAdapter][WARN] skip {sid}: {exc}")
+                elif rec is not None:
+                    records.append(rec)
 
         if self.verbose and skipped:
             print(f"[BlendedMVSAdapter] skipped {len(skipped)} scenes (non-strict mode)")

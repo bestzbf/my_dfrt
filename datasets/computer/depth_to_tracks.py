@@ -28,6 +28,9 @@ import cv2
 import numpy as np
 
 
+TRACK_SEMANTICS_VERSION = 2
+
+
 # --------------------------------------------------------------------------- #
 # Low-level geometry helpers
 # --------------------------------------------------------------------------- #
@@ -87,6 +90,132 @@ def _depth_boundary_mask(depth: np.ndarray, percentile: float = 85.0) -> np.ndar
     return valid & (mag >= thr)
 
 
+def _project_world_points_to_frames(
+    points_world: np.ndarray,
+    depths: list[np.ndarray],
+    intrinsics: np.ndarray,
+    extrinsics: np.ndarray,
+    depth_consistency_thresh: float = 0.05,
+    depth_max: float = 100.0,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Project static world points into all frames and separate defined/visible masks.
+
+    Semantics:
+      - ``valids``: the target 3D / visibility label is *defined* in this frame.
+        This requires the point to project in-bounds, lie in front of the camera,
+        and land on a pixel with a valid depth sample.
+      - ``visibs``: the point is additionally *visible* under a depth-consistency
+        check against the target depth map. Occluded points remain valid but are
+        marked invisible.
+    """
+    points_world = np.asarray(points_world, dtype=np.float32)
+    depths = [np.asarray(d, dtype=np.float32) for d in depths]
+    intrinsics = np.asarray(intrinsics, dtype=np.float32)
+    extrinsics = np.asarray(extrinsics, dtype=np.float32)
+
+    T = len(depths)
+    if points_world.ndim != 2 or points_world.shape[1] != 3:
+        raise ValueError(
+            f"Expected points_world to have shape [N,3], got {tuple(points_world.shape)}"
+        )
+    if intrinsics.ndim == 2:
+        intrinsics = np.broadcast_to(intrinsics[None], (T, 3, 3)).copy()
+
+    H, W = depths[0].shape
+    N = points_world.shape[0]
+    trajs_2d = np.zeros((T, N, 2), dtype=np.float32)
+    valids = np.zeros((T, N), dtype=bool)
+    visibs = np.zeros((T, N), dtype=bool)
+
+    ones = np.ones((N, 1), dtype=np.float32)
+    points_world_h = np.concatenate([points_world, ones], axis=-1)
+
+    for t in range(T):
+        E_t = extrinsics[t]
+        K_t = intrinsics[t]
+        depth_t = depths[t]
+
+        points_cam_t = (E_t @ points_world_h.T).T[:, :3]
+        uv_t, z_t = _project(points_cam_t, K_t)
+        trajs_2d[t] = uv_t
+
+        uv_finite = np.isfinite(uv_t).all(axis=-1)
+        in_front = (z_t > 0) & np.isfinite(z_t) & (z_t < depth_max)
+        in_bounds = (
+            uv_finite
+            & (uv_t[:, 0] >= 0)
+            & (uv_t[:, 0] < W)
+            & (uv_t[:, 1] >= 0)
+            & (uv_t[:, 1] < H)
+        )
+
+        sampled_depth = np.zeros((N,), dtype=np.float32)
+        sampled_depth_valid = np.zeros((N,), dtype=bool)
+        sample_mask = in_bounds & in_front
+        if sample_mask.any():
+            uv_in = uv_t[sample_mask]
+            px = np.clip(np.round(uv_in[:, 0]).astype(np.int32), 0, W - 1)
+            py = np.clip(np.round(uv_in[:, 1]).astype(np.int32), 0, H - 1)
+            sampled = depth_t[py, px]
+            sampled_depth[sample_mask] = sampled
+            sampled_depth_valid[sample_mask] = (
+                (sampled > 0)
+                & np.isfinite(sampled)
+                & (sampled < depth_max)
+            )
+
+        defined_t = sample_mask & sampled_depth_valid
+        depth_rel_err = np.full((N,), np.inf, dtype=np.float32)
+        if defined_t.any():
+            depth_rel_err[defined_t] = (
+                np.abs(sampled_depth[defined_t] - z_t[defined_t])
+                / np.maximum(z_t[defined_t], 1e-6)
+            )
+        visible_t = defined_t & (depth_rel_err < depth_consistency_thresh)
+
+        valids[t] = defined_t
+        visibs[t] = visible_t
+
+    return trajs_2d, valids, visibs
+
+
+def recompute_track_projection_masks(
+    depths: list[np.ndarray],
+    intrinsics: np.ndarray,
+    extrinsics: np.ndarray,
+    trajs_3d_world: np.ndarray,
+    depth_consistency_thresh: float = 0.05,
+    depth_max: float = 100.0,
+) -> dict[str, np.ndarray]:
+    """Refresh projected 2D tracks and defined/visible masks from cached world points."""
+    trajs_3d_world = np.asarray(trajs_3d_world, dtype=np.float32)
+    if trajs_3d_world.ndim != 3 or trajs_3d_world.shape[-1] != 3:
+        raise ValueError(
+            f"Expected trajs_3d_world to have shape [T,N,3], got {tuple(trajs_3d_world.shape)}"
+        )
+    if trajs_3d_world.shape[0] == 0:
+        return {
+            "trajs_2d": np.zeros((0, 0, 2), dtype=np.float32),
+            "valids": np.zeros((0, 0), dtype=bool),
+            "visibs": np.zeros((0, 0), dtype=bool),
+        }
+
+    points_world = trajs_3d_world[0]
+    trajs_2d, valids, visibs = _project_world_points_to_frames(
+        points_world=points_world,
+        depths=depths,
+        intrinsics=intrinsics,
+        extrinsics=extrinsics,
+        depth_consistency_thresh=depth_consistency_thresh,
+        depth_max=depth_max,
+    )
+    return {
+        "trajs_2d": trajs_2d,
+        "valids": valids,
+        "visibs": visibs,
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Main function
 # --------------------------------------------------------------------------- #
@@ -119,10 +248,13 @@ def compute_tracks(
         dict with keys:
             trajs_2d       [T,N,2]  float32  pixel coords (x=col, y=row)
             trajs_3d_world [T,N,3]  float32  world coords (same every frame)
-            valids         [T,N]    bool
-            visibs         [T,N]    bool     (== valids for static scenes)
+            valids         [T,N]    bool     target defined (in-bounds, in-front,
+                                             depth sample exists)
+            visibs         [T,N]    bool     target additionally visible under
+                                             depth-consistency check
             ref_frame      int
             num_points     int      actual N (may be < requested if depth sparse)
+            track_semantics_version int     cache semantics version
     """
     rng = np.random.default_rng(rng_seed)
 
@@ -206,44 +338,15 @@ def compute_tracks(
     # ------------------------------------------------------------------ #
     # 4. Project into every frame                                          #
     # ------------------------------------------------------------------ #
-    trajs_2d   = np.zeros((T, N, 2), dtype=np.float32)
-    valids     = np.zeros((T, N),    dtype=bool)
-
-    for t in range(T):
-        E_t = extrinsics[t]
-        K_t = intrinsics[t]
-
-        # world → camera
-        P_hom_t  = np.concatenate([P_world, ones], axis=-1)   # [N,4]
-        P_cam_t  = (E_t @ P_hom_t.T).T[:, :3]                 # [N,3]
-
-        uv_t, z_t = _project(P_cam_t, K_t)                    # [N,2], [N]
-
-        # in-bounds check
-        in_bounds = (
-            (uv_t[:, 0] >= 0) & (uv_t[:, 0] < W) &
-            (uv_t[:, 1] >= 0) & (uv_t[:, 1] < H) &
-            (z_t > 0)
-        )
-
-        # depth consistency check (nearest-neighbour sample)
-        depth_t = depths[t]
-        px = np.clip(np.round(uv_t[:, 0]).astype(np.int32), 0, W - 1)
-        py = np.clip(np.round(uv_t[:, 1]).astype(np.int32), 0, H - 1)
-        sampled_d = depth_t[py, px]
-        depth_ok  = (
-            (sampled_d > 0)
-            & np.isfinite(sampled_d)
-            & (sampled_d < depth_max)
-            & (np.abs(sampled_d - z_t) / np.maximum(z_t, 1e-6) < depth_consistency_thresh)
-        )
-
-        valid_t = in_bounds & depth_ok
-        trajs_2d[t]  = uv_t
-        valids[t]    = valid_t
-
+    trajs_2d, valids, visibs = _project_world_points_to_frames(
+        points_world=P_world,
+        depths=depths,
+        intrinsics=intrinsics,
+        extrinsics=extrinsics,
+        depth_consistency_thresh=depth_consistency_thresh,
+        depth_max=depth_max,
+    )
     trajs_3d_world = np.broadcast_to(P_world[None], (T, N, 3)).copy()
-    visibs = valids.copy()   # static scene: no occlusion modelling
 
     return {
         "trajs_2d":       trajs_2d,
@@ -252,4 +355,5 @@ def compute_tracks(
         "visibs":         visibs,
         "ref_frame":      ref,
         "num_points":     N,
+        "track_semantics_version": TRACK_SEMANTICS_VERSION,
     }

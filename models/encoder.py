@@ -1,11 +1,13 @@
 """D4RT Encoder: Video encoder using timm ViT backbone with local/global attention."""
 
+import json
 import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional, Tuple
 from functools import partial
+from pathlib import Path
 from torch.utils.checkpoint import checkpoint
 from torch.nn.attention import SDPBackend, sdpa_kernel
 
@@ -29,6 +31,13 @@ try:
 except ImportError:
     VIDEOMAE_AVAILABLE = False
     print("Warning: transformers not available. VideoMAE encoder disabled.")
+
+try:
+    from safetensors.torch import load_file as safetensors_load_file
+    SAFETENSORS_AVAILABLE = True
+except ImportError:
+    SAFETENSORS_AVAILABLE = False
+    safetensors_load_file = None
 
 
 def canonicalize_video(video: torch.Tensor) -> torch.Tensor:
@@ -588,9 +597,9 @@ class D4RTEncoder(nn.Module):
 
         self._init_weights()
 
-        if use_videomae_init and VIDEOMAE_AVAILABLE:
+        if use_videomae_init:
             if videomae_model is not None:
-             self._load_videomae_weights(videomae_model)
+                self._load_videomae_weights(videomae_model)
         elif use_vggt_init:
             self._load_vggt_weights(vggt_checkpoint)
         elif use_monst3r_init:
@@ -699,9 +708,153 @@ class D4RTEncoder(nn.Module):
 
         print(f"Loaded pretrained weights for {min(self.depth, len(timm_blocks))} blocks")
 
+    def _load_state_dict_file(self, checkpoint_path: Path) -> Optional[dict[str, torch.Tensor]]:
+        if checkpoint_path.suffix == ".safetensors":
+            if not SAFETENSORS_AVAILABLE:
+                print(
+                    f"safetensors not available, cannot load VideoMAE checkpoint: {checkpoint_path}"
+                )
+                return None
+            return safetensors_load_file(str(checkpoint_path))
+
+        checkpoint = torch.load(checkpoint_path, map_location="cpu")
+        if isinstance(checkpoint, dict):
+            if "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
+                return checkpoint["state_dict"]
+            if "model" in checkpoint and isinstance(checkpoint["model"], dict):
+                return checkpoint["model"]
+        return checkpoint
+
+    def _load_videomae_v2_weights(self, model_name: str) -> bool:
+        model_path = Path(model_name).expanduser()
+        if not model_path.exists():
+            return False
+
+        config_path = model_path / "config.json" if model_path.is_dir() else model_path.parent / "config.json"
+        if not config_path.exists():
+            return False
+
+        try:
+            config_data = json.loads(config_path.read_text())
+        except Exception:
+            return False
+
+        model_type = str(config_data.get("model_type", "")).lower()
+        architectures = [str(item).lower() for item in config_data.get("architectures", [])]
+        if "videomaev2" not in model_type and not any("videomaev2" in item for item in architectures):
+            return False
+
+        candidate_files = [model_path] if model_path.is_file() else [
+            model_path / "model.safetensors",
+            model_path / "pytorch_model.bin",
+            model_path / "model.bin",
+        ]
+
+        state_dict = None
+        for candidate in candidate_files:
+            if not candidate.exists():
+                continue
+            loaded = self._load_state_dict_file(candidate)
+            if isinstance(loaded, dict):
+                state_dict = loaded
+                break
+
+        if not isinstance(state_dict, dict):
+            print(f"Failed to load VideoMAE V2 checkpoint state from {model_name}")
+            return False
+
+        prefix = "model." if any(key.startswith("model.blocks.") for key in state_dict) else ""
+        block_prefix = f"{prefix}blocks."
+        if not any(key.startswith(block_prefix) for key in state_dict):
+            print(f"VideoMAE V2 checkpoint at {model_name} does not contain {block_prefix}* keys")
+            return False
+
+        print(f"Loading VideoMAE V2 weights for custom encoder init: {model_name}")
+
+        patch_weight = state_dict.get(f"{prefix}patch_embed.proj.weight")
+        patch_bias = state_dict.get(f"{prefix}patch_embed.proj.bias")
+        if patch_weight is not None and patch_weight.shape == self.patch_embed.proj.weight.shape:
+            self.patch_embed.proj.weight.data.copy_(
+                patch_weight.to(dtype=self.patch_embed.proj.weight.dtype)
+            )
+            if patch_bias is not None and self.patch_embed.proj.bias is not None:
+                self.patch_embed.proj.bias.data.copy_(
+                    patch_bias.to(dtype=self.patch_embed.proj.bias.dtype)
+                )
+
+        block_indices = sorted(
+            {
+                int(key[len(block_prefix):].split(".", 1)[0])
+                for key in state_dict.keys()
+                if key.startswith(block_prefix)
+                and key[len(block_prefix):].split(".", 1)[0].isdigit()
+            }
+        )
+        loaded_blocks = 0
+        for our_block, block_idx in zip(self._iter_subblocks(), block_indices):
+            source_prefix = f"{block_prefix}{block_idx}."
+            qkv_weight = state_dict.get(f"{source_prefix}attn.qkv.weight")
+            if qkv_weight is None or qkv_weight.shape != our_block.attn.qkv.weight.shape:
+                continue
+
+            our_block.attn.qkv.weight.data.copy_(
+                qkv_weight.to(dtype=our_block.attn.qkv.weight.dtype)
+            )
+            if our_block.attn.qkv.bias is not None:
+                q_bias = state_dict.get(f"{source_prefix}attn.q_bias")
+                v_bias = state_dict.get(f"{source_prefix}attn.v_bias")
+                if q_bias is not None and v_bias is not None:
+                    k_bias = torch.zeros_like(q_bias)
+                    qkv_bias = torch.cat([q_bias, k_bias, v_bias], dim=0)
+                    if qkv_bias.shape == our_block.attn.qkv.bias.shape:
+                        our_block.attn.qkv.bias.data.copy_(
+                            qkv_bias.to(dtype=our_block.attn.qkv.bias.dtype)
+                        )
+                else:
+                    qkv_bias = state_dict.get(f"{source_prefix}attn.qkv.bias")
+                    if qkv_bias is not None and qkv_bias.shape == our_block.attn.qkv.bias.shape:
+                        our_block.attn.qkv.bias.data.copy_(
+                            qkv_bias.to(dtype=our_block.attn.qkv.bias.dtype)
+                        )
+
+            pairs = (
+                (our_block.attn.proj.weight, f"{source_prefix}attn.proj.weight"),
+                (our_block.attn.proj.bias, f"{source_prefix}attn.proj.bias"),
+                (our_block.mlp.fc1.weight, f"{source_prefix}mlp.fc1.weight"),
+                (our_block.mlp.fc1.bias, f"{source_prefix}mlp.fc1.bias"),
+                (our_block.mlp.fc2.weight, f"{source_prefix}mlp.fc2.weight"),
+                (our_block.mlp.fc2.bias, f"{source_prefix}mlp.fc2.bias"),
+                (our_block.norm1.weight, f"{source_prefix}norm1.weight"),
+                (our_block.norm1.bias, f"{source_prefix}norm1.bias"),
+                (our_block.norm2.weight, f"{source_prefix}norm2.weight"),
+                (our_block.norm2.bias, f"{source_prefix}norm2.bias"),
+            )
+            for target, source_key in pairs:
+                source_tensor = state_dict.get(source_key)
+                if source_tensor is not None and source_tensor.shape == target.shape:
+                    target.data.copy_(source_tensor.to(dtype=target.dtype))
+
+            loaded_blocks += 1
+
+        norm_weight = state_dict.get(f"{prefix}fc_norm.weight")
+        norm_bias = state_dict.get(f"{prefix}fc_norm.bias")
+        if norm_weight is None or norm_bias is None:
+            norm_weight = state_dict.get(f"{prefix}norm.weight")
+            norm_bias = state_dict.get(f"{prefix}norm.bias")
+        if norm_weight is not None and norm_bias is not None:
+            if norm_weight.shape == self.norm.weight.shape and norm_bias.shape == self.norm.bias.shape:
+                self.norm.weight.data.copy_(norm_weight.to(dtype=self.norm.weight.dtype))
+                self.norm.bias.data.copy_(norm_bias.to(dtype=self.norm.bias.dtype))
+
+        print(f"Loaded VideoMAE V2 weights for {loaded_blocks} encoder blocks")
+        return True
+
     def _load_videomae_weights(self, model_name: str):
         """Initialize the staged encoder from VideoMAE weights."""
         if model_name is None:
+            return
+
+        if self._load_videomae_v2_weights(model_name):
             return
 
         if not VIDEOMAE_AVAILABLE:

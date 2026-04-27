@@ -264,7 +264,7 @@ def _create_mixture_dataset(config: dict, split: str, rank: int = 0, world_size:
 
         # Build mixture sampler
         mixture_sampler = MixtureSampler(
-            dataset_samplers=dataset_samplers,
+            samplers=dataset_samplers,
             dataset_weights=weights,
             dataset_locality_size=config.get('dataset_locality_size', 2),
         )

@@ -108,7 +108,7 @@ class SamplePlanner:
         """
         self.epoch = epoch
         # Reset locality state in the mixture sampler
-        self.mixture_sampler.reset_all_locality()
+        self.mixture_sampler.reset_locality_state()
 
 
 def serialize_sample_spec(spec: SampleSpec) -> bytes:

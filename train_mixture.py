@@ -979,8 +979,8 @@ def main():
             t_opt = time.perf_counter() - t_opt_start
 
             t_fwd = time.perf_counter() - t_fwd_start
+            reasons = []
             if profile_data_wait:
-                reasons = []
                 if t_data >= data_wait_threshold_s:
                     reasons.append(f"threshold>={data_wait_threshold_s:.3f}s")
                 if data_wait_compare_fwd and t_data > t_fwd:

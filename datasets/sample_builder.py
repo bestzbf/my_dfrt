@@ -189,15 +189,40 @@ class SampleBuilder:
                     if t.is_alive():
                         t.join(timeout=70)
                         adapter = self.adapters[spec.dataset_idx]
+                        dataset_name = getattr(adapter, "dataset_name", type(adapter).__name__)
                         if hasattr(adapter, '_scene_cache'):
                             adapter._scene_cache.pop(spec.sequence_name, None)
                         if hasattr(adapter, '_depth_chunk_cache'):
                             adapter._depth_chunk_cache.pop(spec.sequence_name, None)
+
+                        # Get timing info if available (from partial execution)
+                        timing_info = ""
+                        if hasattr(self, '_last_load_timing') and self._last_load_timing:
+                            timing = self._last_load_timing
+                            timing_info = (
+                                f" | partial_timing: "
+                                f"scene_data={timing.get('scene_data_s', 0)*1000:.0f}ms "
+                                f"rgb_load={timing.get('rgb_load_s', 0)*1000:.0f}ms "
+                                f"depth_load={timing.get('depth_load_s', 0)*1000:.0f}ms "
+                                f"precomputed={timing.get('precomputed_s', 0)*1000:.0f}ms"
+                            )
+
                         err = TimeoutError(
                             f"_build_sample timed out after {build_timeout}s "
-                            f"(spec={spec.local_index}, dataset_idx={spec.dataset_idx})"
+                            f"(spec={spec.local_index}, dataset_idx={spec.dataset_idx}, "
+                            f"dataset={dataset_name}, seq={spec.sequence_name}, "
+                            f"frames={len(spec.frame_indices)}){timing_info}"
                         )
                         total_s = time.perf_counter() - attempt_start
+
+                        # Print detailed timeout info
+                        print(
+                            f"[Timeout] dataset={dataset_name} seq={spec.sequence_name} "
+                            f"frames={len(spec.frame_indices)} timeout={build_timeout}s "
+                            f"total_elapsed={total_s:.1f}s{timing_info}",
+                            flush=True,
+                        )
+
                         self._maybe_print_profile(spec=spec, attempt=attempt, success=False,
                                                    total_s=total_s, error=err)
                         # Don't retry on timeout — stale threads exhaust COS connections
@@ -226,6 +251,30 @@ class SampleBuilder:
                 )
                 t_write = time.perf_counter() - t_write0
                 total_s = time.perf_counter() - attempt_start
+
+                # Print detailed timing for slow samples (>5s) or timeout cases
+                slow_threshold = float(os.environ.get("D4RT_SLOW_SAMPLE_THRESHOLD_S", "5.0"))
+                if total_s > slow_threshold and hasattr(self, '_last_load_timing') and self._last_load_timing:
+                    timing = self._last_load_timing
+                    adapter = self.adapters[spec.dataset_idx]
+                    dataset_name = getattr(adapter, "dataset_name", type(adapter).__name__)
+                    print(
+                        f"[SlowSample] dataset={dataset_name} seq={spec.sequence_name} "
+                        f"frames={len(spec.frame_indices)} total_load={timing.get('total_s', 0)*1000:.0f}ms | "
+                        f"scene_data={timing.get('scene_data_s', 0)*1000:.0f}ms "
+                        f"rgb_load={timing.get('rgb_load_s', 0)*1000:.0f}ms "
+                        f"rgb_resize={timing.get('rgb_resize_s', 0)*1000:.0f}ms "
+                        f"depth_load={timing.get('depth_load_s', 0)*1000:.0f}ms "
+                        f"depth_resize={timing.get('depth_resize_s', 0)*1000:.0f}ms "
+                        f"precomputed={timing.get('precomputed_s', 0)*1000:.0f}ms "
+                        f"process={timing.get('process_s', 0)*1000:.0f}ms | "
+                        f"stage={self._last_profile.get('stage_s', 0)*1000:.0f}ms "
+                        f"transform={self._last_profile.get('transform_s', 0)*1000:.0f}ms "
+                        f"query={self._last_profile.get('query_s', 0)*1000:.0f}ms | "
+                        f"total_build={total_s*1000:.0f}ms",
+                        flush=True,
+                    )
+
                 self._maybe_print_profile(
                     spec=spec,
                     attempt=attempt,
@@ -309,6 +358,9 @@ class SampleBuilder:
             clip = staged_adapter.load_clip(spec.sequence_name, spec.frame_indices)
             t_load = time.perf_counter() - t_load0
             self._last_profile["load_s"] = t_load
+
+        # Extract detailed timing from clip metadata if available
+        self._last_load_timing = clip.metadata.pop("_load_timing", None)
 
         # Restore RNG state (deterministic transforms + query building)
         rng = _random_module.Random()

@@ -337,6 +337,19 @@ def format_batch_sample_details(batch: dict, max_samples: int = 8) -> list[str]:
             f"static={_target_ratio(batch, 'is_static_reprojection', i)}"
         )
         lines.append(line)
+
+        # Add load timing info if available
+        load_timing = md.get("_load_timing")
+        if isinstance(load_timing, dict) and load_timing.get("total_s", 0) > 0:
+            timing = load_timing
+            lines.append(
+                f"    load_time={timing.get('total_s', 0)*1000:.0f}ms: "
+                f"scene_data={timing.get('scene_data_s', 0)*1000:.0f}ms "
+                f"rgb={timing.get('rgb_load_s', 0)*1000:.0f}ms "
+                f"depth={timing.get('depth_load_s', 0)*1000:.0f}ms "
+                f"precomputed={timing.get('precomputed_s', 0)*1000:.0f}ms"
+            )
+
     if batch_size > max_samples:
         lines.append(f"  ... {batch_size - max_samples} more samples omitted")
     return lines
@@ -869,6 +882,8 @@ def main():
         "1", "true", "yes", "on",
     }
     data_wait_detail_max_samples = int(os.getenv("D4RT_DATA_WAIT_DETAIL_MAX_SAMPLES", "8"))
+    # Auto-print slow data diagnostics when data time exceeds this threshold
+    slow_data_threshold_s = float(os.getenv("D4RT_SLOW_DATA_THRESHOLD_S", "3.0"))
     for epoch in range(start_epoch, args.epochs):
         if distributed and isinstance(train_sampler, DistributedSampler):
             train_sampler.set_epoch(epoch)
@@ -1000,6 +1015,27 @@ def main():
                             batch, max_samples=data_wait_detail_max_samples
                         ):
                             print(f"[DataWaitDetail rank{local_rank}] {detail_line}", flush=True)
+
+            # Auto-print slow data diagnostics
+            if t_data >= slow_data_threshold_s and not reasons:
+                spool_stats = summarize_spool_ready(
+                    train_dataset, focus_index=next_planned_index_for_batch
+                )
+                dataset_counts = format_dataset_counts(batch.get('dataset_names'))
+                print(
+                    f"[SlowData rank{local_rank}] "
+                    f"epoch={epoch} batch={batch_idx} "
+                    f"data={t_data * 1000:.0f}ms "
+                    f"datasets={dataset_counts} "
+                    f"spool_ready={spool_stats.get('ready_count')} "
+                    f"spool_min={spool_stats.get('ready_min')} "
+                    f"spool_max={spool_stats.get('ready_max')}",
+                    flush=True,
+                )
+                for detail_line in format_batch_sample_details(
+                    batch, max_samples=data_wait_detail_max_samples
+                ):
+                    print(f"[SlowData rank{local_rank}] {detail_line}", flush=True)
 
             real_loss = loss.item() * args.grad_accum  # 还原除法，得到真实loss值
             epoch_loss += real_loss

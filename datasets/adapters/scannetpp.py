@@ -866,7 +866,17 @@ class ScanNetPPAdapter(BaseAdapter):
         }
 
     def load_clip(self, sequence_name: str, frame_indices: list[int]) -> UnifiedClip:
+        import time as _time
+
+        # Timing profile for this clip
+        timing: dict[str, float] = {}
+        t_total_start = _time.perf_counter()
+
+        # Scene data lookup (includes cache)
+        t0 = _time.perf_counter()
         sd = self._get_scene_data(sequence_name)
+        timing["scene_data_s"] = _time.perf_counter() - t0
+
         T_total = len(sd["frame_stems"])
         if len(frame_indices) == 0:
             raise ValueError("frame_indices is empty")
@@ -882,8 +892,10 @@ class ScanNetPPAdapter(BaseAdapter):
         sx = tgt_w / float(native_w)
         sy = tgt_h / float(native_h)
 
+        # Load RGB frames
         fallback_indices = sd["full_indices"][frame_indices].tolist()
         frames_dir = sd["scene_dir"] / "iphone" / "frames"
+        t0 = _time.perf_counter()
         if frames_dir.is_dir():
             raw_images = [
                 cv2.cvtColor(cv2.imread(str(frames_dir / f"{i:06d}.jpg")), cv2.COLOR_BGR2RGB)
@@ -892,21 +904,36 @@ class ScanNetPPAdapter(BaseAdapter):
         else:
             timestamps = [sd["timestamps"][i] for i in frame_indices]
             raw_images = _extract_video_frames_by_timestamps(sd["scene_dir"] / "iphone" / "rgb.mkv", timestamps, fallback_indices)
+        timing["rgb_load_s"] = _time.perf_counter() - t0
 
+        t0 = _time.perf_counter()
         images: list[np.ndarray] = []
         for image in raw_images:
             if image.shape[:2] != (tgt_h, tgt_w):
                 image = cv2.resize(image, (tgt_w, tgt_h), interpolation=cv2.INTER_LINEAR)
             images.append(image)
+        timing["rgb_resize_s"] = _time.perf_counter() - t0
 
+        # Load depth frames
+        t0 = _time.perf_counter()
         raw_depths = self._get_depths(sequence_name, frame_indices)
+        timing["depth_load_s"] = _time.perf_counter() - t0
+
+        t0 = _time.perf_counter()
         depths: list[np.ndarray] = []
         for depth in raw_depths:
             if depth.shape[:2] != (tgt_h, tgt_w):
                 depth = cv2.resize(depth, (tgt_w, tgt_h), interpolation=cv2.INTER_NEAREST)
             depths.append(depth.astype(np.float32))
+        timing["depth_resize_s"] = _time.perf_counter() - t0
 
+        # Load precomputed data (tracks, intrinsics, etc.)
+        t0 = _time.perf_counter()
         cache = self._load_precomputed(sequence_name, frame_indices)
+        timing["precomputed_s"] = _time.perf_counter() - t0
+
+        # Process intrinsics
+        t0 = _time.perf_counter()
         intrinsics = cache["intrinsics"].astype(np.float32).copy()
         intrinsics[:, 0, 0] *= sx
         intrinsics[:, 0, 2] *= sx
@@ -920,6 +947,9 @@ class ScanNetPPAdapter(BaseAdapter):
         normals_out: Optional[list[np.ndarray]] = None
         if "normals" in cache:
             normals_out = [_resize_normals(normal, (tgt_h, tgt_w)) for normal in cache["normals"]]
+        timing["process_s"] = _time.perf_counter() - t0
+
+        timing["total_s"] = _time.perf_counter() - t_total_start
 
         frame_paths = [f"{sd['scene_dir']}/iphone/rgb.mkv@t={sd['timestamps'][i]:.6f}s" for i in frame_indices]
         metadata = {
@@ -936,6 +966,7 @@ class ScanNetPPAdapter(BaseAdapter):
             "has_tracks": True,
             "has_visibility": True,
             "has_trajs_3d_world": True,
+            "_load_timing": timing,
         }
         return UnifiedClip(
             dataset_name=self.dataset_name,

@@ -19,6 +19,8 @@ import time
 import os
 import contextlib
 import math
+import queue
+import threading
 from datetime import timedelta
 
 
@@ -44,6 +46,322 @@ def move_batch_to_device(batch: dict, device: torch.device) -> dict:
     if batch["video"].dtype == torch.uint8:
         batch["video"] = batch["video"].float() / 255.0
     return batch
+
+
+class BatchPrefetchIterator:
+    """Prefetch CPU batches on a background thread.
+
+    This is intentionally a thread wrapper around the existing DataLoader
+    iterator, not DataLoader multiprocessing.  Planned mode requires a single
+    sequential consumer for its spool/window state, and this keeps that
+    invariant while overlapping CPU batch loading with GPU compute.
+    """
+
+    _STOP = object()
+
+    def __init__(self, iterable, depth: int):
+        self._iterator = iter(iterable)
+        self._depth = max(1, int(depth))
+        self._queue: queue.Queue = queue.Queue(maxsize=self._depth)
+        self._closed = threading.Event()
+        self._last_get_wait_s = 0.0
+        self._last_qsize_before = None
+        self._last_qsize_after = None
+        self._thread = threading.Thread(
+            target=self._producer,
+            name="D4RTBatchPrefetch",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _producer(self) -> None:
+        try:
+            for batch in self._iterator:
+                if self._closed.is_set():
+                    break
+                self._queue.put((True, batch))
+        except BaseException as exc:
+            self._queue.put((False, exc))
+        finally:
+            self._queue.put((True, self._STOP))
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        self._last_qsize_before = self._safe_qsize()
+        t0 = time.perf_counter()
+        ok, item = self._queue.get()
+        self._last_get_wait_s = time.perf_counter() - t0
+        self._last_qsize_after = self._safe_qsize()
+        if not ok:
+            raise item
+        if item is self._STOP:
+            raise StopIteration
+        return item
+
+    def _safe_qsize(self):
+        try:
+            return self._queue.qsize()
+        except NotImplementedError:
+            return None
+
+    def last_stats(self) -> dict:
+        return {
+            "depth": self._depth,
+            "get_wait_s": self._last_get_wait_s,
+            "qsize_before": self._last_qsize_before,
+            "qsize_after": self._last_qsize_after,
+        }
+
+    def close(self) -> None:
+        self._closed.set()
+        self._thread.join(timeout=2.0)
+
+
+def summarize_spool_ready(dataset, focus_index: int | None = None) -> dict:
+    """Return a cheap ready-file summary for planned-mode diagnostics."""
+    spool = getattr(dataset, "spool", None)
+    if spool is None:
+        return {}
+    generation = getattr(dataset, "_generation", getattr(spool, "_generation", 0))
+    prefix = f"g{int(generation):04d}_"
+    indices = []
+    try:
+        for path in spool.spool_dir.iterdir():
+            name = path.name
+            if not name.startswith(prefix) or not name.endswith(".ready"):
+                continue
+            try:
+                indices.append(int(name[len(prefix):len(prefix) + 8]))
+            except ValueError:
+                continue
+    except OSError:
+        return {"ready_count": 0}
+    if not indices:
+        return {"ready_count": 0}
+    indices.sort()
+    out = {
+        "ready_count": len(indices),
+        "ready_min": indices[0],
+        "ready_max": indices[-1],
+    }
+    if focus_index is not None:
+        ready_set = set(indices)
+        contiguous = 0
+        cursor = int(focus_index)
+        while cursor in ready_set:
+            contiguous += 1
+            cursor += 1
+        next_ready = next((idx for idx in indices if idx >= focus_index), None)
+        near = [idx for idx in indices if focus_index - 8 <= idx <= focus_index + 16]
+        out.update(
+            focus_index=int(focus_index),
+            contiguous_from_focus=contiguous,
+            next_ready=next_ready,
+            ready_near=near,
+        )
+    return out
+
+
+def format_dataset_counts(dataset_names) -> str:
+    counts = {}
+    for name in dataset_names or []:
+        counts[name] = counts.get(name, 0) + 1
+    return ",".join(f"{name}:{counts[name]}" for name in sorted(counts)) or "<none>"
+
+
+def _slice_first_dim(value, indices: torch.Tensor, batch_size: int):
+    if isinstance(value, torch.Tensor) and value.ndim > 0 and value.shape[0] == batch_size:
+        return value.detach().index_select(0, indices)
+    return value
+
+
+@torch.no_grad()
+def compute_per_dataset_loss_metrics(
+    loss_fn: D4RTLoss,
+    outputs: dict,
+    targets: dict,
+    batch: dict,
+    num_frames: int,
+) -> dict:
+    dataset_names = batch.get("dataset_names") or []
+    if not dataset_names or "pos_3d" not in outputs:
+        return {}
+    batch_size = int(outputs["pos_3d"].shape[0])
+    groups: dict[str, list[int]] = {}
+    for idx, name in enumerate(dataset_names[:batch_size]):
+        groups.setdefault(str(name), []).append(idx)
+    if not groups:
+        return {}
+
+    metric_keys = {
+        "loss": "loss",
+        "loss_3d": "loss_3d",
+        "loss_3d_nocon": "loss_3d_unweighted",
+        "loss_raw_3d": "loss_raw_3d",
+        "loss_2d": "loss_2d",
+        "loss_vis": "loss_vis",
+        "loss_disp": "loss_disp",
+        "loss_conf": "loss_conf",
+        "raw_3d_l1": "metric_raw_3d_l1",
+        "valid_3d_ratio": "metric_valid_3d_query_ratio",
+        "static_query_ratio": "metric_static_query_ratio",
+        "temporal_query_ratio": "metric_temporal_query_ratio",
+        "pred_abs_depth_mean": "metric_pred_abs_depth_mean",
+        "target_abs_depth_mean": "metric_target_abs_depth_mean",
+    }
+    out = {}
+    device = outputs["pos_3d"].device
+    for dataset_name, sample_indices in sorted(groups.items()):
+        index_tensor = torch.tensor(sample_indices, device=device, dtype=torch.long)
+        sub_outputs = {
+            key: _slice_first_dim(value, index_tensor, batch_size)
+            for key, value in outputs.items()
+        }
+        sub_targets = {
+            key: _slice_first_dim(value, index_tensor, batch_size)
+            for key, value in targets.items()
+        }
+        sub_dataset_id = _slice_first_dim(batch["dataset_id"], index_tensor, batch_size)
+        sub_t_cam = _slice_first_dim(batch["t_cam"], index_tensor, batch_size)
+        sub_loss = loss_fn(
+            sub_outputs,
+            sub_targets,
+            normalize_groups=sub_dataset_id * num_frames + sub_t_cam,
+        )
+        out[dataset_name] = {"count": len(sample_indices)}
+        for log_key, loss_key in metric_keys.items():
+            if loss_key in sub_loss:
+                value = sub_loss[loss_key]
+                out[dataset_name][log_key] = f"{float(value.detach().float().item()):.4f}"
+    return out
+
+
+def _as_int(value):
+    if isinstance(value, torch.Tensor):
+        if value.numel() == 0:
+            return None
+        return int(value.detach().flatten()[0].item())
+    try:
+        return int(value)
+    except Exception:
+        return None
+
+
+def _format_frame_indices(value) -> str:
+    if value is None:
+        return "<unknown>"
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().flatten().tolist()
+    try:
+        vals = [int(v) for v in value]
+    except Exception:
+        return str(value)
+    if not vals:
+        return "0[]"
+    step = vals[1] - vals[0] if len(vals) > 1 else 0
+    regular = len(vals) <= 2 or all(vals[i] - vals[i - 1] == step for i in range(1, len(vals)))
+    suffix = f",step={step}" if regular and step not in (0, 1) else ""
+    return f"{len(vals)}[{min(vals)}..{max(vals)}{suffix}]"
+
+
+def _tensor_range(tensor, sample_idx: int) -> str:
+    try:
+        values = tensor[sample_idx].detach()
+        if values.numel() == 0:
+            return "empty"
+        return f"{int(values.min().item())}..{int(values.max().item())}"
+    except Exception:
+        return "?"
+
+
+def _target_ratio(batch: dict, key: str, sample_idx: int) -> str:
+    try:
+        target = batch["targets"][key][sample_idx].detach()
+        if target.numel() == 0:
+            return "nan"
+        return f"{target.float().mean().item():.3f}"
+    except Exception:
+        return "?"
+
+
+def infer_next_planned_index(batch: dict) -> int | None:
+    indices = []
+    for metadata in batch.get("metadata") or []:
+        if isinstance(metadata, dict):
+            idx = _as_int(metadata.get("planned_local_index"))
+            if idx is not None:
+                indices.append(idx)
+    if not indices:
+        return None
+    return max(indices) + 1
+
+
+def format_batch_sample_details(batch: dict, max_samples: int = 8) -> list[str]:
+    """Compact per-sample diagnostics for slow data waits."""
+    dataset_names = batch.get("dataset_names") or []
+    sequence_names = batch.get("sequence_names") or []
+    metadata_list = batch.get("metadata") or []
+    batch_size = max(len(dataset_names), len(sequence_names), len(metadata_list))
+    lines = []
+    for i in range(min(batch_size, max_samples)):
+        md = metadata_list[i] if i < len(metadata_list) and isinstance(metadata_list[i], dict) else {}
+        dataset = dataset_names[i] if i < len(dataset_names) else md.get("dataset_name", "?")
+        sequence = sequence_names[i] if i < len(sequence_names) else md.get("sequence_name", "?")
+        frame_indices = (
+            md.get("planned_frame_indices")
+            or md.get("frame_indices")
+            or md.get("logical_frame_indices")
+        )
+        local_idx = _as_int(md.get("planned_local_index"))
+        global_idx = _as_int(md.get("planned_global_index"))
+        planned = (
+            f"planned={local_idx}"
+            + (f"/global={global_idx}" if global_idx is not None else "")
+            if local_idx is not None
+            else "planned=?"
+        )
+        tracks = md.get("has_tracks", md.get("has_temporal_supervision", "?"))
+        semantics = md.get("query_semantics", "?")
+        num_frames = md.get("num_frames_in_sequence", md.get("num_frames_total", "?"))
+        line = (
+            f"  sample[{i}] {planned} dataset={dataset} seq={sequence} "
+            f"frames={_format_frame_indices(frame_indices)} total_frames={num_frames} "
+            f"tracks={tracks} sem={semantics} "
+            f"t_src={_tensor_range(batch.get('t_src'), i)} "
+            f"t_tgt={_tensor_range(batch.get('t_tgt'), i)} "
+            f"t_cam={_tensor_range(batch.get('t_cam'), i)} "
+            f"mask3d={_target_ratio(batch, 'mask_3d', i)} "
+            f"mask2d={_target_ratio(batch, 'mask_2d', i)} "
+            f"static={_target_ratio(batch, 'is_static_reprojection', i)}"
+        )
+        lines.append(line)
+    if batch_size > max_samples:
+        lines.append(f"  ... {batch_size - max_samples} more samples omitted")
+    return lines
+
+
+class ProfilingCollateFn:
+    """Small optional wrapper for timing CPU collate in planned mode."""
+
+    def __init__(self, rank: int, interval: int):
+        self.rank = rank
+        self.interval = max(1, int(interval))
+        self.count = 0
+
+    def __call__(self, batch):
+        t0 = time.perf_counter()
+        result = d4rt_collate_fn(batch)
+        dt = time.perf_counter() - t0
+        self.count += 1
+        if self.count <= 3 or self.count % self.interval == 0:
+            print(
+                f"[DataProfile rank{self.rank}] collate "
+                f"batch={self.count} samples={len(batch)} time={dt * 1000:.1f}ms",
+                flush=True,
+            )
+        return result
 
 
 def maybe_fallback_patch_provider(
@@ -91,6 +409,10 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--lr-min", type=float, default=1e-6)
     parser.add_argument("--lr-warmup-steps", type=int, default=2500)
+    parser.add_argument("--encoder-lr-mult", type=float, default=1.0,
+                        help="LR multiplier for encoder parameters. Default 1.0 keeps one LR for the whole model.")
+    parser.add_argument("--decoder-lr-mult", type=float, default=1.0,
+                        help="LR multiplier for decoder parameters. Default 1.0 keeps one LR for the whole model.")
     parser.add_argument("--weight-decay", type=float, default=0.03)
     parser.add_argument("--grad-clip", type=float, default=10.0)
     parser.add_argument("--resolution", type=int, default=256)
@@ -99,19 +421,22 @@ def main():
     parser.add_argument("--loss-w-3d", type=float, default=1.0)
     parser.add_argument("--loss-w-raw-3d", type=float, default=0.0)
     parser.add_argument("--loss-w-2d", type=float, default=0.1)
-    parser.add_argument("--loss-w-vis", type=float, default=0.1)
+    parser.add_argument("--loss-w-vis", type=float, default=0.01)
     parser.add_argument("--loss-w-disp", type=float, default=0.1)
     parser.add_argument("--loss-w-conf", type=float, default=0.2)
+    parser.add_argument("--loss-conf-warmup-steps", type=int, default=0,
+                        help="Linearly ramp confidence penalty and Kendall weighting from 0 to --loss-w-conf. "
+                             "Default 0 keeps confidence fully enabled from the first step.")
     parser.add_argument("--loss-w-normal", type=float, default=0.5)
     parser.add_argument("--loss-w-static-reprojection", type=float, default=1.0,
                         help="Weight for static-reprojection (has_tracks=False) queries in 3D loss. "
                              "Default 1.0 = no change. Set <1.0 to down-weight static queries.")
-    parser.add_argument("--shared-depth-norm", action="store_true", default=True,
-                        help="Use target mean-depth to normalize both pred and target (scale-aware). "
-                             "Default True. Use --no-shared-depth-norm for paper's independent normalization.")
+    parser.add_argument("--shared-depth-norm", action="store_true", default=False,
+                        help="Use target median depth to normalize both pred and target (scale-aware). "
+                             "Default False: pred and target are normalized by their own median depth.")
     parser.add_argument("--no-shared-depth-norm", dest="shared_depth_norm", action="store_false",
                         help="Use independent normalization (paper default): pred and target each "
-                             "divided by their own mean depth. Scale-invariant but blind to depth-scale drift.")
+                             "divided by their own median depth. Scale-invariant but blind to depth-scale drift.")
     parser.add_argument("--loss-3d-mode", type=str, default="scale_invariant",
                         choices=["scale_invariant", "raw_l1", "log_space"],
                         help="3D loss mode. 'scale_invariant': paper default (median-norm + log1p). "
@@ -190,6 +515,30 @@ def main():
         default=32,
         help="Number of samples to prefetch ahead in planned mode",
     )
+    parser.add_argument(
+        "--batch-prefetch-depth",
+        type=int,
+        default=0,
+        help=(
+            "CPU batch prefetch queue depth. In planned mode this overlaps "
+            "spool pickle.load + collate with GPU compute without enabling "
+            "DataLoader multiprocessing."
+        ),
+    )
+    parser.add_argument(
+        "--profile-data-loading",
+        action="store_true",
+        help=(
+            "Print lightweight data-path timing. Use for short diagnostics only; "
+            "it may add small overhead."
+        ),
+    )
+    parser.add_argument(
+        "--data-profile-interval",
+        type=int,
+        default=20,
+        help="Print data-path profile every N batches/samples when profiling is enabled.",
+    )
     args = parser.parse_args()
 
     # Distributed setup
@@ -221,6 +570,13 @@ def main():
         with open(args.val_config) as f:
             val_config = yaml.safe_load(f)
 
+    # Validation must NOT use planned mode.  Planned mode assumes sequential
+    # single-worker access (SequentialSampler + num_workers=0) which conflicts
+    # with the validation DataLoader's DistributedSampler + multi-worker setup.
+    # It is also unnecessary: validation is infrequent and not I/O-bound.
+    if val_config.get('planned_mode'):
+        val_config = {**val_config, 'planned_mode': False}
+
     # Create dataset
     rank = dist.get_rank() if distributed else 0
     train_dataset = create_training_dataset(config, split='train', rank=rank, world_size=world_size)
@@ -246,7 +602,10 @@ def main():
             print(f"Quick test mode: using {len(train_dataset)} samples")
 
     # DataLoader sampler setup
-    if distributed:
+    if args.planned_mode:
+        # Planned mode: dataset 内部已处理 rank 分片和确定性顺序
+        train_sampler = SequentialSampler(train_dataset)
+    elif distributed:
         train_sampler = DistributedSampler(train_dataset, shuffle=True)
     else:
         train_sampler = RandomSampler(train_dataset)
@@ -264,11 +623,23 @@ def main():
         train_num_workers = 0  # No workers needed, samples are pre-built
         if local_rank == 0:
             print(f"[Planned Mode] Setting DataLoader num_workers=0 (samples pre-built by {args.builder_workers} builder processes)")
+            if args.batch_prefetch_depth > 0:
+                print(
+                    f"[Planned Mode] CPU batch prefetch enabled "
+                    f"(depth={args.batch_prefetch_depth})"
+                )
+
+    train_collate_fn = d4rt_collate_fn
+    if args.profile_data_loading and args.planned_mode:
+        train_collate_fn = ProfilingCollateFn(
+            rank=local_rank,
+            interval=args.data_profile_interval,
+        )
 
     train_loader_kwargs = dict(
         batch_size=args.batch_size,
         num_workers=train_num_workers,
-        collate_fn=d4rt_collate_fn,
+        collate_fn=train_collate_fn,
         sampler=train_sampler,
         pin_memory=True,
         persistent_workers=train_num_workers > 0,
@@ -353,22 +724,39 @@ def main():
                     "to avoid stale uncertainty calibration."
                 )
 
-    # Optimizer and loss - separate weight decay for bias/norm
-    decay_params = []
-    no_decay_params = []
+    # Optimizer and loss - separate weight decay for bias/norm and optional
+    # encoder/decoder LR multipliers.
+    param_groups_by_key: dict[tuple[bool, float], dict] = {}
+
+    def _lr_multiplier_for_name(param_name: str) -> float:
+        local_name = param_name.removeprefix("module.")
+        if local_name.startswith("encoder."):
+            return float(args.encoder_lr_mult)
+        if local_name.startswith("decoder."):
+            return float(args.decoder_lr_mult)
+        return 1.0
+
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
-        # No weight decay for bias, norm, and embedding parameters
-        if 'bias' in name or 'norm' in name or 'embed' in name:
-            no_decay_params.append(param)
-        else:
-            decay_params.append(param)
+        use_decay = not ('bias' in name or 'norm' in name or 'embed' in name)
+        lr_mult = _lr_multiplier_for_name(name)
+        key = (use_decay, lr_mult)
+        if key not in param_groups_by_key:
+            param_groups_by_key[key] = {
+                'params': [],
+                'weight_decay': args.weight_decay if use_decay else 0.0,
+                'lr': args.lr * lr_mult,
+                'lr_mult': lr_mult,
+                'decay': use_decay,
+            }
+        param_groups_by_key[key]['params'].append(param)
 
-    optimizer = torch.optim.AdamW([
-        {'params': decay_params, 'weight_decay': args.weight_decay},
-        {'params': no_decay_params, 'weight_decay': 0.0}
-    ], lr=args.lr)
+    optimizer_groups = [
+        group for group in param_groups_by_key.values()
+        if group['params']
+    ]
+    optimizer = torch.optim.AdamW(optimizer_groups, lr=args.lr)
     loss_fn = D4RTLoss(lambda_3d=args.loss_w_3d, lambda_raw_3d=args.loss_w_raw_3d,
                        lambda_2d=args.loss_w_2d,
                        lambda_vis=args.loss_w_vis, lambda_disp=args.loss_w_disp,
@@ -388,7 +776,13 @@ def main():
         if total_steps <= args.lr_warmup_steps:
             return 1.0
         progress = (step - args.lr_warmup_steps) / (total_steps - args.lr_warmup_steps)
-        return args.lr_min / args.lr + (1 - args.lr_min / args.lr) * 0.5 * (1 + torch.cos(torch.tensor(progress * 3.14159)))
+        # When resuming from a checkpoint trained with a different world size,
+        # planned-mode setting, or epoch length, the restored global_step can be
+        # beyond the newly computed total_steps.  The raw cosine formula is
+        # periodic after progress > 1 and raises LR again, which is not intended
+        # for a finished cosine decay.  Clamp to keep the schedule at lr_min.
+        progress = min(max(float(progress), 0.0), 1.0)
+        return args.lr_min / args.lr + (1 - args.lr_min / args.lr) * 0.5 * (1 + math.cos(progress * math.pi))
     scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
     # Training loop
@@ -416,6 +810,24 @@ def main():
             # Advance scheduler to match current step for older checkpoints.
             for _ in range(global_step):
                 scheduler.step()
+        # Optimizer state carries the LR stored in the checkpoint.  If the run
+        # is resumed with a different total_steps geometry, align it immediately
+        # to the current scheduler so the first post-resume optimizer step does
+        # not use a stale or already-rebounded LR.
+        scheduler.last_epoch = global_step
+        resumed_lr_factor = float(lr_lambda(global_step))
+        for param_group, base_lr in zip(optimizer.param_groups, scheduler.base_lrs):
+            param_group['lr'] = float(base_lr) * resumed_lr_factor
+        scheduler._last_lr = [group['lr'] for group in optimizer.param_groups]
+        if global_step > total_steps and local_rank == 0:
+            print(
+                "[LR Scheduler] WARNING: resumed global_step "
+                f"{global_step} exceeds configured total_steps {total_steps}. "
+                "Cosine progress will be clamped at lr_min; if you intended a "
+                "new fine-tuning schedule, start with a fresh scheduler state "
+                "or increase --epochs.",
+                flush=True,
+            )
         if local_rank == 0:
             print(f"Resumed at epoch {start_epoch}, global_step {global_step}")
 
@@ -431,6 +843,32 @@ def main():
         print(f"Grad accum steps: {args.grad_accum}, effective batch size: {effective_batch}")
         print(f"Steps per epoch: {len(train_loader)}, samples per epoch: {len(train_dataset)}")
         print(f"Optimizer steps per epoch: {optimizer_steps_per_epoch}")
+        print(
+            "LR multipliers: "
+            f"encoder={args.encoder_lr_mult:g}, decoder={args.decoder_lr_mult:g}"
+        )
+        if len(optimizer.param_groups) > 2:
+            group_summary = [
+                f"lr={group['lr']:.2e}, wd={group['weight_decay']}, params={len(group['params'])}"
+                for group in optimizer.param_groups
+            ]
+            print("Optimizer param groups: " + " | ".join(group_summary))
+        if args.loss_conf_warmup_steps > 0:
+            print(
+                "Confidence warmup: "
+                f"0 -> {args.loss_w_conf:g} over {args.loss_conf_warmup_steps} optimizer steps"
+            )
+    profile_data_wait = os.getenv("D4RT_PROFILE_DATA_WAIT", "").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    data_wait_threshold_s = float(os.getenv("D4RT_DATA_WAIT_THRESHOLD_S", "2.0"))
+    data_wait_detail = os.getenv("D4RT_DATA_WAIT_DETAIL", "1").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    data_wait_compare_fwd = os.getenv("D4RT_DATA_WAIT_COMPARE_FWD", "1").strip().lower() in {
+        "1", "true", "yes", "on",
+    }
+    data_wait_detail_max_samples = int(os.getenv("D4RT_DATA_WAIT_DETAIL_MAX_SAMPLES", "8"))
     for epoch in range(start_epoch, args.epochs):
         if distributed and isinstance(train_sampler, DistributedSampler):
             train_sampler.set_epoch(epoch)
@@ -438,10 +876,22 @@ def main():
         model.train()
         epoch_loss = 0
         optimizer.zero_grad(set_to_none=True)
+        train_iter = train_loader
+        if args.batch_prefetch_depth > 0:
+            train_iter = BatchPrefetchIterator(
+                train_loader,
+                depth=args.batch_prefetch_depth,
+            )
         t_data_start = time.perf_counter()
-        for batch_idx, batch in enumerate(train_loader):
+        for batch_idx, batch in enumerate(train_iter):
             t_data_end = time.perf_counter()
             t_data = t_data_end - t_data_start
+            prefetch_stats_for_batch = (
+                train_iter.last_stats()
+                if isinstance(train_iter, BatchPrefetchIterator)
+                else {}
+            )
+            next_planned_index_for_batch = infer_next_planned_index(batch)
 
             batch = move_batch_to_device(batch, device)
             warned_patch_provider_fallback = maybe_fallback_patch_provider(
@@ -464,6 +914,15 @@ def main():
             is_last_accum = (batch_idx + 1) % args.grad_accum == 0 or (batch_idx + 1) == len(train_loader)
 
             t_fwd_start = time.perf_counter()
+            if args.loss_conf_warmup_steps > 0:
+                confidence_ramp = min(global_step / max(1, args.loss_conf_warmup_steps), 1.0)
+            else:
+                confidence_ramp = 1.0
+            effective_loss_w_conf = args.loss_w_conf * confidence_ramp
+            loss_fn.set_confidence_schedule(
+                effective_loss_w_conf,
+                weighting_factor=confidence_ramp,
+            )
             # 梯度累积：只在最后一步才同步梯度，减少NCCL通信频次
             use_no_sync = distributed and hasattr(model, "no_sync") and not is_last_accum
             ctx = model.no_sync() if use_no_sync else contextlib.nullcontext()
@@ -476,7 +935,7 @@ def main():
                                     query_frames=query_frames_arg,)
                     # Per-(dataset, frame) depth normalization:
                     # dataset_id * num_frames + t_cam gives each (dataset, frame) pair a unique
-                    # group id, so mean-depth is computed independently per frame within each
+                    # group id, so median depth is computed independently per frame within each
                     # dataset. This is correct for both single- and multi-dataset batches.
                     normalize_groups = batch['dataset_id'] * args.num_frames + batch['t_cam']
                     loss_dict = loss_fn(outputs, batch['targets'], normalize_groups=normalize_groups)
@@ -492,13 +951,50 @@ def main():
                 global_step += 1
 
             t_fwd = time.perf_counter() - t_fwd_start
+            if profile_data_wait:
+                reasons = []
+                if t_data >= data_wait_threshold_s:
+                    reasons.append(f"threshold>={data_wait_threshold_s:.3f}s")
+                if data_wait_compare_fwd and t_data > t_fwd:
+                    reasons.append("data_gt_fwd_bwd")
+                if reasons:
+                    spool_stats = summarize_spool_ready(
+                        train_dataset, focus_index=next_planned_index_for_batch
+                    )
+                    print(
+                        f"[DataWaitDetail rank{local_rank}] "
+                        f"reason={','.join(reasons)} "
+                        f"epoch={epoch} batch={batch_idx} "
+                        f"data={t_data * 1000:.0f}ms fwd+bwd={t_fwd * 1000:.0f}ms "
+                        f"datasets={format_dataset_counts(batch.get('dataset_names'))} "
+                        f"batch_prefetch_wait={prefetch_stats_for_batch.get('get_wait_s', 0.0) * 1000:.0f}ms "
+                        f"q_before={prefetch_stats_for_batch.get('qsize_before')} "
+                        f"q_after={prefetch_stats_for_batch.get('qsize_after')} "
+                        f"q_depth={prefetch_stats_for_batch.get('depth')} "
+                        f"spool_ready={spool_stats.get('ready_count')} "
+                        f"spool_min={spool_stats.get('ready_min')} "
+                        f"spool_max={spool_stats.get('ready_max')} "
+                        f"focus_next={spool_stats.get('focus_index')} "
+                        f"contiguous_from_next={spool_stats.get('contiguous_from_focus')} "
+                        f"next_ready={spool_stats.get('next_ready')} "
+                        f"ready_near={spool_stats.get('ready_near')}",
+                        flush=True,
+                    )
+                    if data_wait_detail:
+                        for detail_line in format_batch_sample_details(
+                            batch, max_samples=data_wait_detail_max_samples
+                        ):
+                            print(f"[DataWaitDetail rank{local_rank}] {detail_line}", flush=True)
 
             real_loss = loss.item() * args.grad_accum  # 还原除法，得到真实loss值
             epoch_loss += real_loss
             if batch_idx % args.log_interval == 0:
-                current_lr = optimizer.param_groups[0]['lr']
+                current_lrs = [group['lr'] for group in optimizer.param_groups]
+                current_lr = max(current_lrs)
                 lr_info = f"LR: {current_lr:.2e} (warmup {global_step}/{args.lr_warmup_steps} → {args.lr:.2e})" \
                     if global_step < args.lr_warmup_steps else f"LR: {current_lr:.2e}"
+                if min(current_lrs) != max(current_lrs):
+                    lr_info += f" [min {min(current_lrs):.2e}]"
                 # Print from ALL ranks so we can compare data/compute time per rank
                 print(f"[{time.strftime('%H:%M:%S')}][rank{local_rank}] Epoch {epoch}, Batch {batch_idx}, "
                       f"data={t_data*1000:.0f}ms fwd+bwd={t_fwd*1000:.0f}ms Loss: {real_loss:.4f}, {lr_info}", flush=True)
@@ -509,6 +1005,7 @@ def main():
                         'epoch': epoch,
                         'step': global_step,
                         'batch': batch_idx,
+                        'datasets': format_dataset_counts(batch.get('dataset_names')),
                         'loss': f"{real_loss:.4f}",
                         'loss_3d': f"{loss_dict.get('loss_3d', 0):.4f}",
                         'loss_3d_nocon': f"{loss_dict.get('loss_3d_unweighted', 0):.4f}",
@@ -517,6 +1014,8 @@ def main():
                         'loss_vis': f"{loss_dict.get('loss_vis', 0):.4f}",
                         'loss_disp': f"{loss_dict.get('loss_disp', 0):.4f}",
                         'loss_conf': f"{loss_dict.get('loss_conf', 0):.4f}",
+                        'loss_w_conf_effective': f"{effective_loss_w_conf:.6f}",
+                        'loss_conf_ramp': f"{confidence_ramp:.6f}",
                         'loss_normal': f"{loss_dict.get('loss_normal', 0):.4f}",
                         'raw_3d_l1': f"{loss_dict.get('metric_raw_3d_l1', 0):.4f}",
                         'raw_3d_euc': f"{loss_dict.get('metric_raw_3d_euclidean', 0):.4f}",
@@ -536,10 +1035,19 @@ def main():
                         'conf_mean': f"{loss_dict.get('metric_conf_mean', 0):.4f}",
                         'lr': f"{current_lr:.6f}"
                     }
+                    log_entry['per_dataset'] = compute_per_dataset_loss_metrics(
+                        loss_fn,
+                        outputs,
+                        batch['targets'],
+                        batch,
+                        args.num_frames,
+                    )
                     with open(output_dir / 'loss_log.jsonl', 'a') as f:
                         f.write(json.dumps(log_entry) + '\n')
 
             t_data_start = time.perf_counter()
+        if isinstance(train_iter, BatchPrefetchIterator):
+            train_iter.close()
 
         avg_loss = epoch_loss / len(train_loader)
         if local_rank == 0:

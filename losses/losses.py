@@ -69,12 +69,12 @@ def normalize_points(
     groups: Optional[torch.Tensor] = None,
     eps: float = 1e-6
 ) -> torch.Tensor:
-    """Normalize points by their mean depth, accounting for invalid points.
+    """Normalize points by their median depth, accounting for invalid points.
 
     Args:
         points: (B, N, 3) point positions
         mask: (B, N) optional validity mask
-        groups: (B, N) optional group ids. When provided, mean-depth normalization is
+        groups: (B, N) optional group ids. When provided, median-depth normalization is
             computed independently per group inside each batch element.
         eps: Small value for numerical stability
 
@@ -238,7 +238,7 @@ def compute_3d_loss(
     groups: Optional[torch.Tensor] = None,
     normalize: bool = True,
     use_log_transform: bool = True,
-    shared_depth_normalization: bool = True,
+    shared_depth_normalization: bool = False,
 ) -> torch.Tensor:
     """Compute L1 loss on 3D positions.
 
@@ -246,12 +246,12 @@ def compute_3d_loss(
         pred: (B, N, 3) predicted 3D positions
         target: (B, N, 3) target 3D positions
         mask: (B, N) optional validity mask
-        groups: (B, N) optional group ids used for per-group mean-depth normalization
-        normalize: Whether to normalize by mean depth
+        groups: (B, N) optional group ids used for per-group median-depth normalization
+        normalize: Whether to normalize by median depth
         use_log_transform: Whether to apply log transform
-        shared_depth_normalization: If True, use target mean-depth for both
+        shared_depth_normalization: If True, use target median depth for both
             pred and target (scale-aware).  If False, each is normalized by
-            its own mean-depth (paper default, scale-invariant).
+            its own median depth (paper default, scale-invariant).
 
     Returns:
         loss: Scalar loss value
@@ -474,7 +474,7 @@ class D4RTLoss(nn.Module):
         use_confidence_weighting: Optional[bool] = None,
         debug_3d_loss_mode: str = "scale_invariant",
         static_reprojection_weight: float = 1.0,
-        shared_depth_normalization: bool = True,
+        shared_depth_normalization: bool = False,
     ):
         super().__init__()
         self.lambda_3d = lambda_3d
@@ -656,7 +656,7 @@ class D4RTLoss(nn.Module):
             )
         elif mask_3d is not None:
             if self.shared_depth_normalization:
-                # Shared normalization: compute mean-depth from *target* only and
+                # Shared normalization: compute median depth from *target* only and
                 # apply it to both pred and target.  This preserves depth-scale
                 # information so the model receives gradients when its predictions
                 # have a systematic scale offset.
@@ -667,7 +667,7 @@ class D4RTLoss(nn.Module):
                 target_norm = normalize_points_by(targets['pos_3d'], tgt_normalizer, mask=mask_3d)
             else:
                 # Independent normalization (paper default): pred and target are
-                # each divided by their own mean depth.  Scale-invariant but
+                # each divided by their own median depth.  Scale-invariant but
                 # blind to systematic depth-scale offsets.
                 pred_norm = normalize_points(predictions['pos_3d'], mask=mask_3d, groups=normalize_groups)
                 target_norm = normalize_points(targets['pos_3d'], mask=mask_3d, groups=normalize_groups)

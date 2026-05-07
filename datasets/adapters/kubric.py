@@ -14,7 +14,7 @@ from PIL import Image
 from .base import BaseAdapter, UnifiedClip
 
 
-@dataclass(slots=True)
+@dataclass
 class _KubricSceneRecord:
     sequence_name: str
     scene_dir: Path
@@ -33,6 +33,7 @@ class _KubricSceneRecord:
     frame_name_suffix: str = ".png"
     depth_name_width: int = 3
     depth_name_suffix: str = ".npy"
+    has_depth_dir: bool = False
 
     @property
     def frame_dir(self) -> Path:
@@ -184,14 +185,14 @@ class KubricAdapter(BaseAdapter):
                 visibs       = hf['visibility'][idx]     # [T,N]
 
             # depth still comes from per-frame .npy files in depths/
-            if record.depth_names is not None or record.depth_dir.exists():
+            if record.depth_names is not None or getattr(record, 'has_depth_dir', False):
                 depth_paths = [self._depth_path_for_index(record, i) for i in frame_indices]
                 depths = [
                     np.load(path).astype(np.float32).squeeze()
                     for path in depth_paths
                 ]
             else:
-                depths = []
+                depths = None
 
             ann = None
             seg_thw1 = None
@@ -255,6 +256,17 @@ class KubricAdapter(BaseAdapter):
             & np.isfinite(coords_depth)
             & (coords_depth > 0)
         )
+
+        # Kubric's raw `visibility` only encodes occlusion via raycasting, with
+        # out-of-frame projections defaulting to True. Combine with an explicit
+        # in-frame check so visibs at the adapter boundary already means
+        # "occluded-free AND in-frame".
+        H_img, W_img = images[0].shape[:2]
+        in_bounds = (
+            (trajs_2d[..., 0] >= 0) & (trajs_2d[..., 0] < W_img) &
+            (trajs_2d[..., 1] >= 0) & (trajs_2d[..., 1] < H_img)
+        )
+        visibs = visibs.astype(bool) & in_bounds
 
         metadata = {
             "backend": "kubric_extracted",
@@ -439,6 +451,7 @@ class KubricAdapter(BaseAdapter):
                 frame_name_suffix=frame_name_suffix,
                 depth_name_width=depth_name_width,
                 depth_name_suffix=depth_name_suffix,
+                has_depth_dir=depth_dir is not None,
             )
 
         n_workers = min(self.index_workers, len(scene_dirs))

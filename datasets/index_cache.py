@@ -5,6 +5,9 @@ from __future__ import annotations
 import contextlib
 import os
 import pickle
+import sys
+import types
+import pathlib
 from pathlib import Path
 from typing import Callable, TypeVar
 
@@ -14,6 +17,37 @@ except ImportError:  # pragma: no cover - non-POSIX platforms
     fcntl = None
 
 T = TypeVar('T')
+
+
+def _load_pickle_compat(cache_path: Path):
+    """Load a pickle with small compatibility shims for older Python outputs.
+
+    Some historical cache files were written under a Python version that
+    pickled pathlib classes from ``pathlib._local``.  Python 3.10 cannot
+    import that module, so plain ``pickle.load`` fails and would otherwise
+    trigger an expensive cold rebuild on remote storage.
+    """
+    try:
+        with open(cache_path, 'rb') as f:
+            return pickle.load(f)
+    except ModuleNotFoundError as exc:
+        if exc.name != "pathlib._local":
+            raise
+
+    shim = types.ModuleType("pathlib._local")
+    shim.Path = pathlib.Path
+    shim.PosixPath = pathlib.PosixPath
+    shim.WindowsPath = pathlib.WindowsPath
+    previous = sys.modules.get("pathlib._local")
+    sys.modules["pathlib._local"] = shim
+    try:
+        with open(cache_path, 'rb') as f:
+            return pickle.load(f)
+    finally:
+        if previous is None:
+            sys.modules.pop("pathlib._local", None)
+        else:
+            sys.modules["pathlib._local"] = previous
 
 
 @contextlib.contextmanager
@@ -40,8 +74,7 @@ def load_or_build(build_fn: Callable[[], T], cache_path: Path) -> T:
     cache_path = Path(cache_path)
     if cache_path.exists():
         try:
-            with open(cache_path, 'rb') as f:
-                return pickle.load(f)
+            return _load_pickle_compat(cache_path)
         except Exception:
             pass  # Corrupt cache — fall through and rebuild
 
@@ -49,8 +82,7 @@ def load_or_build(build_fn: Callable[[], T], cache_path: Path) -> T:
     with _cache_build_lock(lock_path):
         if cache_path.exists():
             try:
-                with open(cache_path, 'rb') as f:
-                    return pickle.load(f)
+                return _load_pickle_compat(cache_path)
             except Exception:
                 pass  # Corrupt cache — rebuild under lock.
 

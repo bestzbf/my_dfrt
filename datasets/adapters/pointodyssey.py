@@ -3,7 +3,10 @@ from __future__ import annotations
 import io
 import hashlib
 import json
+import os
+import pickle
 import re
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy.lib.format as _npy_fmt  # for lightweight numpy header reads
@@ -70,6 +73,7 @@ class SequenceRecord:
 
     num_frames: int
     image_size: Optional[tuple[int, int]]
+    has_tracks: Optional[bool] = None
 
     # Fast-loading paths (populated for PointOdyssey_fast sequences)
     fast_dir: Optional[Path] = None
@@ -90,6 +94,9 @@ class PointOdysseyAdapter(BaseAdapter):
         fast_root: Optional[str] = None,
         require_tracks: bool = False,
         cache_dir: Optional[str] = None,
+        runtime_sanitize: bool = True,
+        io_workers: int = 1,
+        anno_frame_cache_dir: Optional[str] = None,
     ):
         self.root = Path(root)
         self.split = split
@@ -98,6 +105,16 @@ class PointOdysseyAdapter(BaseAdapter):
         self.index_workers = index_workers
         self.fast_root = Path(fast_root) if fast_root is not None else None
         self.require_tracks = require_tracks
+        self.runtime_sanitize = bool(runtime_sanitize)
+        self.io_workers = max(1, int(io_workers))
+        resolved_anno_frame_cache_dir = anno_frame_cache_dir or os.getenv(
+            "D4RT_POINTODYSSEY_ANNO_FRAME_CACHE_DIR", ""
+        )
+        self.anno_frame_cache_dir = (
+            Path(resolved_anno_frame_cache_dir)
+            if resolved_anno_frame_cache_dir
+            else None
+        )
 
         split_root = self.root / self.split
         if not split_root.exists():
@@ -115,7 +132,7 @@ class PointOdysseyAdapter(BaseAdapter):
                 "fast_root": str(self.fast_root.resolve()) if self.fast_root is not None else None,
                 "require_tracks": self.require_tracks,
                 "strict": self.strict,
-                "cache_schema": 2,
+                "cache_schema": 3,
             }
             cache_suffix = hashlib.sha1(
                 json.dumps(cache_key, sort_keys=True).encode("utf-8")
@@ -124,6 +141,8 @@ class PointOdysseyAdapter(BaseAdapter):
             self.records: list[SequenceRecord] = load_or_build(self._build_index, _cache_path)
         else:
             self.records: list[SequenceRecord] = self._build_index()
+        if self.runtime_sanitize:
+            self.records = self._sanitize_records_for_runtime(self.records)
         if self.require_tracks:
             original_count = len(self.records)
             self.records = [r for r in self.records if self._record_has_tracks(r)]
@@ -155,14 +174,105 @@ class PointOdysseyAdapter(BaseAdapter):
             )
 
     def _record_has_tracks(self, record: SequenceRecord) -> bool:
-        if record.fast_anno_paths is not None and "trajs_3d" in record.fast_anno_paths:
-            trajs_3d = np.load(record.fast_anno_paths["trajs_3d"], mmap_mode="r")
-            return not (trajs_3d.ndim == 0 or trajs_3d.shape[0] == 0)
-        if record.anno_path is not None:
-            anno = np.load(record.anno_path, allow_pickle=True)
-            trajs_3d = anno["trajs_3d"]
-            return not (trajs_3d.ndim == 0 or trajs_3d.shape[0] == 0)
-        return False
+        cached = getattr(record, "has_tracks", None)
+        if cached is not None:
+            return bool(cached)
+
+        has_tracks = False
+        try:
+            if record.fast_anno_paths is not None and "trajs_3d" in record.fast_anno_paths:
+                trajs_3d = np.load(record.fast_anno_paths["trajs_3d"], mmap_mode="r")
+                has_tracks = not (trajs_3d.ndim == 0 or trajs_3d.shape[0] == 0)
+            elif record.anno_path is not None:
+                anno = np.load(record.anno_path, allow_pickle=True)
+                if "trajs_3d" in anno:
+                    trajs_3d = anno["trajs_3d"]
+                    has_tracks = not (trajs_3d.ndim == 0 or trajs_3d.shape[0] == 0)
+        except (FileNotFoundError, KeyError, OSError, ValueError):
+            has_tracks = False
+
+        try:
+            record.has_tracks = has_tracks
+        except Exception:
+            pass
+        return has_tracks
+
+    def _sanitize_records_for_runtime(
+        self,
+        records: list[SequenceRecord],
+    ) -> list[SequenceRecord]:
+        """Reconcile cached records with the actually mounted dataset tree."""
+        sanitized: list[SequenceRecord] = []
+        dropped = 0
+
+        for record in records:
+            seq_root = Path(record.sequence_root)
+            if not seq_root.is_dir():
+                dropped += 1
+                continue
+
+            if record.fast_dir is not None and not Path(record.fast_dir).is_dir():
+                record.fast_dir = None
+                record.fast_anno_paths = None
+                record.encoded_cache_paths = None
+
+            if record.fast_anno_paths is not None:
+                fast_anno_paths = {
+                    k: p for k, p in record.fast_anno_paths.items() if Path(p).exists()
+                }
+                if all(k in fast_anno_paths for k in FAST_REQUIRED_ANNO_FILES):
+                    record.fast_anno_paths = fast_anno_paths
+                else:
+                    record.fast_anno_paths = None
+
+            if record.encoded_cache_paths is not None:
+                encoded_cache_paths = {
+                    k: p for k, p in record.encoded_cache_paths.items() if Path(p).exists()
+                }
+                required_encoded = {
+                    "rgb_bin_path",
+                    "rgb_offsets_path",
+                    "depth_bin_path",
+                    "depth_offsets_path",
+                    "normal_bin_path",
+                    "normal_offsets_path",
+                    "normal_valids_path",
+                    "meta_path",
+                }
+                if required_encoded.issubset(encoded_cache_paths):
+                    record.encoded_cache_paths = encoded_cache_paths
+                else:
+                    record.encoded_cache_paths = None
+
+            if record.anno_path is not None and not Path(record.anno_path).exists():
+                npz_path = seq_root / "anno.npz"
+                if npz_path.exists():
+                    record.anno_path = npz_path
+                else:
+                    record.anno_path = None
+
+            has_rgb = record.encoded_cache_paths is not None or (seq_root / "rgbs").is_dir()
+            has_anno = record.fast_anno_paths is not None or record.anno_path is not None
+            if not has_rgb or not has_anno:
+                dropped += 1
+                continue
+
+            if record.depth_paths is not None and not (seq_root / "depths").is_dir():
+                record.depth_paths = None
+            if record.normal_paths is not None and not (seq_root / "normals").is_dir():
+                record.normal_paths = None
+            if record.mask_paths is not None and not (seq_root / "masks").is_dir():
+                record.mask_paths = None
+            if record.info_path is not None and not Path(record.info_path).exists():
+                record.info_path = None
+            if record.scene_info_path is not None and not Path(record.scene_info_path).exists():
+                record.scene_info_path = None
+
+            sanitized.append(record)
+
+        if self.verbose and dropped:
+            print(f"[PointOdysseyAdapter] dropped {dropped} cached records with missing mandatory data")
+        return sanitized
 
     # ------------------------------------------------------------------ #
     #  Public interface                                                    #
@@ -277,33 +387,21 @@ class PointOdysseyAdapter(BaseAdapter):
                 f"valid range = [0, {r.num_frames - 1}]"
             )
 
-        anno = self._load_anno(sequence_name, frame_indices_np)
-        scene_info = self._load_scene_info(sequence_name)
-
-        if r.encoded_cache_paths is not None:
-            # Fast path: decode frames from packed binary cache
-            cache = self._get_encoded_cache(sequence_name, r)
-            images = [self._decode_rgb_from_cache(cache, int(i)) for i in frame_indices_np]
-            depths = [self._decode_depth_from_cache(cache, int(i)) for i in frame_indices_np]
-            normals_raw = [self._decode_normal_from_cache(cache, int(i)) for i in frame_indices_np]
-            # Replace None (invalid normal) with zeros matching the image shape
-            h, w = images[0].shape[:2]
-            normals = [
-                n if n is not None else np.zeros((h, w, 3), dtype=np.float32)
-                for n in normals_raw
-            ]
+        if self.io_workers > 1 and len(frame_indices_np) > 1:
+            with ThreadPoolExecutor(max_workers=1) as anno_executor:
+                anno_future = anno_executor.submit(
+                    self._load_anno, sequence_name, frame_indices_np
+                )
+                scene_info = self._load_scene_info(sequence_name)
+                images, depths, normals = self._load_frame_payload(
+                    sequence_name, r, frame_indices_np
+                )
+                anno = anno_future.result()
         else:
-            # Fallback: read individual frame files
-            images = [self._read_rgb(r.rgb_paths[i]) for i in frame_indices_np]
-            depths = (
-                [self._read_depth(r.depth_paths[i]) for i in frame_indices_np]
-                if r.depth_paths is not None
-                else None
-            )
-            normals = (
-                [self._read_normal(r.normal_paths[i]) for i in frame_indices_np]
-                if r.normal_paths is not None
-                else None
+            anno = self._load_anno(sequence_name, frame_indices_np)
+            scene_info = self._load_scene_info(sequence_name)
+            images, depths, normals = self._load_frame_payload(
+                sequence_name, r, frame_indices_np
             )
 
         # PointOdyssey depth uses 16-bit visualization units:
@@ -365,6 +463,62 @@ class PointOdysseyAdapter(BaseAdapter):
             },
         )
         return clip
+
+    def _load_frame_payload(
+        self,
+        sequence_name: str,
+        r: SequenceRecord,
+        frame_indices_np: np.ndarray,
+    ) -> tuple[list[np.ndarray], Optional[list[np.ndarray]], Optional[list[np.ndarray]]]:
+        if r.encoded_cache_paths is not None:
+            # Fast path: decode frames from packed binary cache
+            cache = self._get_encoded_cache(sequence_name, r)
+            frame_ids = [int(i) for i in frame_indices_np]
+            images = self._parallel_map(
+                lambda i: self._decode_rgb_from_cache(cache, i), frame_ids
+            )
+            depths = self._parallel_map(
+                lambda i: self._decode_depth_from_cache(cache, i), frame_ids
+            )
+            normals_raw = self._parallel_map(
+                lambda i: self._decode_normal_from_cache(cache, i), frame_ids
+            )
+            # Replace None (invalid normal) with zeros matching the image shape
+            h, w = images[0].shape[:2]
+            normals = [
+                n if n is not None else np.zeros((h, w, 3), dtype=np.float32)
+                for n in normals_raw
+            ]
+        else:
+            # Fallback: read individual frame files
+            frame_ids = [int(i) for i in frame_indices_np]
+            images = self._parallel_map(lambda i: self._read_rgb(r.rgb_paths[i]), frame_ids)
+            depths = None
+            if r.depth_paths is not None:
+                try:
+                    depths = self._parallel_map(
+                        lambda i: self._read_depth(r.depth_paths[i]), frame_ids
+                    )
+                except (FileNotFoundError, OSError, IOError):
+                    r.depth_paths = None
+                    depths = None
+            normals = None
+            if r.normal_paths is not None:
+                try:
+                    normals = self._parallel_map(
+                        lambda i: self._read_normal(r.normal_paths[i]), frame_ids
+                    )
+                except (FileNotFoundError, OSError, IOError):
+                    r.normal_paths = None
+                    normals = None
+
+        return images, depths, normals
+
+    def _parallel_map(self, fn, values: list[int]) -> list[Any]:
+        if self.io_workers <= 1 or len(values) <= 1:
+            return [fn(value) for value in values]
+        with ThreadPoolExecutor(max_workers=min(len(values), self.io_workers)) as executor:
+            return list(executor.map(fn, values))
 
     def probe_sequence_meta(self, sequence_name: str) -> dict[str, Any]:
         r = self.get_record(sequence_name)
@@ -696,12 +850,15 @@ class PointOdysseyAdapter(BaseAdapter):
         # HDF5 chunked format: O(frames) random access vs full zlib decompress for npz.
         h5_path = r.anno_path.with_suffix(".h5")
         if h5_path.exists():
-            import h5py
-            with h5py.File(h5_path, "r") as f:
-                if idx is not None:
-                    anno = h5_read_frame_slice(f, idx)
-                else:
-                    anno = {k: f[k][()] for k in f.keys()}
+            if idx is not None and self.anno_frame_cache_dir is not None:
+                anno = self._load_anno_from_frame_cache(sequence_name, h5_path, idx)
+            else:
+                import h5py
+                with h5py.File(h5_path, "r") as f:
+                    if idx is not None:
+                        anno = h5_read_frame_slice(f, idx)
+                    else:
+                        anno = {k: f[k][()] for k in f.keys()}
         else:
             z = np.load(r.anno_path, allow_pickle=True)
             if idx is not None:
@@ -715,12 +872,102 @@ class PointOdysseyAdapter(BaseAdapter):
 
         return anno
 
+    def _anno_frame_cache_path(self, sequence_name: str, frame_idx: int) -> Path:
+        safe_name = sequence_name.replace("/", "__")
+        return (
+            self.anno_frame_cache_dir
+            / self.split
+            / safe_name
+            / f"{frame_idx:06d}.pkl"
+        )
+
+    def _load_cached_anno_frame(
+        self,
+        sequence_name: str,
+        frame_idx: int,
+    ) -> Optional[dict[str, np.ndarray]]:
+        cache_path = self._anno_frame_cache_path(sequence_name, frame_idx)
+        if not cache_path.is_file():
+            return None
+        try:
+            with open(cache_path, "rb") as f:
+                return pickle.load(f)
+        except (OSError, ValueError, KeyError, pickle.PickleError, EOFError):
+            cache_path.unlink(missing_ok=True)
+            return None
+
+    def _write_cached_anno_frame(
+        self,
+        sequence_name: str,
+        frame_idx: int,
+        payload: dict[str, np.ndarray],
+    ) -> None:
+        cache_path = self._anno_frame_cache_path(sequence_name, frame_idx)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_name(
+            f".{cache_path.name}.part.{os.getpid()}.{threading.get_ident()}"
+        )
+        try:
+            with open(tmp_path, "wb") as f:
+                pickle.dump(payload, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp_path, cache_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    def _load_anno_from_frame_cache(
+        self,
+        sequence_name: str,
+        h5_path: Path,
+        idx: list[int],
+    ) -> dict[str, Any]:
+        frame_payloads: dict[int, dict[str, np.ndarray]] = {}
+        missing = []
+        for frame_idx in sorted(set(int(i) for i in idx)):
+            cached = self._load_cached_anno_frame(sequence_name, frame_idx)
+            if cached is None:
+                missing.append(frame_idx)
+            else:
+                frame_payloads[frame_idx] = cached
+
+        if missing:
+            import h5py
+            with h5py.File(h5_path, "r") as f:
+                for frame_idx in missing:
+                    payload = {}
+                    for key in f.keys():
+                        ds = f[key]
+                        if ds.ndim >= 1 and ds.shape[0] > 1:
+                            if frame_idx >= ds.shape[0]:
+                                continue
+                            payload[key] = ds[frame_idx]
+                        else:
+                            payload[key] = ds[()]
+                    frame_payloads[frame_idx] = payload
+                    self._write_cached_anno_frame(sequence_name, frame_idx, payload)
+
+        first_payload = frame_payloads[int(idx[0])]
+        out: dict[str, Any] = {}
+        for key, first_value in first_payload.items():
+            if getattr(first_value, "ndim", 0) >= 0:
+                out[key] = np.stack(
+                    [frame_payloads[int(frame_idx)][key] for frame_idx in idx],
+                    axis=0,
+                )
+            else:
+                out[key] = first_value
+        return out
+
     def _load_scene_info(self, sequence_name: str) -> Optional[dict[str, Any]]:
         if sequence_name in self._scene_info_cache:
             return self._scene_info_cache[sequence_name]
 
         r = self.get_record(sequence_name)
         if r.scene_info_path is None:
+            self._scene_info_cache[sequence_name] = None
+            return None
+
+        if not Path(r.scene_info_path).exists():
+            r.scene_info_path = None
             self._scene_info_cache[sequence_name] = None
             return None
 

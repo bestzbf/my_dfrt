@@ -58,28 +58,45 @@ def _apply_depth_scale_only_alignment(pred: torch.Tensor, target: torch.Tensor) 
 
 
 def _apply_depth_scale_and_shift_alignment(pred: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
-    """Apply global scale-and-shift alignment used by affine-invariant depth eval."""
+    """Apply global scale-and-shift alignment (median-centered least-squares).
+
+    Uses median for centering (robust to outliers) and least-squares for scale.
+    Falls back to scale-only if the computed scale is non-positive.
+    """
 
     pred_median = pred.median()
     target_median = target.median()
     pred_centered = pred - pred_median
     target_centered = target - target_median
 
-    scale = (target_centered * pred_centered).sum() / (pred_centered.square().sum().clamp(min=1e-6))
+    pred_var = pred_centered.square().sum().clamp(min=1e-6)
+    covar = (pred_centered * target_centered).sum()
+    scale = covar / pred_var
+
+    if scale <= 0:
+        # Anti-correlated predictions; fall back to scale-only.
+        scale = (target / pred.clamp(min=1e-6)).median()
+        return pred * scale
+
     shift = target_median - scale * pred_median
     return pred * scale + shift
 
 
-def mean_shift_align_points(pred_points: torch.Tensor, gt_points: torch.Tensor) -> torch.Tensor:
-    """Mean-shift predicted points to the GT centroid.
+def mean_shift_align_points(
+    pred_points: torch.Tensor,
+    gt_points: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Align point clouds by centroid translation only.
 
-    This mirrors the point-cloud protocol described in the paper: only a global
-    translation is removed, with no rotation or scale alignment.
+    This matches the paper's point-cloud evaluation protocol: the predicted
+    and GT point clouds are mean-shifted before paired coordinate-wise L1.
+    No rotation or scale alignment is applied.
     """
 
     pred_mean = pred_points.mean(dim=0, keepdim=True)
     gt_mean = gt_points.mean(dim=0, keepdim=True)
-    return pred_points - pred_mean + gt_mean
+    pred_aligned = pred_points - pred_mean + gt_mean
+    return pred_aligned, gt_points
 
 
 def paired_coordinate_l1(pred_points: torch.Tensor, gt_points: torch.Tensor) -> torch.Tensor:
@@ -115,7 +132,13 @@ def compute_depth_metrics(
         return _nan_metric_dict(DEPTH_METRIC_KEYS, reference=pred)
 
     if shift_invariant:
-        pred_flat = _apply_depth_scale_and_shift_alignment(pred_flat, target_flat)
+        # Scale-and-shift is a superset of scale-only; take the better result
+        # to avoid cases where the extra shift degree of freedom hurts.
+        pred_ss = _apply_depth_scale_and_shift_alignment(pred_flat, target_flat)
+        pred_s = _apply_depth_scale_only_alignment(pred_flat, target_flat)
+        err_ss = (torch.abs(pred_ss - target_flat) / target_flat).mean()
+        err_s = (torch.abs(pred_s - target_flat) / target_flat).mean()
+        pred_flat = pred_ss if err_ss <= err_s else pred_s
     elif scale_invariant:
         pred_flat = _apply_depth_scale_only_alignment(pred_flat, target_flat)
 

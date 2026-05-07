@@ -181,7 +181,12 @@ class D4RT(nn.Module):
             resolved: list[torch.Tensor] = []
             for i, qf in enumerate(query_frames):
                 if qf is not None:
-                    resolved.append(qf.to(device=device, dtype=video.dtype))
+                    qf_device = qf.to(device=device)
+                    if qf_device.dtype == torch.uint8:
+                        qf_device = qf_device.to(dtype=video.dtype).div_(255.0)
+                    else:
+                        qf_device = qf_device.to(dtype=video.dtype)
+                    resolved.append(qf_device)
                 else:
                     resolved.append(resized_frames[i])  # [T, C, H, W]
 

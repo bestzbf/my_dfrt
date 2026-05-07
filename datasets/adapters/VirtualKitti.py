@@ -38,13 +38,19 @@ class VKITTI2Adapter(BaseAdapter):
 
         self.sequences: list[str] = []
         self.seq_to_dir: dict[str, Path] = {}
-        if cache_dir is not None:
-            from datasets.index_cache import load_or_build
-            _cache_path = Path(cache_dir) / f"{self.dataset_name}_{split}.pkl"
-            def _build_and_return():
-                self._build_index()
-                return (list(self.sequences), dict(self.seq_to_dir))
-            self.sequences, self.seq_to_dir = load_or_build(_build_and_return, _cache_path)
+
+        # Load sequence list from pre-built cache (avoids slow COS iterdir)
+        seq_cache = Path(cache_dir) / "vkitti2_train_sequences.pkl" if cache_dir else None
+        if seq_cache and seq_cache.exists():
+            import pickle, re
+            sequences = pickle.loads(seq_cache.read_bytes())
+            for seq_name in sequences:
+                # seq_name = "Scene01_clone" or "Scene01_15-deg-left"
+                m = re.match(r'^(Scene\d+)_(.+)$', seq_name)
+                if m:
+                    scene, var = m.group(1), m.group(2)
+                    self.sequences.append(seq_name)
+                    self.seq_to_dir[seq_name] = self.root / scene / var
         else:
             self._build_index()
 
@@ -66,8 +72,10 @@ class VKITTI2Adapter(BaseAdapter):
         return self.sequences[index]
 
     def get_num_frames(self, sequence_name: str) -> int:
-        """Skip per-sequence glob; assume sequences have sufficient frames."""
-        return 10_000
+        seq_dir = self.seq_to_dir[sequence_name]
+        frames_dir = seq_dir / "frames"
+        img_dir = self._get_actual_dir(frames_dir, "rgb")
+        return len(list(img_dir.glob("*.jpg"))) if img_dir.exists() else 0
 
     def _build_index(self):
         scene_dirs = [f for f in self.root.iterdir() if f.is_dir() and "Scene" in f.name]

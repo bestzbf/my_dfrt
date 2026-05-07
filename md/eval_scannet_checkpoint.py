@@ -436,8 +436,8 @@ def compute_pointcloud_l1_for_clip(
     gt_points = torch.cat(gt_points_all, dim=0)
     pred_points, gt_points = _subsample_paired_points(pred_points, gt_points, max_points=max_points, seed=seed)
 
-    pred_aligned = mean_shift_align_points(pred_points, gt_points)
-    l1 = paired_coordinate_l1(pred_aligned, gt_points)
+    pred_aligned, gt_aligned = mean_shift_align_points(pred_points, gt_points)
+    l1 = paired_coordinate_l1(pred_aligned, gt_aligned)
 
     return {
         "pointcloud_num_points": float(pred_points.shape[0]),

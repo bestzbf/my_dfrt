@@ -300,6 +300,29 @@ def _create_mixture_dataset(config: dict, split: str, rank: int = 0, world_size:
             spool_dir=config.get('spool_dir', None),
             rank=rank,
             world_size=world_size,
+            max_spool_bytes=config.get('max_spool_bytes', 2 * 1024**3),
+            sample_stage_config={
+                'backend': config.get('sample_stage_backend', ''),
+                'stage_root': config.get('sample_stage_root', ''),
+                'sdk_workers': config.get('sample_stage_sdk_workers', 8),
+                'cache_max_bytes': config.get('sample_stage_cache_max_bytes', 100 * 1024**3),
+                'cache_low_watermark_ratio': config.get('sample_stage_cache_low_watermark_ratio', 0.9),
+                'cache_touch_interval_s': config.get('sample_stage_cache_touch_interval_s', 30.0),
+                'cache_scan_interval_s': config.get('sample_stage_cache_scan_interval_s', 30.0),
+                'window_radius': config.get('sample_stage_window_radius', 48),
+                'mount_root': config.get('sample_stage_mount_root', '/data_cos'),
+                'bucket': config.get('sample_stage_bucket', 'hd-ai-data-1251882982'),
+                'region': config.get('sample_stage_region', 'ap-beijing'),
+                'passwd_file': config.get('sample_stage_passwd_file', '/etc/passwd-s3fs-data_cos'),
+                'enabled_datasets': config.get(
+                    'sample_stage_datasets',
+                    ['pointodyssey', 'kubric', 'dynamic_replica', 'co3dv2', 'blendedmvs', 'mvssynth'],
+                ),
+                'scene_prefetch_datasets': config.get(
+                    'sample_stage_scene_prefetch_datasets',
+                    [],
+                ),
+            },
         )
     else:
         # Create standard MixtureDataset

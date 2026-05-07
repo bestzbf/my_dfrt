@@ -390,6 +390,7 @@ class DynamicReplicaAdapter(BaseAdapter):
         strict: bool = False,
         verbose: bool = True,
         cache_dir: Optional[str] = None,
+        index_workers: int = 8,
     ) -> None:
         """
         Parameters
@@ -431,6 +432,7 @@ class DynamicReplicaAdapter(BaseAdapter):
         self.min_frames = min_frames
         self.strict = strict
         self.verbose = verbose
+        self.index_workers = index_workers
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
         self._cache_suffix = self._build_cache_suffix()
         self._depth_calibration_cache: dict[str, tuple[float, float]] = {}
@@ -586,8 +588,22 @@ class DynamicReplicaAdapter(BaseAdapter):
 
             trajs_3d_world = np.stack(traj_3d_list, axis=0)  # (T, N, 3)
             trajs_2d = np.stack(traj_2d_list, axis=0)        # (T, N, 2)
-            visibs = np.stack(vis_list, axis=0)               # (T, N)
-            valids = visibs.copy()                            # visible = valid
+            raw_vis = np.stack(vis_list, axis=0)              # (T, N) bool, occlusion-free per raycast
+
+            # valids: independent geometric validity — has finite 2D coord, finite 3D world coord,
+            #   and 2D projection lands inside the image frame. Used as the BCE loss mask.
+            H, W = r.image_size
+            in_bounds = (
+                (trajs_2d[..., 0] >= 0) & (trajs_2d[..., 0] < W) &
+                (trajs_2d[..., 1] >= 0) & (trajs_2d[..., 1] < H)
+            )
+            finite_2d = np.isfinite(trajs_2d).all(axis=-1)
+            finite_3d = np.isfinite(trajs_3d_world).all(axis=-1)
+            valids = finite_2d & finite_3d & in_bounds
+
+            # visibs: a point is "visible" iff (raycast says not occluded) AND (in-frame).
+            # Out-of-frame raycast hits default to True in the raw label, so we must AND inbounds.
+            visibs = raw_vis & in_bounds
 
         raw_depths = [_load_depth_raw(p) for p in dep_paths]
 

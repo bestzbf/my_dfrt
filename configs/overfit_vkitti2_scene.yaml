@@ -1,0 +1,19 @@
+mode: scene
+name: vkitti2
+root: /tmp/vkitti_test
+sequences:
+  - Scene01_clone
+adapter_kwargs:
+  precompute_root: /tmp/vkitti_test
+
+clip_len: 48
+img_size: 256
+num_queries: 2048
+use_augs: false
+boundary_ratio: 0.3
+t_tgt_eq_t_cam_ratio: 0.4
+seed: 42
+allow_track_fallback: true
+precompute_patches: false
+precompute_from_highres: false
+index_cache_dir: /data/zbf/openclaw/d4rt/.index_cache_5datasets_local

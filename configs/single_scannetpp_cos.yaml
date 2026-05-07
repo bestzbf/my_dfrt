@@ -1,0 +1,25 @@
+mode: mixture
+datasets:
+  - name: scannetpp
+    root: /data_cos/hdu_datasets/scannetpp/data
+    split: train
+    weight: 1.0
+    adapter_kwargs:
+      splits_dir: /data_cos/hdu_datasets/scannetpp/splits
+      target_hw: [256, 256]
+
+index_cache_dir: /data1/zbf/my_dfrt/.index_cache
+clip_len: 8
+img_size: 256
+num_queries: 2048
+use_augs: false
+boundary_ratio: 0.3
+t_tgt_eq_t_cam_ratio: 0.4
+seed: 42
+
+sample_stage_backend: cos_sdk
+sample_stage_mount_root: /data_cos
+sample_stage_bucket: hd-ai-data-1251882982
+sample_stage_region: ap-beijing
+sample_stage_passwd_file: /etc/passwd-s3fs-data_cos
+sample_stage_enabled_datasets: scannetpp

@@ -636,6 +636,9 @@ class Co3Dv2Adapter(BaseAdapter):
         max_sequences_per_category: Optional[int] = None,
         sequence_allowlist: Optional[Any] = None,
         sequence_denylist: Optional[Any] = None,
+        index_workers: int = 8,
+        io_workers: int = 2,
+        load_normals: bool = True,
     ) -> None:
         """
         Parameters
@@ -687,6 +690,16 @@ class Co3Dv2Adapter(BaseAdapter):
             Optional list / JSON / text file of sequence names. Entries may be
             bare sequence names (``seq123``) or full UIDs
             (``category/seq123``).
+        index_workers :
+            Number of threads for parallel category indexing in
+            ``_build_index``.  Each category is processed independently.
+            Set to 1 to disable threading.  Defaults to 8.
+        io_workers :
+            Number of per-sample threads used to read RGB/depth/mask frames.
+            Keep this small when many builder processes run in parallel.
+        load_normals :
+            Load normals from Co3D precomputed files. Disable when normal loss
+            is not used; track supervision remains available.
         """
         self.root = Path(root)
         if not self.root.exists():
@@ -719,12 +732,15 @@ class Co3Dv2Adapter(BaseAdapter):
         self.require_pointcloud = bool(require_pointcloud)
         self.require_precomputed = bool(require_precomputed)
         self.max_sequences_per_category = _safe_int(max_sequences_per_category)
+        self.io_workers = max(1, int(io_workers))
+        self.load_normals = bool(load_normals)
         if self.quality_probe_frames < 1:
             raise ValueError("quality_probe_frames must be >= 1")
         if self.max_sequences_per_category is not None and self.max_sequences_per_category < 1:
             raise ValueError("max_sequences_per_category must be >= 1")
         self._sequence_allow_uids, self._sequence_allow_names = _parse_sequence_filter(sequence_allowlist)
         self._sequence_deny_uids, self._sequence_deny_names = _parse_sequence_filter(sequence_denylist)
+        self.index_workers = int(index_workers)
         self._filter_summary: dict[str, Any] = {}
 
         # category → {(seq_name, frame_number): frame_annotation_dict}
@@ -742,6 +758,24 @@ class Co3Dv2Adapter(BaseAdapter):
         self._frame_anno_npz_dir: Optional[Path] = (
             Path(cache_dir) / "co3dv2_frame_anno" if cache_dir is not None else None
         )
+        self._frame_anno_npz_paths: dict[str, Path] = {}
+        if self._frame_anno_npz_dir is not None and self._frame_anno_npz_dir.exists():
+            for npz_path in self._frame_anno_npz_dir.glob("frame_anno_*.npz"):
+                stem = npz_path.stem
+                prefix = "frame_anno_"
+                if not stem.startswith(prefix):
+                    continue
+                suffix = stem[len(prefix):]
+                category = suffix.rsplit("_", 1)[0]
+                # Newer cache builders append a content hash
+                # (frame_anno_<category>_<hash>.npz), while older code looked
+                # for frame_anno_<category>_v1.npz.  Keep one deterministic
+                # path per category and let the exact v1 name override below.
+                self._frame_anno_npz_paths.setdefault(category, npz_path)
+            for category in self.categories:
+                exact = self._frame_anno_npz_dir / f"frame_anno_{category}_v1.npz"
+                if exact.exists():
+                    self._frame_anno_npz_paths[category] = exact
         # category → loaded NpzFile (lazy, kept open; OS page-cache means hot reads ~0.2 ms)
         self._frame_anno_npz: dict[str, Any] = {}
 
@@ -825,7 +859,7 @@ class Co3Dv2Adapter(BaseAdapter):
             has_precomputed = has_precomputed or track_has_precomputed
 
         has_tracks = track_has_precomputed or (base_has_precomputed and not track_failure_marker)
-        has_normals = has_precomputed
+        has_normals = has_precomputed and self.load_normals
 
         return {
             "dataset_name": self.dataset_name,
@@ -902,7 +936,7 @@ class Co3Dv2Adapter(BaseAdapter):
             return img, dep, (H, W), K, E, str(self.root / anno["image"]["path"]), fn
 
         from concurrent.futures import ThreadPoolExecutor
-        with ThreadPoolExecutor(max_workers=min(len(frame_indices), 8)) as ex:
+        with ThreadPoolExecutor(max_workers=min(len(frame_indices), self.io_workers)) as ex:
             rows = list(ex.map(_load_one, frame_indices))
         (images, depths, image_sizes,
          intrinsics_list, extrinsics_list,
@@ -962,7 +996,7 @@ class Co3Dv2Adapter(BaseAdapter):
                 "a valid overlay precomputed.npz exists."
             )
 
-        if base_cache is not None:
+        if base_cache is not None and self.load_normals:
             # Load normals lazily: only when the base precomputed file is
             # actually the selected source (i.e. no track_cache overlay or
             # track_failure_marker).  Normals are the largest array in the npz
@@ -1060,7 +1094,10 @@ class Co3Dv2Adapter(BaseAdapter):
                 "has_depth": True,
                 "has_normals": has_normals_out,
                 "has_tracks": has_tracks_out,
-                "has_visibility": has_tracks_out,
+                # Precomputed Co3Dv2 tracks set visibs == valids (no real
+                # per-frame occlusion). Disable visibility BCE supervision until
+                # tracks are recomputed with a real occlusion signal.
+                "has_visibility": False,
                 "has_trajs_3d_world": has_tracks_out,
                 "normal_convention": "camera_space_opencv_towards_camera" if has_normals_out else None,
                 "normal_supervision_compatible": has_normals_out,
@@ -1416,6 +1453,8 @@ class Co3Dv2Adapter(BaseAdapter):
     # ------------------------------------------------------------------
 
     def _build_index(self) -> list[_Co3DSequenceRecord]:
+        from concurrent.futures import ThreadPoolExecutor, as_completed
+
         file_suffix, split_key = _SUBSET_MAP[self.subset_name]
         records: list[_Co3DSequenceRecord] = []
         skipped_cats: list[str] = []
@@ -1423,6 +1462,9 @@ class Co3Dv2Adapter(BaseAdapter):
         per_category: dict[str, dict[str, Any]] = {}
         total_seen = 0
 
+        # Phase 1: collect valid (cat, cat_dir, set_lists_path) tuples.
+        # Path validation is cheap even on COS — only 2 stat() per category.
+        category_tasks: list[tuple[str, Path, Path, str]] = []
         for cat in self.categories:
             cat_dir = self.root / cat
             if not cat_dir.is_dir():
@@ -1440,21 +1482,50 @@ class Co3Dv2Adapter(BaseAdapter):
                 skipped_cats.append(f"{cat}: {msg}")
                 continue
 
+            category_tasks.append((cat, cat_dir, set_lists_path, split_key))
+
+        # Phase 2: index each category (heavy I/O — parallelise).
+        def _process_category(
+            args: tuple[str, Path, Path, str],
+        ) -> tuple[str, list[_Co3DSequenceRecord], dict[str, Any], Optional[Exception]]:
+            cat, cat_dir, slp, sk = args
             try:
-                cat_records, cat_stats = self._index_category(
-                    cat, cat_dir, set_lists_path, split_key
-                )
+                cat_records, cat_stats = self._index_category(cat, cat_dir, slp, sk)
+                return cat, cat_records, cat_stats, None
+            except Exception as exc:
+                return cat, [], {}, exc
+
+        n_workers = min(self.index_workers, len(category_tasks))
+        # Collect results into a list first, then aggregate — avoids
+        # mutating shared locals (total_seen, dropped_by_reason) from threads.
+        category_results: list[tuple[str, list[_Co3DSequenceRecord], dict[str, Any], Optional[Exception]]] = []
+
+        if n_workers > 1:
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                futures = {
+                    executor.submit(_process_category, task): task[0]
+                    for task in category_tasks
+                }
+                for fut in as_completed(futures):
+                    category_results.append(fut.result())
+        else:
+            for task in category_tasks:
+                category_results.append(_process_category(task))
+
+        # Phase 3: aggregate results (single-threaded, safe).
+        for cat, cat_records, cat_stats, exc in category_results:
+            if exc is not None:
+                if self.strict:
+                    raise exc
+                skipped_cats.append(f"{cat}: {exc}")
+                if self.verbose:
+                    print(f"[Co3Dv2Adapter][WARN] skip category {cat}: {exc}")
+            else:
                 records.extend(cat_records)
                 per_category[cat] = cat_stats
                 total_seen += int(cat_stats["seen"])
                 for reason, count in cat_stats["dropped"].items():
                     dropped_by_reason[reason] = dropped_by_reason.get(reason, 0) + int(count)
-            except Exception as exc:
-                if self.strict:
-                    raise
-                skipped_cats.append(f"{cat}: {exc}")
-                if self.verbose:
-                    print(f"[Co3Dv2Adapter][WARN] skip category {cat}: {exc}")
 
         if self.verbose and skipped_cats:
             print(
@@ -1655,10 +1726,8 @@ class Co3Dv2Adapter(BaseAdapter):
 
         # ── Fast path: pre-built stacked npz ──────────────────────────────
         if self._frame_anno_npz_dir is not None:
-            # Direct path construction instead of glob to avoid hot-path I/O
-            # Expected cache structure: frame_anno_{category}_v1.npz
-            npz_path = self._frame_anno_npz_dir / f"frame_anno_{category}_v1.npz"
-            if npz_path.exists():
+            npz_path = self._frame_anno_npz_paths.get(category)
+            if npz_path is not None and npz_path.exists():
                 if category not in self._frame_anno_npz:
                     # np.load without mmap: all arrays land in RAM (~23 ms for
                     # apple with 163 K frames, 13 MB).  Random index then costs

@@ -88,7 +88,7 @@ def load_precomputed_fast(
             if k in _skip:
                 continue
             arr = raw[k]
-            if arr.ndim >= 1 and arr.shape[0] > 1:
+            if arr.ndim >= 1 and arr.shape[0] > 1 and k not in ('origin_shift',):
                 result[k] = arr[np.array(frame_indices)]
             else:
                 result[k] = arr[()]

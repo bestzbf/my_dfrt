@@ -7,7 +7,15 @@ from typing import Any, Optional
 
 import numpy as np
 
+from datasets.computer.depth_to_tracks import (
+    TRACK_SEMANTICS_VERSION,
+    recompute_track_projection_masks,
+)
+
 from .base import BaseAdapter, UnifiedClip
+
+
+MVSSYNTH_TRACK_DEPTH_MAX_M = 100.0
 
 
 # ---------------------------------------------------------------------------
@@ -127,6 +135,9 @@ class MVSSynthAdapter(BaseAdapter):
         strict: bool = True,
         verbose: bool = True,
         precompute_root: Optional[str] = None,
+        load_normals: bool = False,
+        cache_dir: Optional[str] = None,
+        **kwargs,
     ):
         """
         Parameters
@@ -140,8 +151,12 @@ class MVSSynthAdapter(BaseAdapter):
             If False, skip broken sequences with a warning.
         verbose :
             Print summary after index construction.
+        load_normals :
+            If True, load precomputed full-resolution normal maps. Defaults to
+            False because MVS-Synth normals are large and slow to slice from
+            COS-backed HDF5; tracks remain enabled either way.
         """
-        self.split = split  # Store but don't use
+        self.split = split
         self.root = Path(root)
         if not self.root.exists():
             raise FileNotFoundError(f"MVS-Synth root not found: {self.root}")
@@ -149,11 +164,25 @@ class MVSSynthAdapter(BaseAdapter):
         self.strict = strict
         self.verbose = verbose
         self.precompute_root = Path(precompute_root) if precompute_root else self.root
+        self.load_normals = bool(load_normals)
 
-        # Enable OpenEXR support in OpenCV
         os.environ.setdefault("OPENCV_IO_ENABLE_OPENEXR", "1")
 
-        self._records: list[_SequenceRecord] = self._build_index()
+        if cache_dir is not None:
+            import hashlib, json as _json
+            from datasets.index_cache import load_or_build
+            cache_key = {
+                "dataset": self.dataset_name,
+                "split": self.split,
+                "cache_schema": 1,
+            }
+            suffix = hashlib.sha1(
+                _json.dumps(cache_key, sort_keys=True).encode()
+            ).hexdigest()[:12]
+            cache_path = Path(cache_dir) / f"{self.dataset_name}_{self.split}_{suffix}.pkl"
+            self._records = load_or_build(self._build_index, cache_path)
+        else:
+            self._records = self._build_index()
         self._name_to_record: dict[str, _SequenceRecord] = {
             r.sequence_id: r for r in self._records
         }
@@ -209,6 +238,9 @@ class MVSSynthAdapter(BaseAdapter):
             "depth_unit": "meters",
         }
 
+    def get_num_frames(self, sequence_name: str) -> int:
+        return self._get_record(sequence_name).num_frames
+
     def load_clip(
         self, sequence_name: str, frame_indices: list[int]
     ) -> UnifiedClip:
@@ -226,7 +258,8 @@ class MVSSynthAdapter(BaseAdapter):
         UnifiedClip
             Unified intermediate representation.
             ``normals``, ``trajs_2d``, ``trajs_3d_world``, ``valids``,
-            and ``visibs`` are all ``None``.
+            and ``visibs`` are loaded from precomputed cache when available;
+            otherwise they are ``None``.
         """
         r = self._get_record(sequence_name)
         self._check_indices(frame_indices, r.num_frames, sequence_name)
@@ -236,6 +269,22 @@ class MVSSynthAdapter(BaseAdapter):
         intrinsics_list: list[np.ndarray] = []
         extrinsics_list: list[np.ndarray] = []
         frame_paths: list[str] = []
+
+        # GTA V uses a left-handed world coordinate system
+        # (X=right, Y=forward, Z=up, det(R)=-1).
+        # Convert to a right-handed OpenCV-compatible world:
+        #   new_X = old_Y  (forward)
+        #   new_Y = -old_Z (down)
+        #   new_Z = old_X  (right)
+        # Basis-change matrix P (new_world = P @ old_world), det(P)=-1:
+        #   P = [[0,1,0],[0,0,-1],[1,0,0]]
+        # For a w2c matrix E=[R|t]:
+        #   E_new = E @ P^{-1} = E @ P^T
+        # det(R_new) = det(R)*det(P) = (-1)*(-1) = +1
+        # Camera axes in new world: cam_Y ≈ down, cam_Z ≈ forward (RDF).
+        P = np.array(
+            [[0, 1, 0], [0, 0, -1], [1, 0, 0]], dtype=np.float32
+        )
 
         for idx in frame_indices:
             img_path = r.image_path(idx)
@@ -264,59 +313,102 @@ class MVSSynthAdapter(BaseAdapter):
             E = np.array(pose["extrinsic"], dtype=np.float32)  # w2c
             # Translation is in centimeters; convert to meters
             E[:3, 3] /= 100.0
-            # GTA V uses a left-handed world coordinate system
-            # (X=right, Y=forward, Z=up, det(R)=-1).
-            # Convert to a right-handed OpenCV-compatible world:
-            #   new_X = old_Y  (forward)
-            #   new_Y = -old_Z (down)
-            #   new_Z = old_X  (right)
-            # Basis-change matrix P (new_world = P @ old_world), det(P)=-1:
-            #   P = [[0,1,0],[0,0,-1],[1,0,0]]
-            # For a w2c matrix E=[R|t]:
-            #   E_new = E @ P^{-1} = E @ P^T
-            # det(R_new) = det(R)*det(P) = (-1)*(-1) = +1
-            # Camera axes in new world: cam_Y ≈ down, cam_Z ≈ forward (RDF).
-            P = np.array(
-                [[0, 1, 0], [0, 0, -1], [1, 0, 0]], dtype=np.float32
-            )
             E[:3, :3] = E[:3, :3] @ P.T
             extrinsics_list.append(E)
 
         intrinsics = np.stack(intrinsics_list, axis=0)   # (T, 3, 3)
         extrinsics = np.stack(extrinsics_list, axis=0)   # (T, 4, 4) w2c
 
-        # Shift world origin to the first frame's camera center so that the
-        # scene is near the origin and rerun can auto-fit the 3-D view.
-        # Depth images live in camera space and are unaffected by this shift.
-        # For a w2c matrix E = [R | t]:  cam_center = E_inv[:3,3] = -R^T t
-        # After shifting by cam0:  new_t = t + R @ cam0  (reprojection unchanged)
-        E0_inv = np.linalg.inv(extrinsics[0].astype(np.float64))
-        cam0 = E0_inv[:3, 3].astype(np.float32)   # world-space camera center of frame 0
-        for i in range(len(extrinsics)):
-            extrinsics[i, :3, 3] += extrinsics[i, :3, :3] @ cam0
-
-        # Load precomputed normals / tracks if available
+        # Load precomputed normals / tracks if available.
+        # This must happen before origin shifting so that, for cached tracks,
+        # we can reuse the exact full-sequence frame-0 shift used at
+        # precompute time.  Sub-clips may start at a later frame.
         normals_out, trajs_2d_out, trajs_3d_out, valids_out, visibs_out = \
             None, None, None, None, None
         has_normals_out, has_tracks_out = False, False
+        precomputed_origin_shift: np.ndarray | None = None
+        precomputed_track_semantics_version: Optional[int] = None
+        active_track_semantics_version: Optional[int] = None
+        precomputed_track_semantics_refreshed = False
+        has_precomputed_cache = False
         if self.precompute_root is not None:
             cache = self._load_precomputed(sequence_name, frame_indices)
             if cache is not None:
-                normals_out     = [n.astype(np.float32) for n in cache["normals"]]
+                has_precomputed_cache = True
+                if self.load_normals and "normals" in cache:
+                    normals_out = [n.astype(np.float32) for n in cache["normals"]]
+                    has_normals_out = True
                 trajs_2d_out    = cache["trajs_2d"]
-                # trajs_3d_world stored in centimeters in the original GTA
-                # world (X=right, Y=forward, Z=up).  Apply the same P
-                # transform used for extrinsics (new_X=old_Y, new_Y=-old_Z,
-                # new_Z=old_X), then shift to the centered coordinate system.
-                t3d = cache["trajs_3d_world"].astype(np.float32) / 100.0
-                t3d = t3d[..., [1, 2, 0]] * np.array(
-                    [1.0, -1.0, 1.0], dtype=np.float32
-                )
-                trajs_3d_out    = t3d - cam0
+                # compute_tracks() receives already-converted data from this
+                # adapter: meters, right-handed world, and origin-shifted.  The
+                # cached 3-D tracks are therefore already in the same world
+                # space as the extrinsics below; applying the raw GTA unit/basis
+                # conversion again would corrupt them.
+                trajs_3d_out    = cache["trajs_3d_world"].astype(np.float32)
                 valids_out      = cache["valids"]
                 visibs_out      = cache["visibs"]
-                has_normals_out = True
+                raw_semantics_version = cache.get("track_semantics_version", 0)
+                precomputed_track_semantics_version = int(
+                    np.asarray(raw_semantics_version).item()
+                )
+                active_track_semantics_version = precomputed_track_semantics_version
                 has_tracks_out  = True
+                if "origin_shift" in cache:
+                    origin_shift = np.asarray(
+                        cache["origin_shift"], dtype=np.float32
+                    ).reshape(-1)
+                    if origin_shift.size != 3:
+                        raise RuntimeError(
+                            f"[{sequence_name}] invalid origin_shift shape in "
+                            f"precomputed cache: {origin_shift.shape}"
+                        )
+                    precomputed_origin_shift = origin_shift
+
+        # Shift world origin to a camera center so that the scene is near the
+        # origin and rerun can auto-fit the 3-D view.
+        # Depth images live in camera space and are unaffected by this shift.
+        # For a w2c matrix E = [R | t]:  cam_center = E_inv[:3,3] = -R^T t
+        # After shifting by cam0:  new_t = t + R @ cam0  (reprojection unchanged)
+        #
+        # Cached tracks are computed over the full sequence, whose first frame
+        # is frame 0.  When loading a sub-clip, use the same full-sequence shift
+        # instead of the sub-clip's first camera center.
+        if precomputed_origin_shift is not None:
+            cam0 = precomputed_origin_shift
+        elif has_precomputed_cache and frame_indices[0] != 0:
+            with open(r.pose_path(0), "r") as f:
+                pose0 = json.load(f)
+            E0 = np.array(pose0["extrinsic"], dtype=np.float32)
+            E0[:3, 3] /= 100.0
+            E0[:3, :3] = E0[:3, :3] @ P.T
+            cam0 = np.linalg.inv(E0.astype(np.float64))[:3, 3].astype(np.float32)
+        else:
+            E0_inv = np.linalg.inv(extrinsics[0].astype(np.float64))
+            cam0 = E0_inv[:3, 3].astype(np.float32)
+        for i in range(len(extrinsics)):
+            extrinsics[i, :3, 3] += extrinsics[i, :3, :3] @ cam0
+
+        # Old MVS-Synth caches predate the current track semantics: they often
+        # have visibs == valids and retain very far projected points.  Refresh
+        # from depth so valids mean "label defined", visibs mean "visible", and
+        # the dataset-level p99.5-ish 100 m depth cap masks the extreme tail.
+        if (
+            trajs_3d_out is not None
+            and precomputed_track_semantics_version is not None
+            and precomputed_track_semantics_version < TRACK_SEMANTICS_VERSION
+        ):
+            refreshed = recompute_track_projection_masks(
+                depths=depths,
+                intrinsics=intrinsics,
+                extrinsics=extrinsics,
+                trajs_3d_world=trajs_3d_out,
+                depth_max=MVSSYNTH_TRACK_DEPTH_MAX_M,
+            )
+            trajs_2d_out = refreshed["trajs_2d"]
+            valids_out = refreshed["valids"]
+            visibs_out = refreshed["visibs"]
+            active_track_semantics_version = TRACK_SEMANTICS_VERSION
+            precomputed_track_semantics_refreshed = True
 
         return UnifiedClip(
             dataset_name=self.dataset_name,
@@ -345,10 +437,18 @@ class MVSSynthAdapter(BaseAdapter):
                 "pose_convention": "w2c",
                 "extrinsics_convention": "w2c",
                 "intrinsics_convention": "pinhole",
+                "precomputed_track_semantics_version": precomputed_track_semantics_version,
+                "track_semantics_version": active_track_semantics_version,
+                "precomputed_track_semantics_refreshed": precomputed_track_semantics_refreshed,
+                "track_depth_max_m": MVSSYNTH_TRACK_DEPTH_MAX_M,
                 "depth_unit": "meters",
                 "depth_note": (
                     "OpenEXR float32; inf values converted to 0 (invalid/sky)"
                 ),
+                # Camera center used for the origin shift, in pre-shift world
+                # coordinates.  Saved into precomputed caches so sub-clips can
+                # keep cached trajs_3d_world and extrinsics in the same frame.
+                "origin_shift": cam0.tolist(),
             },
         )
 
@@ -367,7 +467,8 @@ class MVSSynthAdapter(BaseAdapter):
             n = int(np.load(path, allow_pickle=False)["num_frames"])
         if n < max(frame_indices) + 1:
             return None
-        return load_precomputed_fast(path, frame_indices)
+        skip_keys = set() if self.load_normals else {"normals"}
+        return load_precomputed_fast(path, frame_indices, skip_keys=skip_keys)
 
     def sanity_check(self, sequence_name: str) -> dict[str, Any]:
         """Run consistency checks on a sequence.
@@ -544,6 +645,31 @@ class MVSSynthAdapter(BaseAdapter):
 
         records: list[_SequenceRecord] = []
         skipped: list[str] = []
+
+        if num_images_list is not None:
+            # COS directory stat/list calls are expensive.  The official
+            # num_images.json already defines the compact 0000..0119 index, so
+            # build records from it and let load_clip report any missing files.
+            for seq_idx, num_frames in enumerate(num_images_list):
+                seq_id = f"{seq_idx:04d}"
+                if int(num_frames) <= 0:
+                    if self.strict:
+                        raise RuntimeError(f"No frames found in {self.root / seq_id}")
+                    skipped.append(f"{seq_id}: no frames")
+                    continue
+                records.append(
+                    _SequenceRecord(
+                        sequence_id=seq_id,
+                        sequence_dir=self.root / seq_id,
+                        num_frames=int(num_frames),
+                    )
+                )
+            if self.verbose and skipped:
+                print(
+                    f"[MVSSynthAdapter] skipped {len(skipped)} sequences "
+                    "(non-strict mode)"
+                )
+            return records
 
         # Enumerate sequence directories (0000, 0001, ..., 0119)
         for seq_dir in sorted(self.root.iterdir()):

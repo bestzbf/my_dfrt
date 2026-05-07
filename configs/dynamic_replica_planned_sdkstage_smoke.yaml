@@ -1,0 +1,37 @@
+mode: mixture
+datasets:
+  - name: dynamic_replica
+    root: /data_cos/hdu_datasets/Dynamic_Replica
+    weight: 1.0
+
+clip_len: 48
+img_size: 256
+num_queries: 2048
+use_augs: true
+boundary_ratio: 0.3
+t_tgt_eq_t_cam_ratio: 0.4
+seed: 42
+allow_track_fallback: true
+
+precompute_patches: false
+precompute_from_highres: false
+
+index_cache_dir: /data1/zbf/my_dfrt/.index_cache_dynamic_replica_smoke
+index_workers: 16
+
+planned_mode: true
+builder_workers: 1
+prefetch_depth: 1
+max_spool_bytes: 8589934592
+
+sample_stage_backend: cos_sdk
+sample_stage_root: /data1/zbf/d4rt_sample_stage_smoke
+sample_stage_sdk_workers: 8
+sample_stage_cache_max_bytes: 8589934592
+sample_stage_window_radius: 0
+sample_stage_datasets:
+  - dynamic_replica
+sample_stage_mount_root: /data_cos
+sample_stage_bucket: hd-ai-data-1251882982
+sample_stage_region: ap-beijing
+sample_stage_passwd_file: /etc/passwd-s3fs-data_cos

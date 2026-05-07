@@ -457,6 +457,40 @@ def _load_depth_frames_indexed(depth_path: Path, frame_indices: list[int], chunk
     return [idx_map[fi] for fi in frame_indices]
 
 
+def _load_depth_frames_cos_range(
+    cos_client: Any,
+    bucket: str,
+    depth_key: str,
+    frame_indices: list[int],
+    chunk_offsets: list[tuple[int, int]],
+) -> list[np.ndarray]:
+    """Fetch only the needed depth chunks via COS Range requests."""
+    import lz4.block
+    from concurrent.futures import ThreadPoolExecutor
+
+    needed = sorted(set(frame_indices))
+
+    def fetch_one(fi: int) -> tuple[int, np.ndarray]:
+        offset, chunk_size = chunk_offsets[fi]
+        # offset points to chunk data (after 4-byte header), so byte range is [offset, offset+chunk_size-1]
+        range_header = f"bytes={offset}-{offset + chunk_size - 1}"
+        resp = cos_client.get_object(Bucket=bucket, Key=depth_key, Range=range_header)
+        chunk = resp["Body"].get_raw_stream().read()
+        try:
+            dec = lz4.block.decompress(chunk, uncompressed_size=_DEPTH_H * _DEPTH_W * 2)
+            depth = np.frombuffer(dec, dtype=np.uint16).reshape(_DEPTH_H, _DEPTH_W).astype(np.float32) / 1000.0
+        except Exception:
+            import zlib
+            dec = zlib.decompress(chunk, wbits=-zlib.MAX_WBITS)
+            depth = np.frombuffer(dec, dtype=np.float32).reshape(_DEPTH_H, _DEPTH_W)
+        return fi, depth.copy()
+
+    with ThreadPoolExecutor(max_workers=min(16, len(needed))) as ex:
+        idx_map = dict(ex.map(lambda fi: fetch_one(fi), needed))
+
+    return [idx_map[fi] for fi in frame_indices]
+
+
 def _extract_video_frames_by_timestamps(video_path: Path, relative_timestamps: list[float], fallback_indices: list[int]) -> list[np.ndarray]:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -529,7 +563,9 @@ class ScanNetPPAdapter(BaseAdapter):
         precomputed_name: str = "precomputed.npz",
         splits_dir: Optional[str] = None,
         split_file: Optional[str] = None,
+        scenes_record: Optional[str] = None,
         cache_dir: Optional[str] = None,
+        index_workers: int = 8,
         **kwargs,
     ):
         self.split = split
@@ -538,20 +574,27 @@ class ScanNetPPAdapter(BaseAdapter):
         self.verbose = verbose
         self.strict = strict
         self.precomputed_name = precomputed_name
+        self.index_workers = index_workers
         self.splits_dir = Path(splits_dir) if splits_dir is not None else self.root / "splits"
         self.split_file = split_file
+        self.scenes_record_path = (
+            Path(scenes_record)
+            if scenes_record is not None
+            else self.root.parent / "scenes_record.json"
+        )
         self.data_root = self._resolve_data_root()
 
         if cache_dir is not None:
             from datasets.index_cache import load_or_build
             cache_key = {
                 "dataset": self.dataset_name,
+                "data_root": str(self.data_root),
                 "split": self.split,
-                "root": str(self.data_root.resolve()),
-                "splits_dir": str(self.splits_dir.resolve()),
                 "split_file": self.split_file,
+                "splits_dir": str(self.splits_dir),
                 "precomputed_name": self.precomputed_name,
-                "cache_schema": 2,  # bumped: now stores (name, num_frames) tuples
+                "scenes_record": str(self.scenes_record_path),
+                "cache_schema": 4,
             }
             cache_suffix = hashlib.sha1(
                 json.dumps(cache_key, sort_keys=True).encode("utf-8")
@@ -580,7 +623,9 @@ class ScanNetPPAdapter(BaseAdapter):
         if scene_name in self._precomputed_info_cache:
             return self._precomputed_info_cache[scene_name]
 
-        scene_dir = self.data_root / scene_name
+        # Use _precomputed_dir if set (during staging, data_root points to staged path)
+        sd = self._scene_cache.get(scene_name)
+        scene_dir = sd.get("_precomputed_dir", self.data_root / scene_name) if sd else self.data_root / scene_name
         npz_path = self._precomputed_npz_path(scene_dir)
         h5_path = self._precomputed_h5_path(scene_dir)
 
@@ -609,6 +654,9 @@ class ScanNetPPAdapter(BaseAdapter):
         return info
 
     def _resolve_data_root(self) -> Path:
+        # Fast path: if root itself looks like a data dir (or strict=False), skip iterdir scan
+        if not self.strict and self.root.exists():
+            return self.root
         candidates = [self.root]
         sibling = self.root.parent / "data"
         if sibling != self.root:
@@ -617,7 +665,7 @@ class ScanNetPPAdapter(BaseAdapter):
             if not cand.exists():
                 continue
             for p in cand.iterdir():
-                if p.is_dir() and (p / "iphone" / "colmap" / "images.txt").exists() and (p / "iphone" / "pose_intrinsic_imu.json").exists():
+                if p.is_dir() and (p / "iphone" / "colmap" / "images.txt").exists():
                     return cand
         if not self.strict:
             return self.root
@@ -641,6 +689,30 @@ class ScanNetPPAdapter(BaseAdapter):
 
         return None
 
+    def _load_scenes_record_index(self) -> dict[str, int]:
+        """Load optional ScanNet++ preprocessing manifest as scene -> frame count."""
+        path = self.scenes_record_path
+        if not path.exists():
+            return {}
+        records: dict[str, int] = {}
+        try:
+            for raw_line in path.read_text().splitlines():
+                line = raw_line.strip()
+                if not line:
+                    continue
+                item = json.loads(line)
+                if str(item.get("status", "ok")) != "ok":
+                    continue
+                scene = item.get("scene_name")
+                num_frames = int(item.get("num_frames", 0))
+                if scene and num_frames > 0:
+                    records[str(scene)] = num_frames
+        except Exception:
+            if self.strict:
+                raise
+            return {}
+        return records
+
     def _build_index(self) -> list[tuple[str, int]]:
         """Return list of (scene_name, num_frames) for all valid scenes in this split."""
         results: list[tuple[str, int]] = []
@@ -649,17 +721,60 @@ class ScanNetPPAdapter(BaseAdapter):
                 raise RuntimeError(f"Data root does not exist: {self.data_root}")
             return results
         allowlist = self._load_split_allowlist()
-        for p in sorted(self.data_root.iterdir()):
-            if not p.is_dir():
-                continue
-            if allowlist is not None and p.name not in allowlist:
-                continue
+
+        scene_dirs: list[Path] = []
+        if allowlist is not None:
+            # Use allowlist directly — avoids slow iterdir() on COS/FUSE mounts.
+            for name in sorted(allowlist):
+                p = self.data_root / name
+                scene_dirs.append(p)
+        else:
+            for p in sorted(self.data_root.iterdir()):
+                if p.is_dir():
+                    scene_dirs.append(p)
+
+        record_index = self._load_scenes_record_index() if allowlist is not None else {}
+        if record_index:
+            for p in scene_dirs:
+                num_frames = record_index.get(p.name)
+                if num_frames is not None:
+                    results.append((p.name, num_frames))
+            if results:
+                return results
+
+        def _index_one(p: Path):
+            import os as _os
+            trust_allowlist = _os.getenv("D4RT_SCANNETPP_TRUST_ALLOWLIST", "").strip().lower() in {"1", "true", "yes"}
+            if trust_allowlist and allowlist is not None:
+                try:
+                    sd = _join_frames(p)
+                    return (p.name, len(sd["frame_stems"]))
+                except Exception:
+                    return None
+            # Normal path: check files exist
             if (p / "iphone" / "colmap" / "images.txt").exists() and self._has_precomputed(p):
                 try:
                     sd = _join_frames(p)
-                    results.append((p.name, len(sd["frame_stems"])))
+                    return (p.name, len(sd["frame_stems"]))
                 except Exception:
-                    pass  # skip malformed scenes
+                    return None
+            return None
+
+        n_workers = min(self.index_workers, len(scene_dirs))
+        if n_workers > 1:
+            from concurrent.futures import ThreadPoolExecutor, as_completed
+            with ThreadPoolExecutor(max_workers=n_workers) as executor:
+                futures = [executor.submit(_index_one, p) for p in scene_dirs]
+                for fut in as_completed(futures):
+                    r = fut.result()
+                    if r is not None:
+                        results.append(r)
+        else:
+            for p in scene_dirs:
+                r = _index_one(p)
+                if r is not None:
+                    results.append(r)
+
         if len(results) == 0 and self.strict:
             raise RuntimeError(f"No valid ScanNet++ scenes under {self.data_root} (split={self.split})")
         return results
@@ -691,20 +806,26 @@ class ScanNetPPAdapter(BaseAdapter):
     def _get_depths(self, scene_name: str, frame_indices: list[int]) -> list[np.ndarray]:
         sd = self._get_scene_data(scene_name)
         depth_path = sd["scene_dir"] / "iphone" / "depth.bin"
-        # Map from COLMAP subset indices to full_indices (depth frame numbers).
         full_indices = sd["full_indices"][frame_indices].tolist()
+        # when staged, full_indices are remapped to staged chunk positions
+        staged_map = sd.get("_staged_depth_map")
+        if staged_map is not None:
+            remapped = [staged_map[fi] for fi in full_indices]
+            chunks = self._get_depth_chunks(scene_name)
+            return _load_depth_frames_indexed(depth_path, remapped, chunks)
         try:
             chunks = self._get_depth_chunks(scene_name)
             return _load_depth_frames_indexed(depth_path, full_indices, chunks)
         except Exception:
-            # Fallback: load all and index (original behavior).
             all_depths = _load_depth_bin_all(depth_path)
             return [all_depths[fi] for fi in full_indices]
 
     def _load_precomputed(self, scene_name: str, frame_indices: list[int]) -> dict[str, Any]:
         sd = self._get_scene_data(scene_name)
-        npz_path = sd["scene_dir"] / self.precomputed_name
-        cache = load_precomputed_fast(npz_path, frame_indices)
+        # _precomputed_dir points to original (non-staged) scene_dir when staged
+        precomputed_dir = sd.get("_precomputed_dir", sd["scene_dir"])
+        npz_path = precomputed_dir / self.precomputed_name
+        cache = load_precomputed_fast(npz_path, frame_indices, skip_keys={"normals"})
         if cache is None:
             raise FileNotFoundError(npz_path)
         required = ["trajs_2d", "trajs_3d_world", "valids", "visibs", "intrinsics", "extrinsics"]
@@ -762,8 +883,15 @@ class ScanNetPPAdapter(BaseAdapter):
         sy = tgt_h / float(native_h)
 
         fallback_indices = sd["full_indices"][frame_indices].tolist()
-        timestamps = [sd["timestamps"][i] for i in frame_indices]
-        raw_images = _extract_video_frames_by_timestamps(sd["scene_dir"] / "iphone" / "rgb.mkv", timestamps, fallback_indices)
+        frames_dir = sd["scene_dir"] / "iphone" / "frames"
+        if frames_dir.is_dir():
+            raw_images = [
+                cv2.cvtColor(cv2.imread(str(frames_dir / f"{i:06d}.jpg")), cv2.COLOR_BGR2RGB)
+                for i in frame_indices
+            ]
+        else:
+            timestamps = [sd["timestamps"][i] for i in frame_indices]
+            raw_images = _extract_video_frames_by_timestamps(sd["scene_dir"] / "iphone" / "rgb.mkv", timestamps, fallback_indices)
 
         images: list[np.ndarray] = []
         for image in raw_images:

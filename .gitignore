@@ -2,6 +2,10 @@
 .claude/
 .codex
 
+# Local editor state
+.vscode/
+.idea/
+
 # Python
 __pycache__/
 *.py[cod]
@@ -12,6 +16,11 @@ __pycache__/
 # Core dumps
 core.*
 
+# Local backup/sync snapshots
+.backup*/
+.sync*/
+*.bak
+
 # Datasets
 datasets1/
 
@@ -19,6 +28,20 @@ datasets1/
 outputs/
 vis_output/
 tmp/
+coscli_output/
+coscli.log
+*.log
+*.pth
+*.pt
+*.ckpt
+*.h5
+*.hdf5
+*.npy
+*.npz
+*.pkl
+*.pickle
+*.gif
+*.mp4
 
 # Config
 # configs/

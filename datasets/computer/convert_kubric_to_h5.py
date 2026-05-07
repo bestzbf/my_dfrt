@@ -32,12 +32,16 @@ import time
 import traceback
 from multiprocessing import Pool
 from pathlib import Path
+from typing import Literal
 
 import h5py
 import numpy as np
 
 
-def convert_one(npy_path: Path) -> str:
+CompressionMode = Literal["lzf", "none"]
+
+
+def convert_one(npy_path: Path, compression: CompressionMode = "lzf") -> str:
     h5_path = npy_path.with_suffix('.h5')
     if h5_path.exists():
         return f"SKIP  {npy_path.stem}"
@@ -51,19 +55,20 @@ def convert_one(npy_path: Path) -> str:
         visibility_nt   = np.asarray(ann["visibility"], dtype=bool)         # [N,T]
 
         # Transpose to [T,N,*] for per-frame chunking
-        trajs_2d     = np.transpose(coords_nt2, (1, 0, 2))       # [T,N,2]
-        coords_depth = np.transpose(coords_depth_nt, (1, 0))     # [T,N]
-        visibility   = np.transpose(visibility_nt, (1, 0))       # [T,N]
+        trajs_2d     = np.ascontiguousarray(np.transpose(coords_nt2, (1, 0, 2)))   # [T,N,2]
+        coords_depth = np.ascontiguousarray(np.transpose(coords_depth_nt, (1, 0))) # [T,N]
+        visibility   = np.ascontiguousarray(np.transpose(visibility_nt, (1, 0)))   # [T,N]
 
         T = trajs_2d.shape[0]
+        h5_compression = None if compression == "none" else compression
 
         with h5py.File(h5_path, 'w') as f:
             f.create_dataset('trajs_2d',     data=trajs_2d,
-                             chunks=(1, trajs_2d.shape[1], 2), compression='lzf')
+                             chunks=(1, trajs_2d.shape[1], 2), compression=h5_compression)
             f.create_dataset('coords_depth', data=coords_depth,
-                             chunks=(1, coords_depth.shape[1]), compression='lzf')
+                             chunks=(1, coords_depth.shape[1]), compression=h5_compression)
             f.create_dataset('visibility',   data=visibility,
-                             chunks=(1, visibility.shape[1]), compression='lzf')
+                             chunks=(1, visibility.shape[1]), compression=h5_compression)
             f.create_dataset('num_frames', data=np.int64(T))
 
         elapsed = time.perf_counter() - t0
@@ -76,14 +81,25 @@ def convert_one(npy_path: Path) -> str:
         return f"ERR   {npy_path.stem}: {e}\n{traceback.format_exc()}"
 
 
-def _worker(path_str: str) -> str:
-    return convert_one(Path(path_str))
+def _worker(args: tuple[str, CompressionMode]) -> str:
+    path_str, compression = args
+    return convert_one(Path(path_str), compression=compression)
+
+
+def _progress_iter(iterable, total: int):
+    try:
+        from tqdm import tqdm
+    except Exception:
+        return iterable
+    return tqdm(iterable, total=total, unit="file", dynamic_ncols=True)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Convert Kubric .npy → .h5")
     parser.add_argument('--root', required=True)
     parser.add_argument('--workers', type=int, default=8)
+    parser.add_argument('--chunksize', type=int, default=4)
+    parser.add_argument('--compression', choices=('lzf', 'none'), default='lzf')
     parser.add_argument('--overwrite', action='store_true')
     args = parser.parse_args()
 
@@ -110,21 +126,25 @@ def main() -> None:
     total_gb = sum(os.path.getsize(p) for p in npy_files) / 1e9
     print(f"Found {len(npy_files)} annotation .npy files  ({total_gb:.1f} GB total)")
     print(f"Workers: {args.workers}")
+    print(f"Chunksize: {args.chunksize}")
+    print(f"Compression: {args.compression}")
     print()
 
     t_start = time.perf_counter()
     n = len(npy_files)
     done = 0
+    worker_args = [(str(p), args.compression) for p in npy_files]
 
     if args.workers > 1:
         with Pool(args.workers) as pool:
-            for result in pool.imap_unordered(_worker, [str(p) for p in npy_files]):
+            results = pool.imap_unordered(_worker, worker_args, chunksize=max(1, args.chunksize))
+            for result in _progress_iter(results, n):
                 done += 1
                 print(f"[{done:4d}/{n}] {result}", flush=True)
     else:
         for npy in npy_files:
             done += 1
-            print(f"[{done:4d}/{n}] {convert_one(npy)}", flush=True)
+            print(f"[{done:4d}/{n}] {convert_one(npy, compression=args.compression)}", flush=True)
 
     print(f"\nDone in {time.perf_counter() - t_start:.1f}s")
 

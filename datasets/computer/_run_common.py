@@ -68,21 +68,27 @@ def _process_sequence(args: tuple) -> tuple[str, str | None]:
 
         # ---- save ----
         out_path.parent.mkdir(parents=True, exist_ok=True)
-        np.savez_compressed(
-            out_path,
-            normals         = normals.astype(np.float16),   # [T,H,W,3] half to save space
-            trajs_2d        = tracks["trajs_2d"].astype(np.float32),
-            trajs_3d_world  = tracks["trajs_3d_world"].astype(np.float32),
-            valids          = tracks["valids"],
-            visibs          = tracks["visibs"],
-            ref_frame       = np.array(tracks["ref_frame"],  dtype=np.int32),
-            num_frames      = np.array(num_frames,           dtype=np.int32),
-            num_points      = np.array(tracks["num_points"], dtype=np.int32),
-            track_semantics_version = np.array(
+        save_kwargs = {
+            "normals": normals.astype(np.float16),   # [T,H,W,3] half to save space
+            "trajs_2d": tracks["trajs_2d"].astype(np.float32),
+            "trajs_3d_world": tracks["trajs_3d_world"].astype(np.float32),
+            "valids": tracks["valids"],
+            "visibs": tracks["visibs"],
+            "ref_frame": np.array(tracks["ref_frame"], dtype=np.int32),
+            "num_frames": np.array(num_frames, dtype=np.int32),
+            "num_points": np.array(tracks["num_points"], dtype=np.int32),
+            "track_semantics_version": np.array(
                 tracks.get("track_semantics_version", 0),
                 dtype=np.int32,
             ),
-        )
+        }
+        origin_shift = clip.metadata.get("origin_shift")
+        if origin_shift is not None:
+            origin_shift = np.asarray(origin_shift, dtype=np.float32).reshape(-1)
+            if origin_shift.size == 3:
+                save_kwargs["origin_shift"] = origin_shift
+
+        np.savez_compressed(out_path, **save_kwargs)
         return seq_name, None
 
     except Exception:

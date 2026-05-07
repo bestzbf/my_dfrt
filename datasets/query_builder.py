@@ -217,12 +217,15 @@ _DATASET_Z_MAX: dict[str, float] = {
     #   co3dv2:         任意坐标单位，14% 有效点 Z>20 → 50 保守上限
     #   blendedmvs:     rendered depth, 场景尺度差异极大（室内 ~1m 到室外 ~468m）
     #                   35% 场景 max>20m, p99 ≈ 448m, max=468m → 500 覆盖全部
+    #   mvssynth:       GTA-V outdoor depth, sampled raw depth p99.5 ≈ 93m,
+    #                   long tail can reach 650m → 100m keeps main geometry
     "pointodyssey":    12.0,
     "kubric":          55.0,
     "dynamic_replica": 12.0,
     "scannet":          5.0,
     "co3dv2":          50.0,
     "blendedmvs":     500.0,
+    "mvssynth":       100.0,
 }
 _DEFAULT_Z_MAX = 20.0   # fallback for unknown datasets
 
@@ -337,8 +340,17 @@ class D4RTQueryBuilder:
                         f"({ch_actual}, {cw_actual})."
                     )
             if ch_actual != result.img_size or cw_actual != result.img_size:
+                # Store high-res crops compactly in the planned spool.  They are
+                # converted back to floating point in model._prepare_query_frames.
+                # This avoids writing hundreds of MB of float32 video per sample.
                 highres_video = torch.stack(
-                    [torch.from_numpy(img).permute(2, 0, 1) for img in result.cropped_images], dim=0
+                    [
+                        torch.from_numpy(
+                            np.clip(img * 255.0, 0.0, 255.0).astype(np.uint8)
+                        ).permute(2, 0, 1)
+                        for img in result.cropped_images
+                    ],
+                    dim=0,
                 )
 
         # ---- boundary masks（在 crop 分辨率下计算） ----
@@ -470,6 +482,7 @@ class D4RTQueryBuilder:
         T, N        = trajs_2d.shape[:2]
         cw, ch      = result.crop.crop_w, result.crop.crop_h
         S           = result.img_size
+        z_max       = self._get_z_max(result.dataset_name)
 
         targets = _build_empty_targets(self.num_queries)
 
@@ -491,7 +504,7 @@ class D4RTQueryBuilder:
                                      np.ones((N, 1), dtype=np.float32)], axis=-1)  # [N,4]
             cam_coords = (E_fi @ world_h.T).T[:, :3]  # [N,3]
             depth_z = cam_coords[:, 2]
-            depth_valid = (depth_z > 1e-3) & (depth_z < 1500) & np.isfinite(depth_z)
+            depth_valid = (depth_z > 1e-3) & (depth_z < z_max) & np.isfinite(depth_z)
 
             depth_map_valid = np.ones(trajs_3d[fi].shape[0], dtype=bool)
             if result.depths is not None:
@@ -607,12 +620,8 @@ class D4RTQueryBuilder:
         )
         vis_flag     = tgt_defined & (visibs[tgt_frames, pt_indices] > 0.5) & tgt_inbounds
 
-        # 仅确保点在相机前方且深度量级合理。
-        # 上限按数据集查表（见 _DATASET_Z_MAX）：
-        #   pointodyssey/kubric/dynamic_replica: 20 m（离群点 Z>20 不参与 loss）
-        #   scannet: 5 m（实测最大 2.18 m）
-        #   co3dv2: 50（任意坐标单位，14% 有效点 Z>20）
-        z_max = self._get_z_max(result.dataset_name)
+        # 仅确保点在相机前方且深度量级合理，上限按数据集查表
+        # （见 _DATASET_Z_MAX，可由 dataset_z_max 覆盖）。
         src_depth_valid = (src_cam[:, 2] > 1e-3) & (src_cam[:, 2] < z_max) & np.isfinite(src_cam[:, 2])
         tgt_depth_valid = (tgt_cam[:, 2] > 1e-3) & (tgt_cam[:, 2] < z_max) & np.isfinite(tgt_cam[:, 2])
         has_valid_3d = (tgt_defined & np.isfinite(src_cam).all(-1) & np.isfinite(tgt_cam).all(-1)
@@ -643,7 +652,13 @@ class D4RTQueryBuilder:
         targets["displacement"][:]               = torch.from_numpy((tgt_cam - src_cam).astype(np.float32))
         targets["mask_3d"][:]                    = torch.from_numpy(has_valid_3d)
         targets["mask_2d"][:]                    = torch.from_numpy(vis_flag)
-        targets["mask_vis"][:]                   = torch.from_numpy(tgt_defined)
+        # mask_vis gates the visibility BCE loss. Some datasets (e.g. Co3Dv2's
+        # precomputed tracks) have visibs == valids and therefore carry no
+        # real positive/negative signal; their adapter sets has_visibility=False
+        # and we mask out the loss entirely here.
+        has_visibility_supervision = bool(result.metadata.get("has_visibility", True))
+        mask_vis_arr = tgt_defined if has_visibility_supervision else np.zeros_like(tgt_defined)
+        targets["mask_vis"][:]                   = torch.from_numpy(mask_vis_arr)
         targets["mask_disp"][:]                  = torch.from_numpy(has_valid_3d)
         targets["source_is_boundary"][:]         = torch.from_numpy(src_is_bnd)
         targets["source_is_depth_boundary"][:]   = torch.from_numpy(src_is_dbnd)

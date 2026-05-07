@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import struct
+import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Optional
@@ -235,6 +237,9 @@ class BlendedMVSAdapter(BaseAdapter):
         precompute_root: Optional[str] = None,
         cache_dir: Optional[str] = None,
         index_workers: int = 8,
+        io_workers: int = 1,
+        depth_cache_dir: Optional[str] = None,
+        load_precomputed: bool = True,
     ) -> None:
         """
         Parameters
@@ -267,15 +272,26 @@ class BlendedMVSAdapter(BaseAdapter):
         self.strict = strict
         self.verbose = verbose
         self.index_workers = index_workers
-        self.precompute_root = Path(precompute_root) if precompute_root else self.root
+        self.io_workers = max(1, int(io_workers))
+        self.load_precomputed = bool(load_precomputed)
+        resolved_depth_cache_dir = depth_cache_dir or os.getenv(
+            "D4RT_BLENDEDMVS_DEPTH_CACHE_DIR", ""
+        )
+        self.depth_cache_dir = (
+            Path(resolved_depth_cache_dir) if resolved_depth_cache_dir else None
+        )
+        self.precompute_root = (
+            Path(precompute_root) if precompute_root else self.root
+        ) if self.load_precomputed else None
 
         if cache_dir is not None:
             from datasets.index_cache import load_or_build
+            cache_precompute_root = Path(precompute_root) if precompute_root else self.root
             cache_key = {
                 "dataset": self.dataset_name,
                 "split": self.split,
                 "root": str(self.root.resolve()),
-                "precompute_root": str(self.precompute_root.resolve()),
+                "precompute_root": str(cache_precompute_root.resolve()),
                 "use_masked": self.use_masked,
                 "strict": self.strict,
                 "cache_schema": 2,
@@ -362,29 +378,34 @@ class BlendedMVSAdapter(BaseAdapter):
         r = self._get_record(sequence_name)
         self._check_indices(frame_indices, r.num_frames, sequence_name)
 
-        images: list[np.ndarray] = []
-        depths: list[np.ndarray] = []
-        intrinsics_list: list[np.ndarray] = []
-        extrinsics_list: list[np.ndarray] = []
-        frame_paths: list[str] = []
-        depth_ranges: list[tuple[float, float]] = []
-
-        for idx in frame_indices:
+        def _load_one(idx: int):
             fid = r.frame_ids[idx]
 
             rgb_p = r.rgb_path(fid, self.use_masked)
             dep_p = r.depth_path(fid)
             cam_p = r.cam_path(fid)
 
-            frame_paths.append(str(rgb_p))
-
-            images.append(self._read_image(rgb_p))
-            depths.append(_read_pfm(dep_p))
-
+            image = self._read_image(rgb_p)
+            depth = self._read_depth(dep_p, r.scene_id, fid)
             cam = _parse_cam_file(cam_p)
-            intrinsics_list.append(cam["intrinsic"])    # (3, 3) float32
-            extrinsics_list.append(cam["extrinsic"])    # (4, 4) float32 w2c
-            depth_ranges.append((cam["depth_min"], cam["depth_max"]))
+            return (
+                image,
+                depth,
+                cam["intrinsic"],    # (3, 3) float32
+                cam["extrinsic"],    # (4, 4) float32 w2c
+                str(rgb_p),
+                (cam["depth_min"], cam["depth_max"]),
+            )
+
+        if self.io_workers > 1 and len(frame_indices) > 1:
+            with ThreadPoolExecutor(max_workers=min(len(frame_indices), self.io_workers)) as ex:
+                rows = list(ex.map(_load_one, frame_indices))
+        else:
+            rows = [_load_one(idx) for idx in frame_indices]
+
+        (images, depths, intrinsics_list, extrinsics_list, frame_paths, depth_ranges) = (
+            list(items) for items in zip(*rows)
+        )
 
         intrinsics = np.stack(intrinsics_list, axis=0)   # (T, 3, 3) float32
         extrinsics = np.stack(extrinsics_list, axis=0)   # (T, 4, 4) float32 w2c
@@ -769,6 +790,30 @@ class BlendedMVSAdapter(BaseAdapter):
     def _read_image(path: Path) -> np.ndarray:
         """Load an RGB image as uint8 (H, W, 3)."""
         return np.asarray(Image.open(path).convert("RGB"))
+
+    def _read_depth(self, path: Path, scene_id: str, frame_id: str) -> np.ndarray:
+        if self.depth_cache_dir is None:
+            return _read_pfm(path)
+
+        cache_path = self.depth_cache_dir / scene_id / f"{frame_id}.npy"
+        if cache_path.is_file():
+            try:
+                return np.load(cache_path, allow_pickle=False)
+            except (OSError, ValueError):
+                cache_path.unlink(missing_ok=True)
+
+        depth = _read_pfm(path)
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = cache_path.with_name(
+            f".{cache_path.name}.part.{os.getpid()}.{threading.get_ident()}"
+        )
+        try:
+            with open(tmp_path, "wb") as f:
+                np.save(f, depth, allow_pickle=False)
+            os.replace(tmp_path, cache_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+        return depth
 
     @staticmethod
     def _read_image_size(path: Path) -> tuple[int, int]:

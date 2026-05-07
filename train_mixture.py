@@ -928,27 +928,40 @@ def main():
             ctx = model.no_sync() if use_no_sync else contextlib.nullcontext()
             with ctx:
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=amp_enabled):
+                    t_model_start = time.perf_counter()
                     outputs = model(batch['video'], batch['coords'], batch['t_src'], batch['t_tgt'], batch['t_cam'],
                                     aspect_ratio=batch.get('aspect_ratio'),
                                     local_patches=batch.get('local_patches'),
                                     transform_metadata=batch.get('transform_metadata'),
                                     query_frames=query_frames_arg,)
+                    torch.cuda.synchronize()
+                    t_model = time.perf_counter() - t_model_start
+
                     # Per-(dataset, frame) depth normalization:
                     # dataset_id * num_frames + t_cam gives each (dataset, frame) pair a unique
                     # group id, so median depth is computed independently per frame within each
                     # dataset. This is correct for both single- and multi-dataset batches.
+                    t_loss_start = time.perf_counter()
                     normalize_groups = batch['dataset_id'] * args.num_frames + batch['t_cam']
                     loss_dict = loss_fn(outputs, batch['targets'], normalize_groups=normalize_groups)
                     loss = loss_dict['loss'] / args.grad_accum
+                    torch.cuda.synchronize()
+                    t_loss = time.perf_counter() - t_loss_start
 
+                t_bwd_start = time.perf_counter()
                 loss.backward()
+                torch.cuda.synchronize()
+                t_bwd = time.perf_counter() - t_bwd_start
 
+            t_opt_start = time.perf_counter()
             if is_last_accum:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+            torch.cuda.synchronize()
+            t_opt = time.perf_counter() - t_opt_start
 
             t_fwd = time.perf_counter() - t_fwd_start
             if profile_data_wait:
@@ -965,7 +978,9 @@ def main():
                         f"[DataWaitDetail rank{local_rank}] "
                         f"reason={','.join(reasons)} "
                         f"epoch={epoch} batch={batch_idx} "
-                        f"data={t_data * 1000:.0f}ms fwd+bwd={t_fwd * 1000:.0f}ms "
+                        f"data={t_data * 1000:.0f}ms | "
+                        f"model={t_model*1000:.0f}ms loss={t_loss*1000:.0f}ms bwd={t_bwd*1000:.0f}ms opt={t_opt*1000:.0f}ms | "
+                        f"total={t_fwd * 1000:.0f}ms "
                         f"datasets={format_dataset_counts(batch.get('dataset_names'))} "
                         f"batch_prefetch_wait={prefetch_stats_for_batch.get('get_wait_s', 0.0) * 1000:.0f}ms "
                         f"q_before={prefetch_stats_for_batch.get('qsize_before')} "
@@ -997,7 +1012,9 @@ def main():
                     lr_info += f" [min {min(current_lrs):.2e}]"
                 # Print from ALL ranks so we can compare data/compute time per rank
                 print(f"[{time.strftime('%H:%M:%S')}][rank{local_rank}] Epoch {epoch}, Batch {batch_idx}, "
-                      f"data={t_data*1000:.0f}ms fwd+bwd={t_fwd*1000:.0f}ms Loss: {real_loss:.4f}, {lr_info}", flush=True)
+                      f"data={t_data*1000:.0f}ms | "
+                      f"model={t_model*1000:.0f}ms loss={t_loss*1000:.0f}ms bwd={t_bwd*1000:.0f}ms opt={t_opt*1000:.0f}ms | "
+                      f"total={t_fwd*1000:.0f}ms Loss: {real_loss:.4f}, {lr_info}", flush=True)
 
                 if local_rank == 0:
                     # Save loss log

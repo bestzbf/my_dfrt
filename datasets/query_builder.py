@@ -760,96 +760,141 @@ class D4RTQueryBuilder:
 
         valid_frames = list(range(T))   # 所有帧都可采
 
-        coords   = torch.zeros(self.num_queries, 2)
-        t_src_t  = torch.zeros(self.num_queries, dtype=torch.long)
-        t_tgt_t  = torch.zeros(self.num_queries, dtype=torch.long)
-        t_cam_t  = torch.zeros(self.num_queries, dtype=torch.long)
+        Q = self.num_queries
 
-        for qi in range(self.num_queries):
-            src_fi = py_rng.choice(valid_frames)
+        # ---- 向量化采样（替换 num_queries 次 Python 循环） ----
+        # 1. 批量采样帧索引
+        t_src_np = np_rng.integers(0, T, size=Q)
+        t_tgt_np = np_rng.integers(0, T, size=Q)
+        t_cam_np = np_rng.integers(0, T, size=Q)
+        # t_tgt=t_cam with probability t_tgt_eq_t_cam_ratio
+        eq_mask = np_rng.random(Q) < self.t_tgt_eq_t_cam_ratio
+        t_cam_np[eq_mask] = t_tgt_np[eq_mask]
 
-            # PAPER-ALIGNED: t_src/t_tgt/t_cam sampled independently at random.
-            # Enforce t_tgt=t_cam with prob t_tgt_eq_t_cam_ratio (paper: 0.4).
-            # In static scenes the world point doesn't move, so we can compute
-            # both pos_3d (in t_cam frame) and pos_2d (in t_tgt frame) for
-            # arbitrary t_tgt — no need to force t_tgt=t_src.
-            tgt_fi = py_rng.randint(0, T - 1)
-            cam_fi = py_rng.randint(0, T - 1)
-            if py_rng.random() < self.t_tgt_eq_t_cam_ratio:
-                cam_fi = tgt_fi
+        # 2. 批量采样像素坐标
+        px_x_np = np.empty(Q, dtype=np.int32)
+        px_y_np = np.empty(Q, dtype=np.int32)
+        src_is_boundary = np.zeros(Q, dtype=bool)
+        src_is_depth_boundary = np.zeros(Q, dtype=bool)
 
-            vpx = valid_pixels_by_frame[src_fi]
-            bpx = boundary_pixels_by_frame[src_fi]
+        boundary_draws = np_rng.random(Q) < self.boundary_ratio
 
-            if len(bpx) > 0 and py_rng.random() < self.boundary_ratio:
-                chosen = bpx[int(np_rng.integers(0, len(bpx)))]
-            else:
-                chosen = vpx[int(np_rng.integers(0, len(vpx)))]
+        for fi in range(T):
+            mask_fi = t_src_np == fi
+            if not mask_fi.any():
+                continue
+            n_fi = int(mask_fi.sum())
+            vpx = valid_pixels_by_frame[fi]
+            bpx = boundary_pixels_by_frame[fi]
 
-            px_x, px_y = int(chosen[0]), int(chosen[1])
+            # Split into boundary vs valid draws for this frame
+            use_bpx = boundary_draws[mask_fi] & (len(bpx) > 0)
+            n_bpx = int(use_bpx.sum())
+            n_vpx = n_fi - n_bpx
 
-            # 坐标归一化到 crop 空间 [0,1]，与 tracks 路径一致。
-            coords[qi, 0] = min(max(px_x / max(cw - 1, 1), 0.0), 1.0)
-            coords[qi, 1] = min(max(px_y / max(ch - 1, 1), 0.0), 1.0)
-            t_src_t[qi]   = src_fi
-            t_tgt_t[qi]   = tgt_fi
-            t_cam_t[qi]   = cam_fi
+            chosen_x = np.empty(n_fi, dtype=np.int32)
+            chosen_y = np.empty(n_fi, dtype=np.int32)
 
-            # boundary/depth_boundary live on resized plane; remap crop coord.
-            px_x_r = int(np.clip(round(px_x / scale_x), 0, S - 1))
-            px_y_r = int(np.clip(round(px_y / scale_y), 0, S - 1))
-            targets["source_is_boundary"][qi]        = bool(boundary[src_fi][px_y_r, px_x_r])
-            targets["source_is_depth_boundary"][qi]  = bool(depth_boundary[src_fi][px_y_r, px_x_r])
-            targets["point_indices"][qi]             = px_y * cw + px_x
-            # is_static_reprojection: marks queries with no temporal component
-            # (t_tgt == t_src), used for loss weighting analysis.
-            targets["is_static_reprojection"][qi]    = (tgt_fi == src_fi)
+            if n_bpx > 0:
+                idx_b = np_rng.integers(0, len(bpx), size=n_bpx)
+                chosen_x[use_bpx] = bpx[idx_b, 0]
+                chosen_y[use_bpx] = bpx[idx_b, 1]
 
-            # pos_3d：从 src 帧 depth 反投影 → world → cam_fi 相机坐标系
-            # pos_2d：投影 p_world 到 tgt_fi 图像平面（静态场景下 p_world 不变）
-            if has_depth:
-                depth_val = float(result.depths[src_fi][px_y_r, px_x_r])
-                if depth_val > 1e-3 and depth_val < z_max and np.isfinite(depth_val):
-                    K_src = K[src_fi]
-                    fx, fy = K_src[0, 0], K_src[1, 1]
-                    cx, cy = K_src[0, 2], K_src[1, 2]
-                    # src 相机坐标
-                    x_c = (px_x_r - cx) * depth_val / fx
-                    y_c = (px_y_r - cy) * depth_val / fy
-                    z_c = depth_val
-                    p_src_cam = np.array([x_c, y_c, z_c, 1.0], dtype=np.float32)
+            if n_vpx > 0:
+                idx_v = np_rng.integers(0, len(vpx), size=n_vpx)
+                chosen_x[~use_bpx] = vpx[idx_v, 0]
+                chosen_y[~use_bpx] = vpx[idx_v, 1]
 
-                    # src cam → world
-                    E_src = E[src_fi]
-                    p_world = np.linalg.inv(E_src) @ p_src_cam
+            px_x_np[mask_fi] = chosen_x
+            px_y_np[mask_fi] = chosen_y
 
-                    # world → cam_fi cam (for pos_3d)
-                    E_cam = E[cam_fi]
-                    p_cam = (E_cam @ p_world)[:3].astype(np.float32)
+            # Boundary flags (on resized plane)
+            px_x_r_fi = np.clip(np.round(chosen_x / scale_x).astype(np.int32), 0, S - 1)
+            px_y_r_fi = np.clip(np.round(chosen_y / scale_y).astype(np.int32), 0, S - 1)
+            src_is_boundary[mask_fi] = boundary[fi][px_y_r_fi, px_x_r_fi]
+            src_is_depth_boundary[mask_fi] = depth_boundary[fi][px_y_r_fi, px_x_r_fi]
 
-                    if np.isfinite(p_cam).all() and p_cam[2] > 1e-3 and p_cam[2] < z_max:
-                        targets["pos_3d"][qi]  = torch.from_numpy(p_cam)
-                        targets["mask_3d"][qi] = True
+        # 归一化到 crop 空间 [0,1]
+        coords_np = np.stack([
+            np.clip(px_x_np / max(cw - 1, 1), 0.0, 1.0),
+            np.clip(px_y_np / max(ch - 1, 1), 0.0, 1.0),
+        ], axis=1).astype(np.float32)
 
-                        # pos_2d: only when t_tgt=t_cam (paper design).
-                        # Project p_world to tgt_fi=cam_fi image plane.
-                        if tgt_fi == cam_fi:
-                            K_tgt = K[tgt_fi]
-                            u = float(K_tgt[0,0] * p_cam[0] / p_cam[2] + K_tgt[0,2])
-                            v = float(K_tgt[1,1] * p_cam[1] / p_cam[2] + K_tgt[1,2])
-                            u_c = u * scale_x
-                            v_c = v * scale_y
-                            if 0 <= u_c < cw and 0 <= v_c < ch:
-                                uv_norm = _normalize_crop_coords(
-                                    np.array([[u_c, v_c]], dtype=np.float32),
-                                    crop_w=cw,
-                                    crop_h=ch,
-                                )[0]
-                                targets["pos_2d"][qi, 0] = float(uv_norm[0])
-                                targets["pos_2d"][qi, 1] = float(uv_norm[1])
-                                targets["mask_2d"][qi]   = True
+        # Resized-plane coords for depth lookup
+        px_x_r = np.clip(np.round(px_x_np / scale_x).astype(np.int32), 0, S - 1)
+        px_y_r = np.clip(np.round(px_y_np / scale_y).astype(np.int32), 0, S - 1)
 
-        # mask_2d set above when t_tgt=t_cam and pos_2d in bounds; others remain False
+        # Fill targets
+        coords = torch.from_numpy(coords_np)
+        t_src_t = torch.from_numpy(t_src_np.astype(np.int64))
+        t_tgt_t = torch.from_numpy(t_tgt_np.astype(np.int64))
+        t_cam_t = torch.from_numpy(t_cam_np.astype(np.int64))
+        targets["source_is_boundary"] = torch.from_numpy(src_is_boundary)
+        targets["source_is_depth_boundary"] = torch.from_numpy(src_is_depth_boundary)
+        targets["point_indices"] = torch.from_numpy((px_y_np * cw + px_x_np).astype(np.int64))
+        targets["is_static_reprojection"] = torch.from_numpy((t_tgt_np == t_src_np))
+
+        # 3. 批量 depth 反投影 + 相机变换 + 2D 投影
+        if has_depth:
+            depths_arr = np.stack(result.depths, axis=0)  # [T,S,S]
+            depth_vals = depths_arr[t_src_np, px_y_r, px_x_r]  # [Q]
+
+            # 有效 depth mask
+            depth_valid = (depth_vals > 1e-3) & (depth_vals < z_max) & np.isfinite(depth_vals)
+
+            if depth_valid.any():
+                v_idx = np.where(depth_valid)[0]
+                v_src = t_src_np[v_idx]
+                v_cam = t_cam_np[v_idx]
+                v_tgt = t_tgt_np[v_idx]
+                v_d = depth_vals[v_idx]
+                v_px_r = px_x_r[v_idx]
+                v_py_r = px_y_r[v_idx]
+                Nv = len(v_idx)
+
+                # src 相机坐标: p_src_cam = [(u-cx)*d/fx, (v-cy)*d/fy, d, 1]
+                K_src = K[v_src]  # [Nv,3,3]
+                fx = K_src[:, 0, 0]; fy = K_src[:, 1, 1]
+                cx = K_src[:, 0, 2]; cy = K_src[:, 1, 2]
+                x_c = (v_px_r - cx) * v_d / fx
+                y_c = (v_py_r - cy) * v_d / fy
+                p_src_cam = np.stack([x_c, y_c, v_d, np.ones(Nv, dtype=np.float32)], axis=1)  # [Nv,4]
+
+                # src cam → world: p_world = inv(E_src) @ p_src_cam
+                E_src = E[v_src]  # [Nv,4,4]
+                E_src_inv = np.linalg.inv(E_src)  # [Nv,4,4]
+                p_world = np.einsum('nij,nj->ni', E_src_inv, p_src_cam)  # [Nv,4]
+
+                # world → cam_fi cam: p_cam = E_cam @ p_world
+                E_cam = E[v_cam]  # [Nv,4,4]
+                p_cam = np.einsum('nij,nj->ni', E_cam, p_world)[:, :3]  # [Nv,3]
+
+                # pos_3d validity
+                cam_valid = np.isfinite(p_cam).all(axis=1) & (p_cam[:, 2] > 1e-3) & (p_cam[:, 2] < z_max)
+
+                if cam_valid.any():
+                    c_idx = v_idx[cam_valid]
+                    targets["pos_3d"][c_idx] = torch.from_numpy(p_cam[cam_valid].astype(np.float32))
+                    targets["mask_3d"][c_idx] = True
+
+                    # pos_2d: only when t_tgt == t_cam
+                    eq_tc = v_tgt[cam_valid] == v_cam[cam_valid]
+                    if eq_tc.any():
+                        p2d_idx = c_idx[eq_tc]
+                        p_cam_eq = p_cam[cam_valid][eq_tc]  # [Np,3]
+                        K_tgt = K[v_tgt[cam_valid][eq_tc]]  # [Np,3,3]
+                        u = K_tgt[:, 0, 0] * p_cam_eq[:, 0] / p_cam_eq[:, 2] + K_tgt[:, 0, 2]
+                        v_proj = K_tgt[:, 1, 1] * p_cam_eq[:, 1] / p_cam_eq[:, 2] + K_tgt[:, 1, 2]
+                        u_c = u * scale_x
+                        v_c = v_proj * scale_y
+                        in_bounds = (u_c >= 0) & (u_c < cw) & (v_c >= 0) & (v_c < ch)
+                        if in_bounds.any():
+                            b_idx = p2d_idx[in_bounds]
+                            uv = np.stack([u_c[in_bounds], v_c[in_bounds]], axis=1).astype(np.float32)
+                            uv_norm = _normalize_crop_coords(uv, crop_w=cw, crop_h=ch)
+                            targets["pos_2d"][b_idx] = torch.from_numpy(uv_norm)
+                            targets["mask_2d"][b_idx] = True
+
         return coords, t_src_t, t_tgt_t, t_cam_t, targets
 
     # ------------------------------------------------------------------

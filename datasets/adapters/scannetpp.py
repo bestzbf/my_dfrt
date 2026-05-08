@@ -166,7 +166,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
+import pickle
+import threading
+import time
 import zlib
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
@@ -561,6 +566,16 @@ class ScanNetPPAdapter(BaseAdapter):
         verbose: bool = False,
         strict: bool = True,
         precomputed_name: str = "precomputed.npz",
+        use_precomputed_tracks: bool = True,
+        precomputed_read_mode: str = "auto",
+        precomputed_cos_mount_root: str = "/data_cos",
+        precomputed_cos_bucket: str = "hd-ai-data-1251882982",
+        precomputed_cos_region: str = "ap-beijing",
+        precomputed_cos_passwd_file: str = "/etc/passwd-s3fs-data_cos",
+        precomputed_cos_timeout_s: int = 20,
+        precomputed_cos_range_workers: int = 16,
+        precomputed_cos_range_retries: int = 2,
+        precomputed_cos_range_merge_gap_bytes: int = 1024 * 1024,
         splits_dir: Optional[str] = None,
         split_file: Optional[str] = None,
         scenes_record: Optional[str] = None,
@@ -574,6 +589,30 @@ class ScanNetPPAdapter(BaseAdapter):
         self.verbose = verbose
         self.strict = strict
         self.precomputed_name = precomputed_name
+        if isinstance(use_precomputed_tracks, str):
+            self.use_precomputed_tracks = use_precomputed_tracks.strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+        else:
+            self.use_precomputed_tracks = bool(use_precomputed_tracks)
+        self.precomputed_read_mode = str(precomputed_read_mode or "auto").strip().lower()
+        self.precomputed_cos_mount_root = Path(precomputed_cos_mount_root)
+        self.precomputed_cos_bucket = str(precomputed_cos_bucket)
+        self.precomputed_cos_region = str(precomputed_cos_region)
+        if (
+            precomputed_cos_passwd_file == "/etc/passwd-s3fs-data_cos"
+            and not Path(precomputed_cos_passwd_file).exists()
+            and Path("/etc/passwd-cosfs").exists()
+        ):
+            precomputed_cos_passwd_file = "/etc/passwd-cosfs"
+        self.precomputed_cos_passwd_file = str(precomputed_cos_passwd_file)
+        self.precomputed_cos_timeout_s = int(precomputed_cos_timeout_s)
+        self.precomputed_cos_range_workers = max(1, int(precomputed_cos_range_workers))
+        self.precomputed_cos_range_retries = max(0, int(precomputed_cos_range_retries))
+        self.precomputed_cos_range_merge_gap_bytes = max(
+            0, int(precomputed_cos_range_merge_gap_bytes)
+        )
+        self._cos_tls = threading.local()
         self.index_workers = index_workers
         self.splits_dir = Path(splits_dir) if splits_dir is not None else self.root / "splits"
         self.split_file = split_file
@@ -582,7 +621,33 @@ class ScanNetPPAdapter(BaseAdapter):
             if scenes_record is not None
             else self.root.parent / "scenes_record.json"
         )
-        self.data_root = self._resolve_data_root()
+
+        # Check cache first to skip slow root.exists() on remote storage
+        _cache_hit = False
+        if cache_dir is not None:
+            from datasets.index_cache import load_or_build
+            # Assume data_root is root for cache key check
+            cache_key = {
+                "dataset": "scannetpp",
+                "data_root": str(self.root),
+                "split": split,
+                "split_file": split_file,
+                "splits_dir": str(self.splits_dir),
+                "precomputed_name": precomputed_name,
+                "scenes_record": str(self.scenes_record_path),
+                "cache_schema": 4,
+            }
+            cache_suffix = hashlib.sha1(
+                json.dumps(cache_key, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:12]
+            _cache_path = Path(cache_dir) / f"scannetpp_{split}_{cache_suffix}.pkl"
+            if _cache_path.exists():
+                _cache_hit = True
+
+        if _cache_hit:
+            self.data_root = self.root
+        else:
+            self.data_root = self._resolve_data_root()
 
         if cache_dir is not None:
             from datasets.index_cache import load_or_build
@@ -609,6 +674,8 @@ class ScanNetPPAdapter(BaseAdapter):
         self._scene_cache: dict[str, dict[str, Any]] = {}
         self._depth_chunk_cache: dict[str, list[tuple[int, int]]] = {}
         self._precomputed_info_cache: dict[str, dict[str, Any]] = {}
+        self._h5_chunk_index_cache: dict[str, dict[str, Any]] = {}
+        self._cos_range_warned = False
 
     def _precomputed_npz_path(self, scene_dir: Path) -> Path:
         return scene_dir / self.precomputed_name
@@ -623,6 +690,18 @@ class ScanNetPPAdapter(BaseAdapter):
         if scene_name in self._precomputed_info_cache:
             return self._precomputed_info_cache[scene_name]
 
+        if not self.use_precomputed_tracks:
+            info = {
+                "backend": None,
+                "has_precomputed": False,
+                "has_normals": False,
+                "has_tracks": False,
+                "has_visibility": False,
+                "has_trajs_3d_world": False,
+            }
+            self._precomputed_info_cache[scene_name] = info
+            return info
+
         # Use _precomputed_dir if set (during staging, data_root points to staged path)
         sd = self._scene_cache.get(scene_name)
         scene_dir = sd.get("_precomputed_dir", self.data_root / scene_name) if sd else self.data_root / scene_name
@@ -631,13 +710,21 @@ class ScanNetPPAdapter(BaseAdapter):
 
         keys: set[str] = set()
         backend = None
-        if h5_path.exists():
+        index_path = self._precomputed_h5_chunk_index_path(scene_dir)
+        if self._should_use_precomputed_cos_range(h5_path, index_path):
+            try:
+                keys = set(self._load_h5_chunk_index(index_path).keys())
+                backend = "h5_range"
+            except Exception:
+                if self.precomputed_read_mode == "cos_range":
+                    raise
+        if not keys and h5_path.exists():
             import h5py
 
             with h5py.File(h5_path, "r") as handle:
                 keys = set(handle.keys())
             backend = "h5"
-        elif npz_path.exists():
+        if not keys and npz_path.exists():
             with np.load(npz_path, allow_pickle=False) as handle:
                 keys = set(handle.files)
             backend = "npz"
@@ -824,8 +911,31 @@ class ScanNetPPAdapter(BaseAdapter):
         sd = self._get_scene_data(scene_name)
         # _precomputed_dir points to original (non-staged) scene_dir when staged
         precomputed_dir = sd.get("_precomputed_dir", sd["scene_dir"])
+        precomputed_index_dir = sd.get("_precomputed_index_dir", precomputed_dir)
         npz_path = precomputed_dir / self.precomputed_name
-        cache = load_precomputed_fast(npz_path, frame_indices, skip_keys={"normals"})
+        h5_path = npz_path.with_suffix(".h5")
+        index_path = self._precomputed_h5_chunk_index_path(precomputed_index_dir)
+        if self._should_use_precomputed_cos_range(h5_path, index_path):
+            try:
+                cache = self._load_precomputed_cos_range(
+                    h5_path=h5_path,
+                    index_path=index_path,
+                    frame_indices=frame_indices,
+                    skip_keys={"normals"},
+                )
+            except Exception as exc:
+                if self.precomputed_read_mode == "cos_range":
+                    raise
+                if not self._cos_range_warned:
+                    print(
+                        "[ScanNet++Adapter] h5 COS range read failed; falling back "
+                        f"to h5py/npz ({type(exc).__name__}: {exc})",
+                        flush=True,
+                    )
+                    self._cos_range_warned = True
+                cache = load_precomputed_fast(npz_path, frame_indices, skip_keys={"normals"})
+        else:
+            cache = load_precomputed_fast(npz_path, frame_indices, skip_keys={"normals"})
         if cache is None:
             raise FileNotFoundError(npz_path)
         required = ["trajs_2d", "trajs_3d_world", "valids", "visibs", "intrinsics", "extrinsics"]
@@ -833,6 +943,353 @@ class ScanNetPPAdapter(BaseAdapter):
         if missing:
             raise KeyError(f"Missing keys in {npz_path.name}: {missing}")
         return cache
+
+    def _precomputed_h5_chunk_index_path(self, scene_dir: Path) -> Path:
+        return scene_dir / f"{Path(self.precomputed_name).with_suffix('.h5').name}_chunk_index.pkl"
+
+    def _path_is_under_cos_mount(self, path: Path) -> bool:
+        mount = str(self.precomputed_cos_mount_root).rstrip("/") + "/"
+        if str(path).startswith(mount) or str(path) == str(self.precomputed_cos_mount_root):
+            return True
+        try:
+            path.resolve().relative_to(self.precomputed_cos_mount_root.resolve())
+            return True
+        except Exception:
+            return False
+
+    def _should_use_precomputed_cos_range(self, h5_path: Path, index_path: Path) -> bool:
+        mode = self.precomputed_read_mode
+        if mode in {"h5py", "direct", "npz"}:
+            return False
+        if mode not in {"auto", "cos_range", "range"}:
+            return False
+        if mode == "auto" and not self._path_is_under_cos_mount(h5_path):
+            return False
+        if self._path_is_under_cos_mount(index_path):
+            return self._cos_object_exists(index_path)
+        return index_path.exists()
+
+    def _get_precomputed_cos_client(self) -> Any:
+        client = getattr(self._cos_tls, "client", None)
+        if client is None:
+            from qcloud_cos import CosConfig, CosS3Client
+
+            parts = Path(self.precomputed_cos_passwd_file).read_text().strip().split(":")
+            if len(parts) == 2:
+                secret_id, secret_key = parts
+            elif len(parts) == 3:
+                _bucket, secret_id, secret_key = parts
+            else:
+                raise ValueError(
+                    "Unsupported COS passwd file format: "
+                    f"{self.precomputed_cos_passwd_file}"
+                )
+            config = CosConfig(
+                Region=self.precomputed_cos_region,
+                SecretId=secret_id,
+                SecretKey=secret_key,
+                Scheme="https",
+                Timeout=self.precomputed_cos_timeout_s,
+            )
+            client = CosS3Client(config)
+            self._cos_tls.client = client
+        return client
+
+    def _precomputed_cos_key(self, h5_path: Path) -> str:
+        try:
+            return h5_path.relative_to(self.precomputed_cos_mount_root).as_posix()
+        except ValueError:
+            mount = str(self.precomputed_cos_mount_root).rstrip("/") + "/"
+            path = str(h5_path)
+            if path.startswith(mount):
+                return path[len(mount):]
+            raise
+
+    def _is_cos_not_found_error(self, exc: BaseException) -> bool:
+        for attr in ("get_status_code", "get_error_code"):
+            getter = getattr(exc, attr, None)
+            if getter is None:
+                continue
+            try:
+                value = getter()
+            except Exception:
+                continue
+            if str(value) in {"404", "NoSuchKey", "NoSuchBucket", "NotFound"}:
+                return True
+        text = str(exc).lower()
+        return "nosuchkey" in text or "not found" in text or "404" in text
+
+    def _cos_object_exists(self, path: Path) -> bool:
+        cos_key = self._precomputed_cos_key(path)
+        last_exc: Optional[BaseException] = None
+        for attempt in range(self.precomputed_cos_range_retries + 1):
+            try:
+                self._get_precomputed_cos_client().head_object(
+                    Bucket=self.precomputed_cos_bucket,
+                    Key=cos_key,
+                )
+                return True
+            except BaseException as exc:
+                last_exc = exc
+                if self._is_cos_not_found_error(exc):
+                    return False
+                if attempt < self.precomputed_cos_range_retries:
+                    time.sleep(min(2.0, 0.25 * (2 ** attempt)))
+                    continue
+                if self.precomputed_read_mode == "cos_range":
+                    raise
+                return False
+        if last_exc is not None and self.precomputed_read_mode == "cos_range":
+            raise last_exc
+        return False
+
+    def _read_cos_object(self, cos_key: str) -> bytes:
+        last_exc: Optional[BaseException] = None
+        for attempt in range(self.precomputed_cos_range_retries + 1):
+            try:
+                resp = self._get_precomputed_cos_client().get_object(
+                    Bucket=self.precomputed_cos_bucket,
+                    Key=cos_key,
+                )
+                return resp["Body"].get_raw_stream().read()
+            except BaseException as exc:
+                last_exc = exc
+                if attempt < self.precomputed_cos_range_retries:
+                    time.sleep(min(2.0, 0.25 * (2 ** attempt)))
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        raise IOError(f"COS object read failed: {cos_key}")
+
+    def _load_h5_chunk_index(self, index_path: Path) -> dict[str, Any]:
+        cache_key = str(index_path)
+        cached = self._h5_chunk_index_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        last_exc: Optional[BaseException] = None
+        if self._path_is_under_cos_mount(index_path):
+            try:
+                raw = self._read_cos_object(self._precomputed_cos_key(index_path))
+                index = pickle.loads(raw)
+                self._h5_chunk_index_cache[cache_key] = index
+                return index
+            except BaseException as exc:
+                last_exc = exc
+                if self.precomputed_read_mode == "cos_range":
+                    raise
+
+        for attempt in range(self.precomputed_cos_range_retries + 1):
+            try:
+                with open(index_path, "rb") as f:
+                    index = pickle.load(f)
+                self._h5_chunk_index_cache[cache_key] = index
+                return index
+            except (EOFError, OSError, pickle.UnpicklingError) as exc:
+                last_exc = exc
+                if attempt < self.precomputed_cos_range_retries:
+                    time.sleep(min(2.0, 0.25 * (2 ** attempt)))
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        raise IOError(f"Failed to load h5 chunk index: {index_path}")
+
+    def _load_precomputed_cos_range(
+        self,
+        h5_path: Path,
+        index_path: Path,
+        frame_indices: list[int],
+        skip_keys: set[str],
+    ) -> dict[str, Any]:
+        index = self._load_h5_chunk_index(index_path)
+        required_keys = [
+            "trajs_2d",
+            "trajs_3d_world",
+            "valids",
+            "visibs",
+            "intrinsics",
+            "extrinsics",
+        ]
+        keys = [key for key in required_keys if key not in skip_keys]
+        sorted_idx = sorted(set(int(i) for i in frame_indices))
+        if not sorted_idx:
+            raise ValueError("frame_indices is empty")
+
+        tasks: list[dict[str, Any]] = []
+        chunks_by_key: dict[str, dict[int, np.ndarray]] = {key: {} for key in keys}
+        entries: dict[str, dict[str, Any]] = {}
+        for key in keys:
+            entry = self._normalize_h5_range_entry(key, index[key])
+            entries[key] = entry
+            self._validate_h5_range_entry(key, entry, sorted_idx)
+            for start, end, chunks in self._merge_h5_range_chunks(entry, sorted_idx):
+                tasks.append({
+                    "key": key,
+                    "start": start,
+                    "end": end,
+                    "chunks": chunks,
+                })
+
+        cos_key = self._precomputed_cos_key(h5_path)
+
+        def fetch_task(task: dict[str, Any]) -> dict[str, Any]:
+            data = self._read_cos_range(cos_key, int(task["start"]), int(task["end"]))
+            return {**task, "data": data}
+
+        max_workers = min(self.precomputed_cos_range_workers, max(1, len(tasks)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(fetch_task, task) for task in tasks]
+            for future in as_completed(futures):
+                task = future.result()
+                entry = entries[task["key"]]
+                dtype = np.dtype(entry["dtype"])
+                chunk_shape = tuple(int(v) for v in entry["chunk_shape"])
+                start = int(task["start"])
+                data = task["data"]
+                for frame_idx, offset, size in task["chunks"]:
+                    rel = int(offset) - start
+                    raw = data[rel:rel + int(size)]
+                    expected = int(size)
+                    if len(raw) != expected:
+                        raise IOError(
+                            f"Short COS range read for {task['key']} frame {frame_idx}: "
+                            f"got {len(raw)} bytes, expected {expected}"
+                        )
+                    arr = np.frombuffer(raw, dtype=dtype).reshape(chunk_shape)[0].copy()
+                    chunks_by_key[task["key"]][int(frame_idx)] = arr
+
+        pos = {frame_idx: idx for idx, frame_idx in enumerate(sorted_idx)}
+        reorder = [pos[int(frame_idx)] for frame_idx in frame_indices]
+        result: dict[str, Any] = {}
+        for key in keys:
+            arr_sorted = np.stack(
+                [chunks_by_key[key][frame_idx] for frame_idx in sorted_idx],
+                axis=0,
+            )
+            result[key] = arr_sorted[reorder]
+        return result
+
+    def _normalize_h5_range_entry(self, key: str, entry: Any) -> dict[str, Any]:
+        if isinstance(entry, dict):
+            return entry
+        if not isinstance(entry, list):
+            raise TypeError(f"Unsupported h5 chunk index entry for {key}: {type(entry).__name__}")
+        if not entry:
+            raise ValueError(f"Empty h5 chunk index entry for {key}")
+
+        first = entry[0]
+        if not isinstance(first, (tuple, list)) or len(first) != 2:
+            raise TypeError(f"Unsupported legacy h5 offset entry for {key}: {first!r}")
+        chunk_size = int(first[1])
+
+        if key == "trajs_2d":
+            dtype = "float32"
+            num_points = chunk_size // (np.dtype(dtype).itemsize * 2)
+            chunk_shape = (1, num_points, 2)
+        elif key == "trajs_3d_world":
+            dtype = "float32"
+            num_points = chunk_size // (np.dtype(dtype).itemsize * 3)
+            chunk_shape = (1, num_points, 3)
+        elif key in {"valids", "visibs"}:
+            dtype = "bool"
+            num_points = chunk_size // np.dtype(dtype).itemsize
+            chunk_shape = (1, num_points)
+        elif key == "intrinsics":
+            dtype = "float32"
+            chunk_shape = (1, 3, 3)
+        elif key == "extrinsics":
+            dtype = "float32"
+            chunk_shape = (1, 4, 4)
+        elif key == "normals":
+            dtype = "float16"
+            chunk_shape = (1, _DEPTH_H, _DEPTH_W, 3)
+        else:
+            raise KeyError(f"Unsupported legacy h5 chunk index key: {key}")
+
+        expected_size = int(np.prod(chunk_shape)) * np.dtype(dtype).itemsize
+        if expected_size != chunk_size:
+            raise ValueError(
+                f"Legacy h5 chunk index size mismatch for {key}: "
+                f"chunk_size={chunk_size}, inferred={expected_size}"
+            )
+
+        return {
+            "offsets": [(int(offset), int(size)) for offset, size in entry],
+            "dtype": dtype,
+            "chunk_shape": chunk_shape,
+            "shape": (len(entry),) + tuple(chunk_shape[1:]),
+            "compression": None,
+        }
+
+    def _validate_h5_range_entry(
+        self,
+        key: str,
+        entry: dict[str, Any],
+        sorted_idx: list[int],
+    ) -> None:
+        if entry.get("compression") not in (None, "None"):
+            raise RuntimeError(f"Unsupported compressed h5 chunks for {key}")
+        chunk_shape = tuple(int(v) for v in entry["chunk_shape"])
+        if not chunk_shape or chunk_shape[0] != 1:
+            raise RuntimeError(f"Unsupported h5 chunk_shape for {key}: {chunk_shape}")
+        offsets = entry["offsets"]
+        max_idx = sorted_idx[-1]
+        if max_idx >= len(offsets):
+            raise IndexError(f"Frame {max_idx} out of range for {key} ({len(offsets)})")
+
+    def _merge_h5_range_chunks(
+        self,
+        entry: dict[str, Any],
+        sorted_idx: list[int],
+    ) -> list[tuple[int, int, list[tuple[int, int, int]]]]:
+        offsets = entry["offsets"]
+        chunks = [
+            (frame_idx, int(offsets[frame_idx][0]), int(offsets[frame_idx][1]))
+            for frame_idx in sorted_idx
+        ]
+        chunks.sort(key=lambda item: item[1])
+        spans: list[tuple[int, int, list[tuple[int, int, int]]]] = []
+        max_gap = self.precomputed_cos_range_merge_gap_bytes
+        cur_start: Optional[int] = None
+        cur_end: Optional[int] = None
+        cur_chunks: list[tuple[int, int, int]] = []
+        for frame_idx, offset, size in chunks:
+            end = offset + size
+            if cur_start is None or cur_end is None or offset > cur_end + max_gap:
+                if cur_start is not None and cur_end is not None:
+                    spans.append((cur_start, cur_end, cur_chunks))
+                cur_start = offset
+                cur_end = end
+                cur_chunks = [(frame_idx, offset, size)]
+            else:
+                cur_end = max(cur_end, end)
+                cur_chunks.append((frame_idx, offset, size))
+        if cur_start is not None and cur_end is not None:
+            spans.append((cur_start, cur_end, cur_chunks))
+        return spans
+
+    def _read_cos_range(self, cos_key: str, start: int, end: int) -> bytes:
+        range_header = f"bytes={start}-{end - 1}"
+        last_exc: Optional[BaseException] = None
+        for attempt in range(self.precomputed_cos_range_retries + 1):
+            try:
+                resp = self._get_precomputed_cos_client().get_object(
+                    Bucket=self.precomputed_cos_bucket,
+                    Key=cos_key,
+                    Range=range_header,
+                )
+                return resp["Body"].get_raw_stream().read()
+            except BaseException as exc:
+                last_exc = exc
+                if attempt < self.precomputed_cos_range_retries:
+                    time.sleep(min(2.0, 0.25 * (2 ** attempt)))
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        raise IOError(f"COS range read failed: {cos_key} {range_header}")
 
     def __len__(self) -> int:
         return len(self.sequence_names)
@@ -927,31 +1384,53 @@ class ScanNetPPAdapter(BaseAdapter):
             depths.append(depth.astype(np.float32))
         timing["depth_resize_s"] = _time.perf_counter() - t0
 
-        # Load precomputed data (tracks, intrinsics, etc.)
-        t0 = _time.perf_counter()
-        cache = self._load_precomputed(sequence_name, frame_indices)
-        timing["precomputed_s"] = _time.perf_counter() - t0
-
-        # Process intrinsics
-        t0 = _time.perf_counter()
-        intrinsics = cache["intrinsics"].astype(np.float32).copy()
-        intrinsics[:, 0, 0] *= sx
-        intrinsics[:, 0, 2] *= sx
-        intrinsics[:, 1, 1] *= sy
-        intrinsics[:, 1, 2] *= sy
-
-        trajs_2d = cache["trajs_2d"].astype(np.float32).copy()
-        trajs_2d[..., 0] *= sx
-        trajs_2d[..., 1] *= sy
-
         normals_out: Optional[list[np.ndarray]] = None
-        if "normals" in cache:
-            normals_out = [_resize_normals(normal, (tgt_h, tgt_w)) for normal in cache["normals"]]
-        timing["process_s"] = _time.perf_counter() - t0
+        trajs_2d: Optional[np.ndarray] = None
+        trajs_3d_world: Optional[np.ndarray] = None
+        valids: Optional[np.ndarray] = None
+        visibs: Optional[np.ndarray] = None
+        extrinsics: np.ndarray
+
+        if self.use_precomputed_tracks:
+            # Load precomputed data (tracks, intrinsics, etc.)
+            t0 = _time.perf_counter()
+            cache = self._load_precomputed(sequence_name, frame_indices)
+            timing["precomputed_s"] = _time.perf_counter() - t0
+
+            # Process intrinsics
+            t0 = _time.perf_counter()
+            intrinsics = cache["intrinsics"].astype(np.float32).copy()
+            intrinsics[:, 0, 0] *= sx
+            intrinsics[:, 0, 2] *= sx
+            intrinsics[:, 1, 1] *= sy
+            intrinsics[:, 1, 2] *= sy
+
+            trajs_2d = cache["trajs_2d"].astype(np.float32).copy()
+            trajs_2d[..., 0] *= sx
+            trajs_2d[..., 1] *= sy
+            trajs_3d_world = cache["trajs_3d_world"].astype(np.float32)
+            valids = cache["valids"].astype(bool)
+            visibs = cache["visibs"].astype(bool)
+            extrinsics = cache["extrinsics"].astype(np.float32)
+
+            if "normals" in cache:
+                normals_out = [_resize_normals(normal, (tgt_h, tgt_w)) for normal in cache["normals"]]
+            timing["process_s"] = _time.perf_counter() - t0
+        else:
+            timing["precomputed_s"] = 0.0
+            t0 = _time.perf_counter()
+            intrinsics = sd["intrinsics"][frame_indices].astype(np.float32).copy()
+            intrinsics[:, 0, 0] *= sx
+            intrinsics[:, 0, 2] *= sx
+            intrinsics[:, 1, 1] *= sy
+            intrinsics[:, 1, 2] *= sy
+            extrinsics = sd["w2c"][frame_indices].astype(np.float32)
+            timing["process_s"] = _time.perf_counter() - t0
 
         timing["total_s"] = _time.perf_counter() - t_total_start
 
         frame_paths = [f"{sd['scene_dir']}/iphone/rgb.mkv@t={sd['timestamps'][i]:.6f}s" for i in frame_indices]
+        has_tracks = trajs_3d_world is not None
         metadata = {
             "dataset_name": self.dataset_name,
             "sequence_name": sequence_name,
@@ -963,9 +1442,9 @@ class ScanNetPPAdapter(BaseAdapter):
             "extrinsics_convention": "w2c",
             "has_depth": True,
             "has_normals": normals_out is not None,
-            "has_tracks": True,
-            "has_visibility": True,
-            "has_trajs_3d_world": True,
+            "has_tracks": has_tracks,
+            "has_visibility": visibs is not None,
+            "has_trajs_3d_world": trajs_3d_world is not None,
             "_load_timing": timing,
         }
         return UnifiedClip(
@@ -976,11 +1455,11 @@ class ScanNetPPAdapter(BaseAdapter):
             depths=depths,
             normals=normals_out,
             trajs_2d=trajs_2d,
-            trajs_3d_world=cache["trajs_3d_world"].astype(np.float32),
-            valids=cache["valids"].astype(bool),
-            visibs=cache["visibs"].astype(bool),
+            trajs_3d_world=trajs_3d_world,
+            valids=valids,
+            visibs=visibs,
             intrinsics=intrinsics,
-            extrinsics=cache["extrinsics"].astype(np.float32),
+            extrinsics=extrinsics,
             metadata=metadata,
         )
 

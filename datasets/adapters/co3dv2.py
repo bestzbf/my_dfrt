@@ -702,7 +702,29 @@ class Co3Dv2Adapter(BaseAdapter):
             is not used; track supervision remains available.
         """
         self.root = Path(root)
-        if not self.root.exists():
+        # Check cache first to skip slow root.exists() on remote storage
+        _cache_hit = False
+        if cache_dir is not None:
+            # We need to set basic attributes for _build_index_cache_path
+            self.subset_name = subset_name
+            self.split = split
+            self.categories = list(categories) if categories is not None else list(ALL_CATEGORIES)
+            self.min_frames = min_frames
+            self.min_viewpoint_quality = _safe_float(min_viewpoint_quality)
+            self.min_pointcloud_quality = _safe_float(min_pointcloud_quality)
+            self.min_pointcloud_n_points = _safe_int(min_pointcloud_n_points)
+            self.min_valid_depth_ratio = _safe_float(min_valid_depth_ratio)
+            self.min_foreground_ratio = _safe_float(min_foreground_ratio)
+            self.quality_probe_frames = int(quality_probe_frames)
+            self.require_pointcloud = bool(require_pointcloud)
+            self.require_precomputed = bool(require_precomputed)
+            self.max_sequences_per_category = _safe_int(max_sequences_per_category)
+            self._sequence_allow_uids, self._sequence_allow_names = _parse_sequence_filter(sequence_allowlist)
+            self._sequence_deny_uids, self._sequence_deny_names = _parse_sequence_filter(sequence_denylist)
+            _cache_path = self._build_index_cache_path(Path(cache_dir))
+            if _cache_path.exists():
+                _cache_hit = True
+        if not _cache_hit and not self.root.exists():
             raise FileNotFoundError(f"Co3Dv2 root not found: {self.root}")
 
         if subset_name not in _SUBSET_MAP:

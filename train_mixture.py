@@ -164,6 +164,57 @@ def summarize_spool_ready(dataset, focus_index: int | None = None) -> dict:
     return out
 
 
+def planned_startup_warmup(
+    dataset,
+    target_samples: int,
+    timeout_s: float,
+    local_rank: int,
+    epoch: int,
+) -> None:
+    """Wait for an initial contiguous planned-mode window before timing data."""
+    target_samples = max(0, int(target_samples))
+    if target_samples <= 0:
+        return
+
+    current = dataset
+    while current is not None and getattr(current, "spool", None) is None:
+        current = getattr(current, "dataset", None)
+    if current is None or getattr(current, "spool", None) is None:
+        return
+
+    try:
+        target_samples = min(target_samples, len(current))
+    except Exception:
+        pass
+    if target_samples <= 0:
+        return
+
+    start = time.perf_counter()
+    deadline = start + max(0.0, float(timeout_s))
+    stats = summarize_spool_ready(current, focus_index=0)
+    timed_out = False
+    while int(stats.get("contiguous_from_focus", 0) or 0) < target_samples:
+        if time.perf_counter() >= deadline:
+            timed_out = True
+            break
+        time.sleep(0.1)
+        stats = summarize_spool_ready(current, focus_index=0)
+
+    waited_s = time.perf_counter() - start
+    if local_rank == 0 and (waited_s >= 0.5 or timed_out):
+        status = "timeout" if timed_out else "ready"
+        print(
+            f"[PlannedWarmup rank{local_rank}] "
+            f"epoch={epoch} status={status} waited={waited_s * 1000:.0f}ms "
+            f"target_contiguous={target_samples} "
+            f"contiguous={stats.get('contiguous_from_focus')} "
+            f"spool_ready={stats.get('ready_count')} "
+            f"spool_min={stats.get('ready_min')} "
+            f"spool_max={stats.get('ready_max')}",
+            flush=True,
+        )
+
+
 def format_dataset_counts(dataset_names) -> str:
     counts = {}
     for name in dataset_names or []:
@@ -406,6 +457,15 @@ def set_dataset_epoch(dataset, epoch: int) -> None:
     while current is not None:
         if hasattr(current, "set_epoch"):
             current.set_epoch(epoch)
+            return
+        current = getattr(current, "dataset", None)
+
+
+def cleanup_dataset(dataset) -> None:
+    current = dataset
+    while current is not None:
+        if hasattr(current, "cleanup"):
+            current.cleanup()
             return
         current = getattr(current, "dataset", None)
 
@@ -884,10 +944,20 @@ def main():
     data_wait_detail_max_samples = int(os.getenv("D4RT_DATA_WAIT_DETAIL_MAX_SAMPLES", "8"))
     # Auto-print slow data diagnostics when data time exceeds this threshold
     slow_data_threshold_s = float(os.getenv("D4RT_SLOW_DATA_THRESHOLD_S", "3.0"))
+    planned_warmup_samples = int(os.getenv("D4RT_PLANNED_STARTUP_WARMUP_SAMPLES", "0"))
+    planned_warmup_timeout_s = float(os.getenv("D4RT_PLANNED_STARTUP_WARMUP_TIMEOUT_S", "60.0"))
     for epoch in range(start_epoch, args.epochs):
         if distributed and isinstance(train_sampler, DistributedSampler):
             train_sampler.set_epoch(epoch)
         set_dataset_epoch(train_dataset, epoch)
+        if args.planned_mode:
+            planned_startup_warmup(
+                train_dataset,
+                target_samples=planned_warmup_samples,
+                timeout_s=planned_warmup_timeout_s,
+                local_rank=local_rank,
+                epoch=epoch,
+            )
         model.train()
         epoch_loss = 0
         optimizer.zero_grad(set_to_none=True)
@@ -981,7 +1051,7 @@ def main():
             t_fwd = time.perf_counter() - t_fwd_start
             reasons = []
             if profile_data_wait:
-                if t_data >= data_wait_threshold_s:
+                if data_wait_threshold_s > 0 and t_data >= data_wait_threshold_s:
                     reasons.append(f"threshold>={data_wait_threshold_s:.3f}s")
                 if data_wait_compare_fwd and t_data > t_fwd:
                     reasons.append("data_gt_fwd_bwd")
@@ -1016,8 +1086,9 @@ def main():
                         ):
                             print(f"[DataWaitDetail rank{local_rank}] {detail_line}", flush=True)
 
-            # Auto-print slow data diagnostics
-            if t_data >= slow_data_threshold_s and not reasons:
+            # Auto-print slow data diagnostics only for positive thresholds.
+            is_slow_data = slow_data_threshold_s > 0 and t_data >= slow_data_threshold_s
+            if is_slow_data and not reasons:
                 spool_stats = summarize_spool_ready(
                     train_dataset, focus_index=next_planned_index_for_batch
                 )
@@ -1197,6 +1268,8 @@ def main():
                 'global_step': global_step,
             }, checkpoint_path)
             print(f"Saved checkpoint to {checkpoint_path}")
+
+    cleanup_dataset(train_dataset)
 
     if distributed:
         dist.destroy_process_group()

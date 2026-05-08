@@ -417,6 +417,7 @@ class D4RTQueryBuilder:
             if self.precompute_from_highres and highres_video is not None:
                 highres_hwc = highres_video.permute(0, 2, 3, 1)  # [T,H,W,3]
                 local_patches = self._extract_patches(highres_hwc, patch_queries)
+                highres_video = None
             else:
                 video_hwc = video.permute(0, 2, 3, 1)   # [T,H,W,3]
                 local_patches = self._extract_patches(video_hwc, patch_queries)
@@ -860,7 +861,11 @@ class D4RTQueryBuilder:
         video_hwc: torch.Tensor,    # [T,H,W,3]
         patch_queries: torch.Tensor, # [Q,3] (u,v,t_src)  u/v in [0,1]
     ) -> torch.Tensor:
-        frames_btchw = video_hwc.permute(0, 3, 1, 2).unsqueeze(0).float()  # [1,T,3,H,W]
+        frames_btchw = video_hwc.permute(0, 3, 1, 2).unsqueeze(0)  # [1,T,3,H,W]
+        if frames_btchw.dtype == torch.uint8:
+            frames_btchw = frames_btchw.float().div_(255.0)
+        else:
+            frames_btchw = frames_btchw.float()
         coords_uv    = patch_queries[:, :2].unsqueeze(0)             # [1,Q,2]
         t_src_idx    = patch_queries[:, 2].round().long().unsqueeze(0)  # [1,Q]
         patches = extract_local_patches(

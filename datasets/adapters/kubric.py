@@ -98,7 +98,23 @@ class KubricAdapter(BaseAdapter):
         self.split = split
         self.verbose = verbose
         self.index_workers = index_workers
-        if not self.root.exists():
+        # Check cache first to skip slow root.exists() on remote storage
+        _cache_hit = False
+        if cache_dir is not None:
+            from datasets.index_cache import load_or_build
+
+            cache_key = {
+                "dataset": self.dataset_name,
+                "root": str(self.root.resolve()),
+                "cache_schema": 4,
+            }
+            cache_suffix = hashlib.sha1(
+                json.dumps(cache_key, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:12]
+            cache_path = Path(cache_dir) / f"{self.dataset_name}_all_{cache_suffix}.pkl"
+            if cache_path.exists():
+                _cache_hit = True
+        if not _cache_hit and not self.root.exists():
             raise FileNotFoundError(f"Kubric root not found: {self.root}")
         if cache_dir is not None:
             from datasets.index_cache import load_or_build

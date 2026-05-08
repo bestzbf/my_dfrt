@@ -117,7 +117,28 @@ class PointOdysseyAdapter(BaseAdapter):
         )
 
         split_root = self.root / self.split
-        if not split_root.exists():
+
+        # Check cache first to skip slow root.exists() on remote storage
+        _cache_hit = False
+        if cache_dir is not None:
+            from datasets.index_cache import load_or_build
+            cache_key = {
+                "dataset": self.dataset_name,
+                "split": split,
+                "root": str(self.root.resolve()),
+                "fast_root": str(self.fast_root.resolve()) if self.fast_root is not None else None,
+                "require_tracks": self.require_tracks,
+                "strict": self.strict,
+                "cache_schema": 3,
+            }
+            cache_suffix = hashlib.sha1(
+                json.dumps(cache_key, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:12]
+            _cache_path = Path(cache_dir) / f"{self.dataset_name}_{split}_{cache_suffix}.pkl"
+            if _cache_path.exists():
+                _cache_hit = True
+
+        if not _cache_hit and not split_root.exists():
             raise FileNotFoundError(
                 f"Split root not found: {split_root}\n"
                 f"Expected root like /path/to/PointOdyssey and split like 'train'/'test'."
@@ -178,6 +199,18 @@ class PointOdysseyAdapter(BaseAdapter):
         if cached is not None:
             return bool(cached)
 
+        if os.getenv("POINTODYSSEY_ASSUME_TRACKS", "0").strip().lower() in {"1", "true", "yes", "on"}:
+            return True
+
+        seq_root = str(getattr(record, "sequence_root", ""))
+        if seq_root.startswith("/data_cos/") and os.getenv(
+            "D4RT_POINTODYSSEY_PROBE_REMOTE_TRACKS", "0"
+        ).strip().lower() not in {"1", "true", "yes", "on"}:
+            # Server-side COS caches are expensive to probe at startup. They are
+            # expected to be pre-filtered by the cache warmer unless explicitly
+            # requested otherwise.
+            return True
+
         has_tracks = False
         try:
             if record.fast_anno_paths is not None and "trajs_3d" in record.fast_anno_paths:
@@ -188,7 +221,7 @@ class PointOdysseyAdapter(BaseAdapter):
                 if "trajs_3d" in anno:
                     trajs_3d = anno["trajs_3d"]
                     has_tracks = not (trajs_3d.ndim == 0 or trajs_3d.shape[0] == 0)
-        except (FileNotFoundError, KeyError, OSError, ValueError):
+        except (FileNotFoundError, KeyError, OSError, ValueError, IndexError):
             has_tracks = False
 
         try:
@@ -836,10 +869,20 @@ class PointOdysseyAdapter(BaseAdapter):
             for key in FAST_REQUIRED_ANNO_FILES:
                 if key in r.fast_anno_paths:
                     arr = np.load(r.fast_anno_paths[key], mmap_mode="r", allow_pickle=False)
-                    anno[key] = arr[idx] if idx is not None else arr
+                    if idx is not None and arr.ndim >= 1:
+                        anno[key] = arr[idx]
+                    elif idx is not None:
+                        anno[key] = arr[()]
+                    else:
+                        anno[key] = arr
             if "visibs" in r.fast_anno_paths:
                 arr = np.load(r.fast_anno_paths["visibs"], mmap_mode="r", allow_pickle=False)
-                anno["visibs"] = arr[idx] if idx is not None else arr
+                if idx is not None and arr.ndim >= 1:
+                    anno["visibs"] = arr[idx]
+                elif idx is not None:
+                    anno["visibs"] = arr[()]
+                else:
+                    anno["visibs"] = arr
             elif "valids" in anno:
                 anno["visibs"] = anno["valids"]
             return anno

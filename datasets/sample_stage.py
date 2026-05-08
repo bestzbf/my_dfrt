@@ -38,6 +38,8 @@ class SampleStageConfig:
     backend: str
     stage_root: str
     sdk_workers: int = 8
+    cos_timeout_s: int = 20
+    download_retries: int = 2
     cache_max_bytes: int = 100 * 1024**3
     cache_low_watermark_ratio: float = 0.9
     cache_touch_interval_s: float = 30.0
@@ -78,6 +80,8 @@ class SampleStageConfig:
             backend=str(raw.get("backend", "")).strip().lower(),
             stage_root=str(raw.get("stage_root", "")).strip(),
             sdk_workers=max(1, int(raw.get("sdk_workers", 8))),
+            cos_timeout_s=max(1, int(raw.get("cos_timeout_s", 20))),
+            download_retries=max(0, int(raw.get("download_retries", 2))),
             cache_max_bytes=max(0, int(raw.get("cache_max_bytes", 100 * 1024**3))),
             cache_low_watermark_ratio=min(
                 0.99,
@@ -102,6 +106,15 @@ class SampleStageConfig:
 class SampleLocalStager:
     """Builder-local staging helper."""
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop('_tls', None)  # threading.local() is not picklable
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._tls = threading.local()
+
     def __init__(self, config: SampleStageConfig):
         if config.backend != "cos_sdk":
             raise ValueError(f"Unsupported sample stage backend: {config.backend!r}")
@@ -122,13 +135,21 @@ class SampleLocalStager:
     def _get_client(self) -> CosS3Client:
         client = getattr(self._tls, "cos_client", None)
         if client is None:
-            secret_id, secret_key = Path(self.config.passwd_file).read_text().strip().split(":", 1)
+            parts = Path(self.config.passwd_file).read_text().strip().split(":")
+            if len(parts) == 2:
+                secret_id, secret_key = parts
+            elif len(parts) == 3:
+                _bucket, secret_id, secret_key = parts
+            else:
+                raise ValueError(
+                    f"Unsupported COS passwd file format: {self.config.passwd_file}"
+                )
             cos_config = CosConfig(
                 Region=self.config.region,
                 SecretId=secret_id,
                 SecretKey=secret_key,
                 Scheme="https",
-                Timeout=60,
+                Timeout=self.config.cos_timeout_s,
             )
             client = CosS3Client(cos_config)
             self._tls.cos_client = client
@@ -143,6 +164,12 @@ class SampleLocalStager:
             return False
         mount = str(self.mount_root).rstrip("/") + "/"
         return str(root).startswith(mount) or str(root) == str(self.mount_root)
+
+    @staticmethod
+    def _stage_blendedmvs_precomputed_enabled() -> bool:
+        return os.getenv(
+            "D4RT_BLENDEDMVS_STAGE_PRECOMPUTED", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
 
     @contextlib.contextmanager
     def stage_sample(
@@ -330,11 +357,16 @@ class SampleLocalStager:
             colmap_dir / "cameras.txt",
             colmap_dir / "images.txt",
             scene_dir / "iphone" / "pose_intrinsic_imu.json",
-            scene_dir / "precomputed.h5",
         ]
         paths += [frames_dir / f"{i:06d}.jpg" for i in frame_indices]
         # depth.bin fetched via Range requests — not in manifest
-        # precomputed.h5 read directly from COS mount via h5py chunked access
+        # precomputed.h5 itself is not staged.  When tracks are enabled, stage
+        # the tiny chunk index so the adapter can fetch only needed h5 chunks
+        # via COS Range requests.
+        if getattr(adapter, "use_precomputed_tracks", False):
+            index_path = scene_dir / "precomputed.h5_chunk_index.pkl"
+            if index_path.exists():
+                paths.append(index_path)
         return self._dedupe_keep_order(paths)
 
     def _prepare_scannetpp_depth_stage(
@@ -409,6 +441,27 @@ class SampleLocalStager:
             paths.append(record.rgb_path(frame_id, adapter.use_masked))
             paths.append(record.depth_path(frame_id))
             paths.append(record.cam_path(frame_id))
+        precompute_root = getattr(adapter, "precompute_root", None)
+        stage_precomputed = self._stage_blendedmvs_precomputed_enabled()
+        if stage_precomputed and precompute_root is not None:
+            precomputed_npz = Path(precompute_root) / sequence_name / "precomputed.npz"
+            precomputed_h5 = precomputed_npz.with_suffix(".h5")
+            max_bytes = int(
+                float(os.getenv("D4RT_BLENDEDMVS_STAGE_PRECOMPUTED_MAX_GB", "2.0"))
+                * 1024**3
+            )
+            if precomputed_h5.exists():
+                try:
+                    if max_bytes <= 0 or precomputed_h5.stat().st_size <= max_bytes:
+                        paths.append(precomputed_h5)
+                except OSError:
+                    pass
+            elif precomputed_npz.exists():
+                try:
+                    if max_bytes <= 0 or precomputed_npz.stat().st_size <= max_bytes:
+                        paths.append(precomputed_npz)
+                except OSError:
+                    pass
         return self._dedupe_keep_order(paths)
 
     def _manifest_co3dv2(
@@ -575,22 +628,33 @@ class SampleLocalStager:
     def _download_to_cache(self, src_path: Path, cache_path: Path, rel_key: Path) -> None:
         key = rel_key.as_posix()
         tmp_path = cache_path.with_name(f".{cache_path.name}.part.{os.getpid()}.{threading.get_ident()}")
-        response = self._get_client().get_object(
-            Bucket=self.config.bucket,
-            Key=key,
-        )
-        stream = response["Body"].get_raw_stream()
-        try:
-            with open(tmp_path, "wb") as f:
-                while True:
-                    chunk = stream.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-            os.replace(tmp_path, cache_path)
-        finally:
-            if tmp_path.exists():
+        last_exc: Optional[BaseException] = None
+        for attempt in range(self.config.download_retries + 1):
+            try:
+                response = self._get_client().get_object(
+                    Bucket=self.config.bucket,
+                    Key=key,
+                )
+                stream = response["Body"].get_raw_stream()
+                with open(tmp_path, "wb") as f:
+                    while True:
+                        chunk = stream.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                os.replace(tmp_path, cache_path)
+                return
+            except BaseException as exc:
+                last_exc = exc
                 tmp_path.unlink(missing_ok=True)
+                if attempt < self.config.download_retries:
+                    time.sleep(min(2.0, 0.25 * (2 ** attempt)))
+                    continue
+                raise
+            finally:
+                tmp_path.unlink(missing_ok=True)
+        if last_exc is not None:
+            raise last_exc
 
     def _touch_cache_entry(self, cache_path: Path, force: bool = False) -> None:
         interval = self.config.cache_touch_interval_s
@@ -796,18 +860,32 @@ class SampleLocalStager:
 
         if dataset_name == "blendedmvs":
             old_root = adapter.root
+            old_precompute_root = getattr(adapter, "precompute_root", None)
             old_record = adapter._name_to_record[sequence_name]
             new_record = old_record.__class__(
                 scene_id=old_record.scene_id,
                 scene_dir=staged_dataset_root / old_record.scene_dir.relative_to(old_root),
                 frame_ids=old_record.frame_ids,
             )
+            new_precompute_root = old_precompute_root
+            if (
+                old_precompute_root is not None
+                and self._stage_blendedmvs_precomputed_enabled()
+            ):
+                try:
+                    new_precompute_root = (
+                        staged_dataset_root / Path(old_precompute_root).relative_to(old_root)
+                    )
+                except ValueError:
+                    new_precompute_root = old_precompute_root
             adapter.root = staged_dataset_root
+            adapter.precompute_root = new_precompute_root
             adapter._name_to_record[sequence_name] = new_record
             try:
                 yield
             finally:
                 adapter.root = old_root
+                adapter.precompute_root = old_precompute_root
                 adapter._name_to_record[sequence_name] = old_record
             return
 
@@ -817,7 +895,25 @@ class SampleLocalStager:
             if old_scene_cache is not None:
                 new_scene_data = dict(old_scene_cache)
                 new_scene_data["scene_dir"] = staged_dataset_root / old_scene_cache["scene_dir"].relative_to(old_data_root)
-                new_scene_data["_precomputed_dir"] = new_scene_data["scene_dir"]
+                precomputed_dir = old_scene_cache.get("_precomputed_dir", old_scene_cache["scene_dir"])
+                try:
+                    cached_scene_dir = self.cache_data_root / self._to_cos_key(old_scene_cache["scene_dir"])
+                    if (
+                        (cached_scene_dir / "precomputed.h5").is_file()
+                        or (cached_scene_dir / "precomputed.npz").is_file()
+                    ):
+                        precomputed_dir = cached_scene_dir
+                except Exception:
+                    pass
+                new_scene_data["_precomputed_dir"] = precomputed_dir
+                index_dir = precomputed_dir
+                try:
+                    cached_scene_dir = self.cache_data_root / self._to_cos_key(old_scene_cache["scene_dir"])
+                    if (cached_scene_dir / "precomputed.h5_chunk_index.pkl").is_file():
+                        index_dir = cached_scene_dir
+                except Exception:
+                    pass
+                new_scene_data["_precomputed_index_dir"] = index_dir
                 # _staged_depth_map set by _prepare_scannetpp_depth_stage in stage_sample
                 staged_depth_map = getattr(adapter, "_staged_depth_map_tmp", None)
                 if staged_depth_map is not None:

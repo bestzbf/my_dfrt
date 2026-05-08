@@ -317,6 +317,21 @@ class SampleSpool:
         """
         return self._get_ready_path(index, generation).exists()
 
+    def list_ready_indices(self, generation: int) -> list[int]:
+        """Return sorted ready bundle indices for a generation."""
+        prefix = f"g{generation:04d}_"
+        indices: list[int] = []
+        for path in self.spool_dir.iterdir():
+            name = path.name
+            if not (name.startswith(prefix) and name.endswith(".ready")):
+                continue
+            try:
+                indices.append(int(name[len(prefix):len(prefix) + 8]))
+            except ValueError:
+                continue
+        indices.sort()
+        return indices
+
     def has_error(self, index: int, generation: int) -> bool:
         """Check if a bundle has an error marker.
 
@@ -328,6 +343,21 @@ class SampleSpool:
             True if bundle has error
         """
         return self._get_error_path(index, generation).exists()
+
+    def list_error_indices(self, generation: int) -> list[int]:
+        """Return sorted error marker indices for a generation."""
+        prefix = f"g{generation:04d}_"
+        indices: list[int] = []
+        for path in self.spool_dir.iterdir():
+            name = path.name
+            if not (name.startswith(prefix) and name.endswith(".error")):
+                continue
+            try:
+                indices.append(int(name[len(prefix):len(prefix) + 8]))
+            except ValueError:
+                continue
+        indices.sort()
+        return indices
 
     # ------------------------------------------------------------------
     # Convenience queries

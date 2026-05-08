@@ -301,8 +301,8 @@ if [[ ! -f "$TORCHRUN_BIN" ]]; then
 fi
 
 if [[ "$AUTO_WARM_INDEX_CACHE" == "1" || "$WARM_CACHE_ONLY" == "1" ]]; then
-  if [[ ! -f "$ROOT_DIR/warm_index_cache_5datasets_cos.sh" ]]; then
-    echo "[mixture_5datasets_cos_planned] warm script not found: $ROOT_DIR/warm_index_cache_5datasets_cos.sh" >&2
+  if [[ ! -f "$ROOT_DIR/cos/warm_index_cache_5datasets_cos.sh" ]]; then
+    echo "[mixture_5datasets_cos_planned] warm script not found: $ROOT_DIR/cos/warm_index_cache_5datasets_cos.sh" >&2
     exit 1
   fi
   echo "[mixture_5datasets_cos_planned] warming index cache before torchrun"
@@ -326,7 +326,7 @@ if [[ "$AUTO_WARM_INDEX_CACHE" == "1" || "$WARM_CACHE_ONLY" == "1" ]]; then
   INDEX_WORKERS="$WARM_INDEX_WORKERS" \
   WARM_VAL="$WARM_VAL" \
   ONLY_DATASETS="$WARM_ONLY_DATASETS" \
-  bash "$ROOT_DIR/warm_index_cache_5datasets_cos.sh"
+  bash "$ROOT_DIR/cos/warm_index_cache_5datasets_cos.sh"
 fi
 
 if [[ "$WARM_CACHE_ONLY" == "1" ]]; then

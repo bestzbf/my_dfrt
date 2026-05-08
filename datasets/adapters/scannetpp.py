@@ -677,6 +677,15 @@ class ScanNetPPAdapter(BaseAdapter):
         self._h5_chunk_index_cache: dict[str, dict[str, Any]] = {}
         self._cos_range_warned = False
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop('_cos_tls', None)  # threading.local() is not picklable
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._cos_tls = threading.local()
+
     def _precomputed_npz_path(self, scene_dir: Path) -> Path:
         return scene_dir / self.precomputed_name
 

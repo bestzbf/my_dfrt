@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
 
 CONFIG="${CONFIG:-configs/mixture_5datasets_cos_planned.yaml}"
@@ -61,7 +62,19 @@ if [[ -n "$ONLY_DATASETS" ]]; then
   echo "[warm_index_cache] ONLY_DATASETS=$ONLY_DATASETS"
 fi
 
-/root/miniconda3/envs/d4rt/bin/python - "$CONFIG" "$INDEX_CACHE_DIR" "$POINTODYSSEY_ROOT" "$POINTODYSSEY_LOCAL_ROOT" "$POINTODYSSEY_LOCAL_CACHE_DIR" "$POINTODYSSEY_REQUIRE_TRACKS" "$POINTODYSSEY_ASSUME_TRACKS" "$POINTODYSSEY_TRACK_WORKERS" "$KUBRIC_ROOT" "$DYNAMIC_REPLICA_ROOT" "$CO3DV2_ROOT" "$BLENDEDMVS_ROOT" "$MVSSYNTH_ROOT" "$SCANNETPP_ROOT" "$SCANNETPP_SPLITS_DIR" "$SCANNETPP_SCENES_RECORD" "$CO3DV2_DENYLIST" "$INDEX_WORKERS" "$WARM_VAL" "$ONLY_DATASETS" <<'PY'
+PYTHON_BIN="${PYTHON_BIN:-/root/miniconda3/envs/d4rt/bin/python}"
+if [[ ! -f "$PYTHON_BIN" ]]; then
+  # 尝试本地conda环境
+  if [[ -f "$HOME/miniconda3/envs/d4rt/bin/python" ]]; then
+    PYTHON_BIN="$HOME/miniconda3/envs/d4rt/bin/python"
+  elif [[ -f "$HOME/anaconda3/envs/d4rt/bin/python" ]]; then
+    PYTHON_BIN="$HOME/anaconda3/envs/d4rt/bin/python"
+  else
+    echo "[warm_index_cache] ERROR: Python not found at $PYTHON_BIN" >&2
+    exit 1
+  fi
+fi
+"$PYTHON_BIN" - "$CONFIG" "$INDEX_CACHE_DIR" "$POINTODYSSEY_ROOT" "$POINTODYSSEY_LOCAL_ROOT" "$POINTODYSSEY_LOCAL_CACHE_DIR" "$POINTODYSSEY_REQUIRE_TRACKS" "$POINTODYSSEY_ASSUME_TRACKS" "$POINTODYSSEY_TRACK_WORKERS" "$KUBRIC_ROOT" "$DYNAMIC_REPLICA_ROOT" "$CO3DV2_ROOT" "$BLENDEDMVS_ROOT" "$MVSSYNTH_ROOT" "$SCANNETPP_ROOT" "$SCANNETPP_SPLITS_DIR" "$SCANNETPP_SCENES_RECORD" "$CO3DV2_DENYLIST" "$INDEX_WORKERS" "$WARM_VAL" "$ONLY_DATASETS" <<'PY'
 from __future__ import annotations
 
 import copy

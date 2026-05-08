@@ -3,9 +3,11 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import pickle
 import re
 import struct
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any, Optional
@@ -19,6 +21,57 @@ from datasets.computer.depth_to_tracks import (
 )
 
 from .base import BaseAdapter, UnifiedClip
+
+
+def _lzf_decompress(data: bytes, expected_size: int) -> bytes:
+    """Decompress a raw liblzf block used by HDF5's built-in LZF filter."""
+    try:
+        import imagecodecs
+
+        decoded = imagecodecs.lzf_decode(data, out=expected_size)
+        if len(decoded) != expected_size:
+            raise ValueError(
+                f"LZF decoded {len(decoded)} bytes, expected {expected_size}"
+            )
+        return bytes(decoded)
+    except ImportError as exc:
+        raise RuntimeError(
+            "BlendedMVS COS Range reading needs imagecodecs to decode "
+            "LZF-compressed HDF5 chunks. Install imagecodecs or rebuild "
+            "precomputed.h5 without compression."
+        ) from exc
+
+    src = memoryview(data)
+    out = bytearray()
+    i = 0
+    n = len(src)
+    while i < n:
+        ctrl = src[i]
+        i += 1
+        if ctrl < 32:
+            length = ctrl + 1
+            out.extend(src[i:i + length])
+            i += length
+            continue
+
+        length = ctrl >> 5
+        ref = len(out) - (((ctrl & 0x1F) << 8) + src[i] + 1)
+        i += 1
+        if length == 7:
+            length += src[i]
+            i += 1
+        length += 2
+        if ref < 0:
+            raise ValueError("Invalid LZF back-reference")
+        for _ in range(length):
+            out.append(out[ref])
+            ref += 1
+
+    if len(out) != expected_size:
+        raise ValueError(
+            f"LZF decoded {len(out)} bytes, expected {expected_size}"
+        )
+    return bytes(out)
 
 
 # ---------------------------------------------------------------------------
@@ -240,6 +293,16 @@ class BlendedMVSAdapter(BaseAdapter):
         io_workers: int = 1,
         depth_cache_dir: Optional[str] = None,
         load_precomputed: bool = True,
+        load_normals: bool = True,
+        precomputed_read_mode: str = "auto",
+        precomputed_cos_mount_root: str = "/data_cos",
+        precomputed_cos_bucket: str = "hd-ai-data-1251882982",
+        precomputed_cos_region: str = "ap-beijing",
+        precomputed_cos_passwd_file: str = "/etc/passwd-s3fs-data_cos",
+        precomputed_cos_timeout_s: int = 20,
+        precomputed_cos_range_workers: int = 16,
+        precomputed_cos_range_retries: int = 2,
+        precomputed_cos_range_merge_gap_bytes: int = 1024 * 1024,
     ) -> None:
         """
         Parameters
@@ -258,7 +321,27 @@ class BlendedMVSAdapter(BaseAdapter):
             Print summary information during construction.
         """
         self.root = Path(root)
-        if not self.root.exists():
+        # Check cache first to skip slow root.exists() on remote storage
+        _cache_hit = False
+        if cache_dir is not None:
+            from datasets.index_cache import load_or_build
+            cache_precompute_root = Path(precompute_root) if precompute_root else self.root
+            cache_key = {
+                "dataset": "blendedmvs",
+                "split": split.lower(),
+                "root": str(self.root.resolve()),
+                "precompute_root": str(cache_precompute_root.resolve()),
+                "use_masked": use_masked,
+                "strict": strict,
+                "cache_schema": 2,
+            }
+            cache_suffix = hashlib.sha1(
+                json.dumps(cache_key, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:12]
+            _cache_path = Path(cache_dir) / f"blendedmvs_{split.lower()}_{cache_suffix}.pkl"
+            if _cache_path.exists():
+                _cache_hit = True
+        if not _cache_hit and not self.root.exists():
             raise FileNotFoundError(f"BlendedMVS root not found: {self.root}")
 
         split_key = split.lower()
@@ -274,6 +357,30 @@ class BlendedMVSAdapter(BaseAdapter):
         self.index_workers = index_workers
         self.io_workers = max(1, int(io_workers))
         self.load_precomputed = bool(load_precomputed)
+        if isinstance(load_normals, str):
+            self.load_normals = load_normals.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            self.load_normals = bool(load_normals)
+        self.precomputed_read_mode = str(precomputed_read_mode or "auto").strip().lower()
+        self.precomputed_cos_mount_root = Path(precomputed_cos_mount_root)
+        self.precomputed_cos_bucket = str(precomputed_cos_bucket)
+        self.precomputed_cos_region = str(precomputed_cos_region)
+        if (
+            precomputed_cos_passwd_file == "/etc/passwd-s3fs-data_cos"
+            and not Path(precomputed_cos_passwd_file).exists()
+            and Path("/etc/passwd-cosfs").exists()
+        ):
+            precomputed_cos_passwd_file = "/etc/passwd-cosfs"
+        self.precomputed_cos_passwd_file = str(precomputed_cos_passwd_file)
+        self.precomputed_cos_timeout_s = int(precomputed_cos_timeout_s)
+        self.precomputed_cos_range_workers = max(1, int(precomputed_cos_range_workers))
+        self.precomputed_cos_range_retries = max(0, int(precomputed_cos_range_retries))
+        self.precomputed_cos_range_merge_gap_bytes = max(
+            0, int(precomputed_cos_range_merge_gap_bytes)
+        )
+        self._cos_tls = threading.local()
+        self._h5_chunk_index_cache: dict[str, dict[str, Any]] = {}
+        self._cos_object_exists_cache: dict[str, bool] = {}
         resolved_depth_cache_dir = depth_cache_dir or os.getenv(
             "D4RT_BLENDEDMVS_DEPTH_CACHE_DIR", ""
         )
@@ -318,6 +425,15 @@ class BlendedMVSAdapter(BaseAdapter):
                 f"num_sequences={len(self._records)}, "
                 f"use_masked={self.use_masked}"
             )
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_cos_tls", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._cos_tls = threading.local()
 
     # ------------------------------------------------------------------
     # BaseAdapter interface
@@ -375,7 +491,13 @@ class BlendedMVSAdapter(BaseAdapter):
             ``normals``, ``trajs_2d``, ``trajs_3d_world``, ``valids``, and
             ``visibs`` are all ``None`` (not available in BlendedMVS).
         """
+        import time as _time
+
+        timing: dict[str, float] = {}
+        t_total_start = _time.perf_counter()
+        t0 = _time.perf_counter()
         r = self._get_record(sequence_name)
+        timing["scene_data_s"] = _time.perf_counter() - t0
         self._check_indices(frame_indices, r.num_frames, sequence_name)
 
         def _load_one(idx: int):
@@ -385,9 +507,15 @@ class BlendedMVSAdapter(BaseAdapter):
             dep_p = r.depth_path(fid)
             cam_p = r.cam_path(fid)
 
+            t_rgb = _time.perf_counter()
             image = self._read_image(rgb_p)
+            rgb_s = _time.perf_counter() - t_rgb
+            t_depth = _time.perf_counter()
             depth = self._read_depth(dep_p, r.scene_id, fid)
+            depth_s = _time.perf_counter() - t_depth
+            t_cam = _time.perf_counter()
             cam = _parse_cam_file(cam_p)
+            cam_s = _time.perf_counter() - t_cam
             return (
                 image,
                 depth,
@@ -395,20 +523,40 @@ class BlendedMVSAdapter(BaseAdapter):
                 cam["extrinsic"],    # (4, 4) float32 w2c
                 str(rgb_p),
                 (cam["depth_min"], cam["depth_max"]),
+                rgb_s,
+                depth_s,
+                cam_s,
             )
 
+        t0 = _time.perf_counter()
         if self.io_workers > 1 and len(frame_indices) > 1:
             with ThreadPoolExecutor(max_workers=min(len(frame_indices), self.io_workers)) as ex:
                 rows = list(ex.map(_load_one, frame_indices))
         else:
             rows = [_load_one(idx) for idx in frame_indices]
+        timing["frame_load_s"] = _time.perf_counter() - t0
 
-        (images, depths, intrinsics_list, extrinsics_list, frame_paths, depth_ranges) = (
+        (
+            images,
+            depths,
+            intrinsics_list,
+            extrinsics_list,
+            frame_paths,
+            depth_ranges,
+            rgb_times,
+            depth_times,
+            cam_times,
+        ) = (
             list(items) for items in zip(*rows)
         )
+        timing["rgb_load_s"] = float(sum(rgb_times))
+        timing["depth_load_s"] = float(sum(depth_times))
+        timing["cam_load_s"] = float(sum(cam_times))
 
+        t0 = _time.perf_counter()
         intrinsics = np.stack(intrinsics_list, axis=0)   # (T, 3, 3) float32
         extrinsics = np.stack(extrinsics_list, axis=0)   # (T, 4, 4) float32 w2c
+        timing["process_s"] = _time.perf_counter() - t0
 
         # Load precomputed normals / tracks if available.
         # Old BlendedMVS caches used visibs == valids, which destroys visibility
@@ -420,9 +568,13 @@ class BlendedMVSAdapter(BaseAdapter):
         active_track_semantics_version: Optional[int] = None
         precomputed_track_semantics_refreshed = False
         if self.precompute_root is not None:
+            t0 = _time.perf_counter()
             cache = self._load_precomputed(sequence_name, frame_indices)
+            timing["precomputed_s"] = _time.perf_counter() - t0
             if cache is not None:
-                normals_out     = [n.astype(np.float32) for n in cache["normals"]]
+                t0 = _time.perf_counter()
+                if self.load_normals and "normals" in cache:
+                    normals_out = [n.astype(np.float32) for n in cache["normals"]]
                 trajs_2d_out    = cache["trajs_2d"]
                 trajs_3d_out    = cache["trajs_3d_world"]
                 valids_out      = cache["valids"]
@@ -447,8 +599,13 @@ class BlendedMVSAdapter(BaseAdapter):
                     active_track_semantics_version = TRACK_SEMANTICS_VERSION
                     precomputed_track_semantics_refreshed = True
 
-                has_normals_out = True
+                has_normals_out = normals_out is not None
                 has_tracks_out  = True
+                timing["process_s"] += _time.perf_counter() - t0
+        else:
+            timing["precomputed_s"] = 0.0
+
+        timing["total_s"] = _time.perf_counter() - t_total_start
 
         return UnifiedClip(
             dataset_name=self.dataset_name,
@@ -487,6 +644,7 @@ class BlendedMVSAdapter(BaseAdapter):
                 "depth_unit": "meters",
                 "depth_ranges": depth_ranges,  # [(depth_min, depth_max), ...]
                 "use_masked": self.use_masked,
+                "_load_timing": timing,
             },
         )
 
@@ -495,6 +653,19 @@ class BlendedMVSAdapter(BaseAdapter):
         from datasets.adapters.base import load_precomputed_fast
         path = self.precompute_root / sequence_name / "precomputed.npz"
         h5_path = path.with_suffix('.h5')
+        skip_keys = set() if self.load_normals else {"normals"}
+        index_path = self._precomputed_h5_chunk_index_path(h5_path)
+        if self._should_use_precomputed_cos_range(h5_path, index_path):
+            try:
+                return self._load_precomputed_cos_range(
+                    h5_path,
+                    index_path,
+                    frame_indices,
+                    skip_keys=skip_keys,
+                )
+            except Exception:
+                if self.precomputed_read_mode in {"cos_range", "range"}:
+                    raise
         if not path.exists() and not h5_path.exists():
             return None
         if h5_path.exists():
@@ -505,7 +676,318 @@ class BlendedMVSAdapter(BaseAdapter):
             n = int(np.load(path, allow_pickle=False)["num_frames"])
         if n < max(frame_indices) + 1:
             return None
-        return load_precomputed_fast(path, frame_indices)
+        return load_precomputed_fast(path, frame_indices, skip_keys=skip_keys)
+
+    def _precomputed_h5_chunk_index_path(self, h5_path: Path) -> Path:
+        return h5_path.with_name(f"{h5_path.name}_chunk_index.pkl")
+
+    def _path_is_under_cos_mount(self, path: Path) -> bool:
+        mount = str(self.precomputed_cos_mount_root).rstrip("/") + "/"
+        if str(path).startswith(mount) or str(path) == str(self.precomputed_cos_mount_root):
+            return True
+        try:
+            path.resolve().relative_to(self.precomputed_cos_mount_root.resolve())
+            return True
+        except Exception:
+            return False
+
+    def _should_use_precomputed_cos_range(self, h5_path: Path, index_path: Path) -> bool:
+        mode = self.precomputed_read_mode
+        if mode in {"h5py", "direct", "npz"}:
+            return False
+        if mode not in {"auto", "cos_range", "range"}:
+            return False
+        if mode == "auto" and not self._path_is_under_cos_mount(h5_path):
+            return False
+        if self._path_is_under_cos_mount(index_path):
+            return self._cos_object_exists(index_path)
+        return index_path.exists()
+
+    def _get_precomputed_cos_client(self) -> Any:
+        client = getattr(self._cos_tls, "client", None)
+        if client is None:
+            from qcloud_cos import CosConfig, CosS3Client
+
+            parts = Path(self.precomputed_cos_passwd_file).read_text().strip().split(":")
+            if len(parts) == 2:
+                secret_id, secret_key = parts
+            elif len(parts) == 3:
+                _bucket, secret_id, secret_key = parts
+            else:
+                raise ValueError(
+                    "Unsupported COS passwd file format: "
+                    f"{self.precomputed_cos_passwd_file}"
+                )
+            config = CosConfig(
+                Region=self.precomputed_cos_region,
+                SecretId=secret_id,
+                SecretKey=secret_key,
+                Scheme="https",
+                Timeout=self.precomputed_cos_timeout_s,
+            )
+            client = CosS3Client(config)
+            self._cos_tls.client = client
+        return client
+
+    def _precomputed_cos_key(self, path: Path) -> str:
+        try:
+            return path.relative_to(self.precomputed_cos_mount_root).as_posix()
+        except ValueError:
+            mount = str(self.precomputed_cos_mount_root).rstrip("/") + "/"
+            path_str = str(path)
+            if path_str.startswith(mount):
+                return path_str[len(mount):]
+            raise
+
+    def _is_cos_not_found_error(self, exc: BaseException) -> bool:
+        for attr in ("get_status_code", "get_error_code"):
+            getter = getattr(exc, attr, None)
+            if getter is None:
+                continue
+            try:
+                value = getter()
+            except Exception:
+                continue
+            if str(value) in {"404", "NoSuchKey", "NoSuchBucket", "NotFound"}:
+                return True
+        text = str(exc).lower()
+        return "nosuchkey" in text or "not found" in text or "404" in text
+
+    def _cos_object_exists(self, path: Path) -> bool:
+        cos_key = self._precomputed_cos_key(path)
+        cached = self._cos_object_exists_cache.get(cos_key)
+        if cached is not None:
+            return cached
+        for attempt in range(self.precomputed_cos_range_retries + 1):
+            try:
+                self._get_precomputed_cos_client().head_object(
+                    Bucket=self.precomputed_cos_bucket,
+                    Key=cos_key,
+                )
+                self._cos_object_exists_cache[cos_key] = True
+                return True
+            except BaseException as exc:
+                if self._is_cos_not_found_error(exc):
+                    self._cos_object_exists_cache[cos_key] = False
+                    return False
+                if attempt < self.precomputed_cos_range_retries:
+                    time.sleep(min(2.0, 0.25 * (2 ** attempt)))
+                    continue
+                if self.precomputed_read_mode in {"cos_range", "range"}:
+                    raise
+                return False
+        return False
+
+    def _read_cos_object(self, cos_key: str) -> bytes:
+        last_exc: Optional[BaseException] = None
+        for attempt in range(self.precomputed_cos_range_retries + 1):
+            try:
+                resp = self._get_precomputed_cos_client().get_object(
+                    Bucket=self.precomputed_cos_bucket,
+                    Key=cos_key,
+                )
+                return resp["Body"].get_raw_stream().read()
+            except BaseException as exc:
+                last_exc = exc
+                if attempt < self.precomputed_cos_range_retries:
+                    time.sleep(min(2.0, 0.25 * (2 ** attempt)))
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        raise IOError(f"COS object read failed: {cos_key}")
+
+    def _load_h5_chunk_index(self, index_path: Path) -> dict[str, Any]:
+        cache_key = str(index_path)
+        cached = self._h5_chunk_index_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        if self._path_is_under_cos_mount(index_path):
+            raw = self._read_cos_object(self._precomputed_cos_key(index_path))
+            index = pickle.loads(raw)
+            self._h5_chunk_index_cache[cache_key] = index
+            return index
+
+        with open(index_path, "rb") as f:
+            index = pickle.load(f)
+        self._h5_chunk_index_cache[cache_key] = index
+        return index
+
+    def _load_precomputed_cos_range(
+        self,
+        h5_path: Path,
+        index_path: Path,
+        frame_indices: list[int],
+        skip_keys: set[str],
+    ) -> dict[str, Any]:
+        index = self._load_h5_chunk_index(index_path)
+        keys = [
+            key
+            for key in ("normals", "trajs_2d", "trajs_3d_world", "valids", "visibs")
+            if key in index and key not in skip_keys
+        ]
+        if not keys:
+            raise KeyError(f"No supported array keys in h5 chunk index: {index_path}")
+        sorted_idx = sorted(set(int(i) for i in frame_indices))
+        if not sorted_idx:
+            raise ValueError("frame_indices is empty")
+
+        tasks: list[dict[str, Any]] = []
+        chunks_by_key: dict[str, dict[int, np.ndarray]] = {key: {} for key in keys}
+        entries: dict[str, dict[str, Any]] = {}
+        for key in keys:
+            entry = index[key]
+            entries[key] = entry
+            self._validate_h5_range_entry(key, entry, sorted_idx)
+            for start, end, chunks in self._merge_h5_range_chunks(entry, sorted_idx):
+                tasks.append({"key": key, "start": start, "end": end, "chunks": chunks})
+
+        cos_key = self._precomputed_cos_key(h5_path)
+
+        def fetch_task(task: dict[str, Any]) -> dict[str, Any]:
+            data = self._read_cos_range(cos_key, int(task["start"]), int(task["end"]))
+            return {**task, "data": data}
+
+        max_workers = min(self.precomputed_cos_range_workers, max(1, len(tasks)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(fetch_task, task) for task in tasks]
+            for future in as_completed(futures):
+                task = future.result()
+                entry = entries[task["key"]]
+                dtype = np.dtype(entry["dtype"])
+                chunk_shape = tuple(int(v) for v in entry["chunk_shape"])
+                start = int(task["start"])
+                data = task["data"]
+                for frame_idx, offset, size, filter_mask in task["chunks"]:
+                    rel = int(offset) - start
+                    raw = data[rel:rel + int(size)]
+                    if len(raw) != int(size):
+                        raise IOError(
+                            f"Short COS range read for {task['key']} frame {frame_idx}: "
+                            f"got {len(raw)} bytes, expected {size}"
+                        )
+                    arr = self._decode_h5_chunk(
+                        raw,
+                        entry=entry,
+                        dtype=dtype,
+                        chunk_shape=chunk_shape,
+                        filter_mask=int(filter_mask),
+                    )[0].copy()
+                    chunks_by_key[task["key"]][int(frame_idx)] = arr
+
+        pos = {frame_idx: idx for idx, frame_idx in enumerate(sorted_idx)}
+        reorder = [pos[int(frame_idx)] for frame_idx in frame_indices]
+        result: dict[str, Any] = {}
+        for key in keys:
+            arr_sorted = np.stack(
+                [chunks_by_key[key][frame_idx] for frame_idx in sorted_idx],
+                axis=0,
+            )
+            result[key] = arr_sorted[reorder]
+
+        for key in ("num_frames", "num_points", "ref_frame", "track_semantics_version"):
+            value = index.get(key)
+            if isinstance(value, dict) and value.get("scalar"):
+                result[key] = value.get("value")
+        return result
+
+    def _validate_h5_range_entry(
+        self,
+        key: str,
+        entry: dict[str, Any],
+        sorted_idx: list[int],
+    ) -> None:
+        compression = entry.get("compression")
+        if compression not in (None, "None", "lzf"):
+            raise RuntimeError(f"Unsupported compressed h5 chunks for {key}: {compression}")
+        chunk_shape = tuple(int(v) for v in entry["chunk_shape"])
+        if not chunk_shape or chunk_shape[0] != 1:
+            raise RuntimeError(f"Unsupported h5 chunk_shape for {key}: {chunk_shape}")
+        offsets = entry["offsets"]
+        max_idx = sorted_idx[-1]
+        if max_idx >= len(offsets):
+            raise IndexError(f"Frame {max_idx} out of range for {key} ({len(offsets)})")
+
+    def _merge_h5_range_chunks(
+        self,
+        entry: dict[str, Any],
+        sorted_idx: list[int],
+    ) -> list[tuple[int, int, list[tuple[int, int, int, int]]]]:
+        offsets = entry["offsets"]
+        filter_masks = entry.get("filter_masks") or [0] * len(offsets)
+        chunks = [
+            (
+                frame_idx,
+                int(offsets[frame_idx][0]),
+                int(offsets[frame_idx][1]),
+                int(filter_masks[frame_idx]),
+            )
+            for frame_idx in sorted_idx
+        ]
+        chunks.sort(key=lambda item: item[1])
+        spans: list[tuple[int, int, list[tuple[int, int, int, int]]]] = []
+        max_gap = self.precomputed_cos_range_merge_gap_bytes
+        cur_start: Optional[int] = None
+        cur_end: Optional[int] = None
+        cur_chunks: list[tuple[int, int, int, int]] = []
+        for frame_idx, offset, size, filter_mask in chunks:
+            end = offset + size
+            if cur_start is None or cur_end is None or offset > cur_end + max_gap:
+                if cur_start is not None and cur_end is not None:
+                    spans.append((cur_start, cur_end, cur_chunks))
+                cur_start = offset
+                cur_end = end
+                cur_chunks = [(frame_idx, offset, size, filter_mask)]
+            else:
+                cur_end = max(cur_end, end)
+                cur_chunks.append((frame_idx, offset, size, filter_mask))
+        if cur_start is not None and cur_end is not None:
+            spans.append((cur_start, cur_end, cur_chunks))
+        return spans
+
+    def _read_cos_range(self, cos_key: str, start: int, end: int) -> bytes:
+        range_header = f"bytes={start}-{end - 1}"
+        last_exc: Optional[BaseException] = None
+        for attempt in range(self.precomputed_cos_range_retries + 1):
+            try:
+                resp = self._get_precomputed_cos_client().get_object(
+                    Bucket=self.precomputed_cos_bucket,
+                    Key=cos_key,
+                    Range=range_header,
+                )
+                return resp["Body"].get_raw_stream().read()
+            except BaseException as exc:
+                last_exc = exc
+                if attempt < self.precomputed_cos_range_retries:
+                    time.sleep(min(2.0, 0.25 * (2 ** attempt)))
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        raise IOError(f"COS range read failed: {cos_key} {range_header}")
+
+    def _decode_h5_chunk(
+        self,
+        raw: bytes,
+        entry: dict[str, Any],
+        dtype: np.dtype,
+        chunk_shape: tuple[int, ...],
+        filter_mask: int,
+    ) -> np.ndarray:
+        expected_nbytes = int(np.prod(chunk_shape)) * dtype.itemsize
+        compression = entry.get("compression")
+        if compression in (None, "None") or (filter_mask & 1):
+            payload = raw
+        elif compression == "lzf":
+            payload = _lzf_decompress(raw, expected_nbytes)
+        else:
+            raise RuntimeError(f"Unsupported h5 compression: {compression}")
+        if len(payload) != expected_nbytes:
+            raise IOError(
+                f"Decoded h5 chunk has {len(payload)} bytes, expected {expected_nbytes}"
+            )
+        return np.frombuffer(payload, dtype=dtype).reshape(chunk_shape)
 
     def sanity_check(self, sequence_name: str) -> dict[str, Any]:
         """Run consistency checks on a sequence.

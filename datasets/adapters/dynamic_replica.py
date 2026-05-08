@@ -417,12 +417,30 @@ class DynamicReplicaAdapter(BaseAdapter):
             ``frame_annotations_<split>.jgz`` on COS-backed mounts.
         """
         self.root = Path(root)
-        if not self.root.exists():
-            raise FileNotFoundError(f"Dynamic_Replica root not found: {self.root}")
-
         self.split = split
         self.split_root = self.root / split
-        if not self.split_root.exists():
+
+        # Check cache first to skip slow root.exists() on remote storage
+        _cache_hit = False
+        if cache_dir is not None:
+            # Build minimal cache path to check existence
+            _cache_key = {
+                "dataset": "dynamic_replica",
+                "split": split,
+                "root": str(root),
+                "schema": 2,  # _CACHE_SCHEMA_VERSION
+            }
+            _cache_suffix = hashlib.sha1(
+                json.dumps(_cache_key, sort_keys=True).encode("utf-8")
+            ).hexdigest()[:12]
+            _cache_path = Path(cache_dir) / f"dynamic_replica_{split}_{_cache_suffix}.pkl"
+            if _cache_path.exists():
+                _cache_hit = True
+
+        if not _cache_hit and not self.root.exists():
+            raise FileNotFoundError(f"Dynamic_Replica root not found: {self.root}")
+
+        if not _cache_hit and not self.split_root.exists():
             raise FileNotFoundError(
                 f"Split directory not found: {self.split_root}. "
                 f"Valid splits: train, valid, test."

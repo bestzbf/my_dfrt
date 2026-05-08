@@ -3,8 +3,10 @@ Planned dataset for deterministic sample-bundle prefetch.
 
 Design invariants
 -----------------
-- __getitem__(i) corresponds to plan[i]; external sampler MUST be
-  SequentialSampler (enforced by train_mixture.py).
+- By default, __getitem__(i) corresponds to plan[i]; external sampler MUST be
+  SequentialSampler (enforced by train_mixture.py).  COS training can opt into
+  a bounded relaxed-order mode that returns nearby ready samples out of order
+  to avoid head-of-line stalls from slow remote reads.
 - Epoch transitions fully tear down and rebuild the prefetch pipeline
   (queues + builder processes + spool generation) so there is zero
   chance of cross-epoch pollution.
@@ -97,8 +99,22 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
         self._wait_log = os.getenv("D4RT_PLANNED_WAIT_LOG", "").strip().lower() in {
             "1", "true", "yes", "on",
         }
+        self._relaxed_order = os.getenv(
+            "D4RT_PLANNED_RELAXED_ORDER", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._relaxed_lookahead = max(
+            0, int(os.getenv("D4RT_PLANNED_RELAXED_LOOKAHEAD", "32"))
+        )
+        self._relaxed_grace_s = max(
+            0.0, float(os.getenv("D4RT_PLANNED_RELAXED_GRACE_S", "0.25"))
+        )
+        self._relaxed_log = os.getenv(
+            "D4RT_PLANNED_RELAXED_LOG", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._returned_indices: set[int] = set()
+        self._requeue_counts: dict[int, int] = {}
 
-        self.current_epoch = 0
+        self.current_epoch: Optional[int] = None
         self._generation: int = 0
 
         # Spool persists across epochs; generation tag isolates files.
@@ -126,12 +142,9 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
         self.current_plan: list = []
         self.next_enqueue_index: int = 0
 
-        # Initial plan + pipeline for epoch 0.
-        self.current_plan = self.planner.generate_plan(
-            epoch=0, count_per_rank=math.ceil(self.epoch_size / self.world_size),
-            epoch_size=self.epoch_size, generation=self._generation,
-        )
-        self._start_pipeline()
+        # The pipeline is started lazily on the first epoch request so resumed
+        # runs do not waste time prebuilding epoch 0 and then immediately tear
+        # it down again.
 
     # ------------------------------------------------------------------
     # Pipeline lifecycle (rebuilt each epoch)
@@ -172,6 +185,12 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
                 self.builder_processes, self.input_queue, timeout=5.0,
             )
             self.builder_processes = []
+        if self.output_queue is not None:
+            try:
+                self.output_queue.cancel_join_thread()
+                self.output_queue.close()
+            except Exception:
+                pass
         # Let old queues be GC'd; new ones are created in _start_pipeline.
         self.input_queue = None
         self.output_queue = None
@@ -192,7 +211,13 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
         SequentialSampler.  The spool blocks until the bundle with the
         matching (index, generation) pair is ready.
         """
-        sample = self._wait_with_worker_check(index)
+        if not self.builder_processes or not self.current_plan:
+            self.set_epoch(self.current_epoch if self.current_epoch is not None else 0)
+
+        if self._relaxed_order:
+            sample = self._wait_relaxed_order(index)
+        else:
+            sample = self._wait_with_worker_check(index)
 
         # Slide the prefetch window forward.
         if self.next_enqueue_index < len(self.current_plan):
@@ -200,6 +225,178 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
             self.next_enqueue_index += 1
 
         return sample
+
+    def _wait_relaxed_order(
+        self,
+        index: int,
+        total_timeout: float = 600.0,
+        max_requeue: int = 3,
+    ) -> QuerySample:
+        """Return the nearest unconsumed ready sample within a lookahead window.
+
+        This preserves the planned sample set while allowing consumption order
+        to differ slightly from plan order.  A slow sample can finish while the
+        GPU trains on already-ready neighbors instead of blocking the whole
+        iterator.
+        """
+        import time
+
+        max_requeue = max(
+            1,
+            int(os.getenv("D4RT_MAX_REQUEUE", str(max_requeue))),
+        )
+        deadline = time.time() + total_timeout
+        requested = int(index)
+        first_loop = True
+        last_alive_log = 0.0
+        while True:
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                alive = sum(1 for p in self.builder_processes if p.is_alive())
+                spec_info = self._format_plan_spec(requested)
+                spool_info = self._format_spool_summary()
+                raise TimeoutError(
+                    f"Relaxed sample request {requested} did not find an "
+                    f"unconsumed ready bundle within {total_timeout}s. "
+                    f"alive_workers={alive}/{len(self.builder_processes)} "
+                    f"{spec_info} {spool_info} Spool dir: {self.spool.spool_dir}"
+                )
+
+            self._handle_relaxed_errors(
+                requested=requested,
+                max_requeue=max_requeue,
+            )
+
+            # Give the exact requested index a tiny grace period.  If it is not
+            # ready quickly, consume a nearby ready item instead.
+            if requested not in self._returned_indices:
+                exact_timeout = min(
+                    self._relaxed_grace_s if first_loop else 0.0,
+                    max(0.0, remaining),
+                )
+                try:
+                    sample = self.spool.wait_for_bundle(
+                        requested,
+                        self._generation,
+                        timeout=exact_timeout,
+                    )
+                    self._mark_returned_sample(sample, requested, requested)
+                    return sample
+                except TimeoutError:
+                    pass
+                except RuntimeError:
+                    self._handle_failed_index(requested, max_requeue=max_requeue)
+                    first_loop = False
+                    continue
+
+            ready_index = self._pick_relaxed_ready_index(requested)
+            if ready_index is not None:
+                try:
+                    sample = self.spool.wait_for_bundle(
+                        ready_index,
+                        self._generation,
+                        timeout=0.0,
+                    )
+                except TimeoutError:
+                    first_loop = False
+                    continue
+                except RuntimeError:
+                    self._handle_failed_index(ready_index, max_requeue=max_requeue)
+                    first_loop = False
+                    continue
+                self._mark_returned_sample(sample, requested, ready_index)
+                if self._relaxed_log and ready_index != requested:
+                    print(
+                        f"[PlannedDataset] relaxed_order request={requested} "
+                        f"returned={ready_index} lookahead={self._relaxed_lookahead}",
+                        flush=True,
+                    )
+                return sample
+
+            alive_workers = [p for p in self.builder_processes if p.is_alive()]
+            dead_workers = [p for p in self.builder_processes if not p.is_alive()]
+            now = time.time()
+            if self._wait_log and now - last_alive_log > 30.0:
+                print(
+                    f"[PlannedDataset] relaxed waiting request={requested} "
+                    f"alive={len(alive_workers)}/{len(self.builder_processes)} "
+                    f"elapsed={total_timeout - remaining:.0f}s "
+                    f"{self._format_plan_spec(requested)} {self._format_spool_summary()}",
+                    flush=True,
+                )
+                last_alive_log = now
+            if dead_workers and not alive_workers:
+                unreturned_ready = self._pick_relaxed_ready_index(requested)
+                if unreturned_ready is None:
+                    exitcodes = [p.exitcode for p in dead_workers]
+                    raise RuntimeError(
+                        f"All {len(dead_workers)} builder workers died "
+                        f"(exitcodes={exitcodes}). Relaxed request {requested} "
+                        "cannot be satisfied."
+                    )
+            first_loop = False
+            time.sleep(0.05)
+
+    def _pick_relaxed_ready_index(self, requested: int) -> Optional[int]:
+        limit = min(len(self.current_plan) - 1, int(requested) + self._relaxed_lookahead)
+        for ready_index in self.spool.list_ready_indices(self._generation):
+            if ready_index in self._returned_indices:
+                continue
+            if ready_index <= limit:
+                return ready_index
+        return None
+
+    def _handle_relaxed_errors(self, requested: int, max_requeue: int) -> None:
+        limit = min(len(self.current_plan) - 1, int(requested) + self._relaxed_lookahead)
+        for error_index in self.spool.list_error_indices(self._generation):
+            if error_index in self._returned_indices:
+                continue
+            if error_index <= limit:
+                self._handle_failed_index(error_index, max_requeue=max_requeue)
+                return
+
+    def _handle_failed_index(self, index: int, max_requeue: int) -> None:
+        import dataclasses
+        import random
+
+        self.spool._get_error_path(index, self._generation).unlink(missing_ok=True)
+        count = self._requeue_counts.get(index, 0) + 1
+        self._requeue_counts[index] = count
+        if count >= max_requeue and len(self.current_plan) > 1:
+            alt_indices = [i for i in range(len(self.current_plan)) if i != index]
+            alt_idx = random.choice(alt_indices)
+            alt_spec = self.current_plan[alt_idx]
+            sub_spec = dataclasses.replace(
+                alt_spec,
+                local_index=index,
+                generation=self._generation,
+            )
+            self.input_queue.put(sub_spec)
+            self._requeue_counts[index] = 0
+            print(
+                f"[PlannedDataset] sample g{self._generation:04d}_{index} failed "
+                f"{max_requeue}x, substituting with plan[{alt_idx}] "
+                f"(dataset_idx={sub_spec.dataset_idx})",
+                flush=True,
+            )
+        elif index < len(self.current_plan):
+            self.input_queue.put(self.current_plan[index])
+
+    def _mark_returned_sample(
+        self,
+        sample: QuerySample,
+        requested_index: int,
+        returned_index: int,
+    ) -> None:
+        self._returned_indices.add(int(returned_index))
+        try:
+            sample.metadata["planned_requested_index"] = int(requested_index)
+            sample.metadata["planned_returned_index"] = int(returned_index)
+            sample.metadata["planned_relaxed_order"] = (
+                int(requested_index) != int(returned_index)
+            )
+        except Exception:
+            pass
 
     def _wait_with_worker_check(self, index: int, total_timeout: float = 600.0, check_interval: float = 5.0, max_requeue: int = 3) -> QuerySample:
         """Wait for spool bundle, failing fast if all workers have died.
@@ -211,6 +408,10 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
         import dataclasses
         import random
         import time
+        max_requeue = max(
+            1,
+            int(os.getenv("D4RT_MAX_REQUEUE", str(max_requeue))),
+        )
         deadline = time.time() + total_timeout
         last_alive_log = 0.0
         requeue_count = 0
@@ -328,8 +529,10 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
         zero cross-epoch pollution by destroying old queues and processes
         before creating new ones.
         """
+        first_start = self.current_epoch is None
         if (
-            epoch == self.current_epoch
+            not first_start
+            and epoch == self.current_epoch
             and self.builder_processes
             and self.current_plan
         ):
@@ -337,22 +540,25 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
 
         self.current_epoch = epoch
 
-        # 1. Kill old builders + queues.
-        self._stop_pipeline()
+        # 1. Kill old builders + queues unless this is the first launch.
+        if not first_start:
+            self._stop_pipeline()
+            self._generation += 1
+        else:
+            self._generation = 0
 
-        # 2. Bump generation.
-        self._generation += 1
-
-        # 3. Purge stale spool files.
+        # 2. Purge stale spool files.
         self.spool.set_generation(self._generation)
+        self._returned_indices.clear()
+        self._requeue_counts.clear()
 
-        # 4. Re-plan.
+        # 3. Re-plan.
         self.current_plan = self.planner.generate_plan(
             epoch=epoch, count_per_rank=math.ceil(self.epoch_size / self.world_size),
             epoch_size=self.epoch_size, generation=self._generation,
         )
 
-        # 5. Spin up fresh pipeline.
+        # 4. Spin up fresh pipeline.
         self._start_pipeline()
 
     # ------------------------------------------------------------------

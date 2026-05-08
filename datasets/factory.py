@@ -305,6 +305,8 @@ def _create_mixture_dataset(config: dict, split: str, rank: int = 0, world_size:
                 'backend': config.get('sample_stage_backend', ''),
                 'stage_root': config.get('sample_stage_root', ''),
                 'sdk_workers': config.get('sample_stage_sdk_workers', 8),
+                'cos_timeout_s': config.get('sample_stage_cos_timeout_s', 20),
+                'download_retries': config.get('sample_stage_download_retries', 2),
                 'cache_max_bytes': config.get('sample_stage_cache_max_bytes', 100 * 1024**3),
                 'cache_low_watermark_ratio': config.get('sample_stage_cache_low_watermark_ratio', 0.9),
                 'cache_touch_interval_s': config.get('sample_stage_cache_touch_interval_s', 30.0),

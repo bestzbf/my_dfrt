@@ -158,7 +158,22 @@ class MVSSynthAdapter(BaseAdapter):
         """
         self.split = split
         self.root = Path(root)
-        if not self.root.exists():
+        # Check cache first to skip slow root.exists() on remote storage
+        _cache_hit = False
+        if cache_dir is not None:
+            import hashlib, json as _json
+            cache_key = {
+                "dataset": "mvssynth",
+                "split": split,
+                "cache_schema": 1,
+            }
+            suffix = hashlib.sha1(
+                _json.dumps(cache_key, sort_keys=True).encode()
+            ).hexdigest()[:12]
+            cache_path = Path(cache_dir) / f"mvssynth_{split}_{suffix}.pkl"
+            if cache_path.exists():
+                _cache_hit = True
+        if not _cache_hit and not self.root.exists():
             raise FileNotFoundError(f"MVS-Synth root not found: {self.root}")
 
         self.strict = strict

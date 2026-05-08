@@ -1,0 +1,28 @@
+mode: single
+name: scannetpp
+root: /home/zbf/16t/f/d4rt/scannetpp_val/data
+
+adapter_kwargs:
+  splits_dir: /home/zbf/16t/f/d4rt/scannetpp_val/splits
+  scenes_record: /home/zbf/16t/f/d4rt/scannetpp_val/scenes_record.json
+  strict: false
+  target_hw: [256, 256]
+
+clip_len: 48
+img_size: 256
+num_queries: 512
+use_augs: false
+boundary_ratio: 0.3
+t_tgt_eq_t_cam_ratio: 0.4
+seed: 42
+
+allow_track_fallback: true
+
+epoch_size: 2000
+precompute_patches: false
+precompute_from_highres: false
+
+index_cache_dir: /home/zbf/16t/f/d4rt/.index_cache_scannetpp_val
+index_workers: 4
+
+planned_mode: false

@@ -266,7 +266,22 @@ class ScanNetAdapter(BaseAdapter):
             Print summary during construction.
         """
         self.root = Path(root)
-        if not self.root.exists():
+        # Check cache first to skip slow root.exists() on remote storage
+        _cache_hit = False
+        if cache_dir is not None:
+            from datasets.index_cache import load_or_build
+            import hashlib, json as _json
+            cache_key = {
+                "dataset": "scannet",
+                "cache_schema": 1,
+            }
+            suffix = hashlib.sha1(
+                _json.dumps(cache_key, sort_keys=True).encode()
+            ).hexdigest()[:12]
+            cache_path = Path(cache_dir) / f"scannet_train_{suffix}.pkl"
+            if cache_path.exists():
+                _cache_hit = True
+        if not _cache_hit and not self.root.exists():
             raise FileNotFoundError(f"ScanNet root not found: {self.root}")
         if default_pose_convention != "w2c":
             raise ValueError(

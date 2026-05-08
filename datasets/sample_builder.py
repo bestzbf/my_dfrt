@@ -98,6 +98,7 @@ class SampleBuilder:
         self._enable_faulthandler = os.getenv("D4RT_BUILDER_FAULTHANDLER", "").strip().lower() in {
             "1", "true", "yes", "on",
         }
+        self._warned_thread_timeout_disabled = False
 
     # ------------------------------------------------------------------
     # Main loop
@@ -172,6 +173,18 @@ class SampleBuilder:
             True if successful, False if failed
         """
         build_timeout = float(os.environ.get("D4RT_BUILD_TIMEOUT", "120"))
+        if build_timeout > 0 and self.sample_stage_config:
+            if not self._warned_thread_timeout_disabled:
+                print(
+                    f"[Builder {self.builder_id}] Disabling D4RT_BUILD_TIMEOUT="
+                    f"{build_timeout:g}s because sample staging mutates adapter "
+                    "paths and Python cannot safely cancel a timed-out thread. "
+                    "Use COS request timeouts/retries for I/O watchdogs.",
+                    flush=True,
+                )
+                self._warned_thread_timeout_disabled = True
+            build_timeout = 0.0
+        timeout_grace_s = max(0.0, float(os.environ.get("D4RT_BUILD_TIMEOUT_GRACE_S", "0")))
         for attempt in range(max_attempts):
             attempt_start = time.perf_counter()
             try:
@@ -187,47 +200,55 @@ class SampleBuilder:
                     t.start()
                     t.join(timeout=build_timeout)
                     if t.is_alive():
-                        t.join(timeout=70)
-                        adapter = self.adapters[spec.dataset_idx]
-                        dataset_name = getattr(adapter, "dataset_name", type(adapter).__name__)
-                        if hasattr(adapter, '_scene_cache'):
-                            adapter._scene_cache.pop(spec.sequence_name, None)
-                        if hasattr(adapter, '_depth_chunk_cache'):
-                            adapter._depth_chunk_cache.pop(spec.sequence_name, None)
+                        if timeout_grace_s > 0:
+                            t.join(timeout=timeout_grace_s)
+                        if not t.is_alive():
+                            if exc_box:
+                                raise exc_box[0]
+                            sample = result_box[0]
+                        else:
+                            adapter = self.adapters[spec.dataset_idx]
+                            dataset_name = getattr(adapter, "dataset_name", type(adapter).__name__)
+                            if hasattr(adapter, '_scene_cache'):
+                                adapter._scene_cache.pop(spec.sequence_name, None)
+                            if hasattr(adapter, '_depth_chunk_cache'):
+                                adapter._depth_chunk_cache.pop(spec.sequence_name, None)
 
-                        # Get timing info if available (from partial execution)
-                        timing_info = ""
-                        if hasattr(self, '_last_load_timing') and self._last_load_timing:
-                            timing = self._last_load_timing
-                            timing_info = (
-                                f" | partial_timing: "
-                                f"scene_data={timing.get('scene_data_s', 0)*1000:.0f}ms "
-                                f"rgb_load={timing.get('rgb_load_s', 0)*1000:.0f}ms "
-                                f"depth_load={timing.get('depth_load_s', 0)*1000:.0f}ms "
-                                f"precomputed={timing.get('precomputed_s', 0)*1000:.0f}ms"
+                            # Get timing info if available (from partial execution)
+                            timing_info = ""
+                            if hasattr(self, '_last_load_timing') and self._last_load_timing:
+                                timing = self._last_load_timing
+                                timing_info = (
+                                    f" | partial_timing: "
+                                    f"scene_data={timing.get('scene_data_s', 0)*1000:.0f}ms "
+                                    f"frame_load={timing.get('frame_load_s', 0)*1000:.0f}ms "
+                                    f"rgb_load={timing.get('rgb_load_s', 0)*1000:.0f}ms "
+                                    f"depth_load={timing.get('depth_load_s', 0)*1000:.0f}ms "
+                                    f"cam_load={timing.get('cam_load_s', 0)*1000:.0f}ms "
+                                    f"precomputed={timing.get('precomputed_s', 0)*1000:.0f}ms"
+                                )
+
+                            err = TimeoutError(
+                                f"_build_sample timed out after {build_timeout}s "
+                                f"(spec={spec.local_index}, dataset_idx={spec.dataset_idx}, "
+                                f"dataset={dataset_name}, seq={spec.sequence_name}, "
+                                f"frames={len(spec.frame_indices)}){timing_info}"
+                            )
+                            total_s = time.perf_counter() - attempt_start
+
+                            # Print detailed timeout info
+                            print(
+                                f"[Timeout] dataset={dataset_name} seq={spec.sequence_name} "
+                                f"frames={len(spec.frame_indices)} timeout={build_timeout}s "
+                                f"total_elapsed={total_s:.1f}s{timing_info}",
+                                flush=True,
                             )
 
-                        err = TimeoutError(
-                            f"_build_sample timed out after {build_timeout}s "
-                            f"(spec={spec.local_index}, dataset_idx={spec.dataset_idx}, "
-                            f"dataset={dataset_name}, seq={spec.sequence_name}, "
-                            f"frames={len(spec.frame_indices)}){timing_info}"
-                        )
-                        total_s = time.perf_counter() - attempt_start
-
-                        # Print detailed timeout info
-                        print(
-                            f"[Timeout] dataset={dataset_name} seq={spec.sequence_name} "
-                            f"frames={len(spec.frame_indices)} timeout={build_timeout}s "
-                            f"total_elapsed={total_s:.1f}s{timing_info}",
-                            flush=True,
-                        )
-
-                        self._maybe_print_profile(spec=spec, attempt=attempt, success=False,
-                                                   total_s=total_s, error=err)
-                        # Don't retry on timeout — stale threads exhaust COS connections
-                        self.spool.write_error(spec.local_index, err, spec.generation)
-                        return False
+                            self._maybe_print_profile(spec=spec, attempt=attempt, success=False,
+                                                       total_s=total_s, error=err)
+                            # Don't retry on timeout — stale threads exhaust COS connections
+                            self.spool.write_error(spec.local_index, err, spec.generation)
+                            return False
                     if exc_box:
                         raise exc_box[0]
                     sample = result_box[0]
@@ -254,7 +275,12 @@ class SampleBuilder:
 
                 # Print detailed timing for slow samples (>5s) or timeout cases
                 slow_threshold = float(os.environ.get("D4RT_SLOW_SAMPLE_THRESHOLD_S", "5.0"))
-                if total_s > slow_threshold and hasattr(self, '_last_load_timing') and self._last_load_timing:
+                if (
+                    slow_threshold > 0
+                    and total_s > slow_threshold
+                    and hasattr(self, '_last_load_timing')
+                    and self._last_load_timing
+                ):
                     timing = self._last_load_timing
                     adapter = self.adapters[spec.dataset_idx]
                     dataset_name = getattr(adapter, "dataset_name", type(adapter).__name__)
@@ -262,10 +288,12 @@ class SampleBuilder:
                         f"[SlowSample] dataset={dataset_name} seq={spec.sequence_name} "
                         f"frames={len(spec.frame_indices)} total_load={timing.get('total_s', 0)*1000:.0f}ms | "
                         f"scene_data={timing.get('scene_data_s', 0)*1000:.0f}ms "
+                        f"frame_load={timing.get('frame_load_s', 0)*1000:.0f}ms "
                         f"rgb_load={timing.get('rgb_load_s', 0)*1000:.0f}ms "
                         f"rgb_resize={timing.get('rgb_resize_s', 0)*1000:.0f}ms "
                         f"depth_load={timing.get('depth_load_s', 0)*1000:.0f}ms "
                         f"depth_resize={timing.get('depth_resize_s', 0)*1000:.0f}ms "
+                        f"cam_load={timing.get('cam_load_s', 0)*1000:.0f}ms "
                         f"precomputed={timing.get('precomputed_s', 0)*1000:.0f}ms "
                         f"process={timing.get('process_s', 0)*1000:.0f}ms | "
                         f"stage={self._last_profile.get('stage_s', 0)*1000:.0f}ms "
@@ -522,9 +550,16 @@ def stop_builder_processes(
         input_queue: Input queue (for sending shutdown signals)
         timeout: Timeout for joining processes
     """
-    # Send shutdown signals
+    # Send shutdown signals.  At epoch end the input queue can legitimately be
+    # full of prefetched specs; blocking here would hang cleanup before we ever
+    # get to the terminate fallback.
     for _ in processes:
-        input_queue.put(None)
+        try:
+            input_queue.put_nowait(None)
+        except queue.Full:
+            break
+        except (BrokenPipeError, EOFError, OSError, ValueError):
+            break
 
     # Wait for processes to finish
     for p in processes:
@@ -533,3 +568,12 @@ def stop_builder_processes(
             print(f"Warning: Builder process {p.name} did not terminate, killing...")
             p.terminate()
             p.join(timeout=1.0)
+        if p.is_alive():
+            p.kill()
+            p.join(timeout=1.0)
+
+    try:
+        input_queue.cancel_join_thread()
+        input_queue.close()
+    except Exception:
+        pass

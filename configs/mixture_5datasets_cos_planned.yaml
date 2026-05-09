@@ -72,7 +72,10 @@ sample_stage_datasets:
   - co3dv2
   - blendedmvs
   - scannetpp
-sample_stage_scene_prefetch_datasets: []
+sample_stage_scene_prefetch_datasets:
+  - co3dv2
+  - kubric
+  - dynamic_replica
 sample_stage_mount_root: /data_cos
 sample_stage_bucket: hd-ai-data-1251882982
 sample_stage_region: ap-beijing

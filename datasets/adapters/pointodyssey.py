@@ -1,12 +1,16 @@
 from __future__ import annotations
 
+import contextlib
 import io
+import fcntl
 import hashlib
 import json
 import os
 import pickle
 import re
 import threading
+import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy.lib.format as _npy_fmt  # for lightweight numpy header reads
@@ -55,6 +59,118 @@ FAST_ENCODED_NORMAL_OFFSETS = "normal_frames_offsets.npy"
 FAST_ENCODED_NORMAL_VALIDS = "normal_frames_valids.npy"
 
 
+class _CosRangeFile(io.RawIOBase):
+    """Small read-only file object backed by COS Range requests.
+
+    h5py can open Python file-like objects.  Using this avoids calling h5py on
+    the COS FUSE mount when we only need HDF5 metadata/chunk offsets.
+    """
+
+    def __init__(
+        self,
+        *,
+        size: int,
+        read_range: Any,
+        block_size: int = 4 * 1024 * 1024,
+        max_blocks: int = 32,
+    ) -> None:
+        super().__init__()
+        self._size = max(0, int(size))
+        self._read_range = read_range
+        self._block_size = max(64 * 1024, int(block_size))
+        self._max_blocks = max(1, int(max_blocks))
+        self._pos = 0
+        self._cache: OrderedDict[int, bytes] = OrderedDict()
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def writable(self) -> bool:
+        return False
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+        if whence == os.SEEK_SET:
+            new_pos = int(offset)
+        elif whence == os.SEEK_CUR:
+            new_pos = self._pos + int(offset)
+        elif whence == os.SEEK_END:
+            new_pos = self._size + int(offset)
+        else:
+            raise ValueError(f"Unsupported seek whence: {whence}")
+        self._pos = max(0, new_pos)
+        return self._pos
+
+    def read(self, size: int = -1) -> bytes:
+        if self.closed:
+            raise ValueError("I/O operation on closed COS range file")
+        if self._pos >= self._size:
+            return b""
+        if size is None or size < 0:
+            end = self._size
+        else:
+            end = min(self._size, self._pos + int(size))
+        start = self._pos
+        if end <= start:
+            return b""
+
+        chunks: list[bytes] = []
+        cur = start
+        while cur < end:
+            block_start = (cur // self._block_size) * self._block_size
+            block = self._get_block(block_start)
+            offset = cur - block_start
+            take = min(end - cur, len(block) - offset)
+            if take <= 0:
+                break
+            chunks.append(block[offset:offset + take])
+            cur += take
+        self._pos = cur
+        return b"".join(chunks)
+
+    def readinto(self, b: Any) -> int:
+        data = self.read(len(b))
+        n = len(data)
+        b[:n] = data
+        return n
+
+    def _get_block(self, block_start: int) -> bytes:
+        cached = self._cache.get(block_start)
+        if cached is not None:
+            self._cache.move_to_end(block_start)
+            return cached
+        block_end = min(self._size, block_start + self._block_size)
+        data = self._read_range(block_start, block_end)
+        self._cache[block_start] = data
+        self._cache.move_to_end(block_start)
+        while len(self._cache) > self._max_blocks:
+            self._cache.popitem(last=False)
+        return data
+
+
+def _lzf_decompress(data: bytes, expected_size: int) -> bytes:
+    """Decompress an HDF5 LZF chunk payload."""
+    try:
+        import imagecodecs
+
+        decoded = imagecodecs.lzf_decode(data, out=expected_size)
+        if len(decoded) != expected_size:
+            raise ValueError(
+                f"LZF decoded {len(decoded)} bytes, expected {expected_size}"
+            )
+        return bytes(decoded)
+    except ImportError as exc:
+        raise RuntimeError(
+            "PointOdyssey COS Range anno.h5 reading needs imagecodecs to decode "
+            "LZF-compressed HDF5 chunks."
+        ) from exc
+
+
 @dataclass
 class SequenceRecord:
     dataset_name: str
@@ -84,6 +200,15 @@ class SequenceRecord:
 class PointOdysseyAdapter(BaseAdapter):
     dataset_name: str = "pointodyssey"
 
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_anno_cos_tls", None)
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._anno_cos_tls = threading.local()
+
     def __init__(
         self,
         root: str,
@@ -97,6 +222,16 @@ class PointOdysseyAdapter(BaseAdapter):
         runtime_sanitize: bool = True,
         io_workers: int = 1,
         anno_frame_cache_dir: Optional[str] = None,
+        anno_read_mode: str = "auto",
+        anno_cos_mount_root: str = "/data_cos",
+        anno_cos_bucket: str = "hd-ai-data-1251882982",
+        anno_cos_region: str = "ap-beijing",
+        anno_cos_passwd_file: str = "/etc/passwd-s3fs-data_cos",
+        anno_cos_timeout_s: int = 20,
+        anno_cos_range_workers: int = 4,
+        anno_cos_range_retries: int = 2,
+        anno_cos_range_merge_gap_bytes: int = 1024 * 1024,
+        anno_index_window_radius: int = 128,
     ):
         self.root = Path(root)
         self.split = split
@@ -107,6 +242,32 @@ class PointOdysseyAdapter(BaseAdapter):
         self.require_tracks = require_tracks
         self.runtime_sanitize = bool(runtime_sanitize)
         self.io_workers = max(1, int(io_workers))
+        self.anno_read_mode = str(anno_read_mode or "auto").strip().lower()
+        self.anno_cos_mount_root = Path(anno_cos_mount_root)
+        self.anno_cos_bucket = str(anno_cos_bucket)
+        self.anno_cos_region = str(anno_cos_region)
+        if (
+            anno_cos_passwd_file == "/etc/passwd-s3fs-data_cos"
+            and not Path(anno_cos_passwd_file).exists()
+            and Path("/etc/passwd-cosfs").exists()
+        ):
+            anno_cos_passwd_file = "/etc/passwd-cosfs"
+        self.anno_cos_passwd_file = str(anno_cos_passwd_file)
+        self.anno_cos_timeout_s = int(anno_cos_timeout_s)
+        self.anno_cos_range_workers = max(1, int(anno_cos_range_workers))
+        self.anno_cos_range_retries = max(0, int(anno_cos_range_retries))
+        self.anno_cos_range_merge_gap_bytes = max(
+            0, int(anno_cos_range_merge_gap_bytes)
+        )
+        self.anno_index_window_radius = max(0, int(anno_index_window_radius))
+        self.anno_local_cache_max_bytes = int(
+            float(os.getenv("POINTODYSSEY_ANNO_LOCAL_CACHE_MAX_GB", "24")) * 1024**3
+        )
+        self._anno_cos_tls = threading.local()
+        self._anno_h5_chunk_index_cache: dict[str, dict[str, Any]] = {}
+        self._anno_h5_index_cache_root = self._resolve_anno_h5_index_cache_root()
+        self._h5_range_cache_root = self._resolve_h5_range_cache_root()
+        self._last_anno_range_stats: dict[str, int] = {}
         resolved_anno_frame_cache_dir = anno_frame_cache_dir or os.getenv(
             "D4RT_POINTODYSSEY_ANNO_FRAME_CACHE_DIR", ""
         )
@@ -407,6 +568,8 @@ class PointOdysseyAdapter(BaseAdapter):
         return out
 
     def load_clip(self, sequence_name: str, frame_indices: list[int]) -> UnifiedClip:
+        timing: dict[str, float] = {}
+        t_total_start = time.perf_counter()
         r = self.get_record(sequence_name)
 
         frame_indices_np = np.asarray(frame_indices, dtype=np.int64)
@@ -420,25 +583,42 @@ class PointOdysseyAdapter(BaseAdapter):
                 f"valid range = [0, {r.num_frames - 1}]"
             )
 
+        def _timed_load_anno() -> dict[str, Any]:
+            t0 = time.perf_counter()
+            out = self._load_anno(sequence_name, frame_indices_np)
+            timing["precomputed_s"] = time.perf_counter() - t0
+            range_stats = getattr(self, "_last_anno_range_stats", None)
+            if range_stats:
+                for key, value in range_stats.items():
+                    timing[f"precomputed_range_{key}"] = float(value)
+            return out
+
         if self.io_workers > 1 and len(frame_indices_np) > 1:
             with ThreadPoolExecutor(max_workers=1) as anno_executor:
-                anno_future = anno_executor.submit(
-                    self._load_anno, sequence_name, frame_indices_np
-                )
+                anno_future = anno_executor.submit(_timed_load_anno)
+                t0 = time.perf_counter()
                 scene_info = self._load_scene_info(sequence_name)
+                timing["scene_data_s"] = time.perf_counter() - t0
+                t0 = time.perf_counter()
                 images, depths, normals = self._load_frame_payload(
                     sequence_name, r, frame_indices_np
                 )
+                timing["frame_load_s"] = time.perf_counter() - t0
                 anno = anno_future.result()
         else:
-            anno = self._load_anno(sequence_name, frame_indices_np)
+            anno = _timed_load_anno()
+            t0 = time.perf_counter()
             scene_info = self._load_scene_info(sequence_name)
+            timing["scene_data_s"] = time.perf_counter() - t0
+            t0 = time.perf_counter()
             images, depths, normals = self._load_frame_payload(
                 sequence_name, r, frame_indices_np
             )
+            timing["frame_load_s"] = time.perf_counter() - t0
 
         # PointOdyssey depth uses 16-bit visualization units:
         # depth_uint16 = depth_meters * 65535 / 1000.
+        t_process0 = time.perf_counter()
         if depths is not None:
             depths = [d * (1000.0 / 65535.0) if d is not None else None for d in depths]
 
@@ -457,6 +637,8 @@ class PointOdysseyAdapter(BaseAdapter):
         extrinsics = anno["extrinsics"][:].astype(np.float32)           # [T,4,4]
         if normals is not None:
             normals = self._convert_released_normals_to_camera_space(normals, extrinsics)
+        timing["process_s"] = time.perf_counter() - t_process0
+        timing["total_s"] = time.perf_counter() - t_total_start
 
         clip = UnifiedClip(
             dataset_name=self.dataset_name,
@@ -493,6 +675,7 @@ class PointOdysseyAdapter(BaseAdapter):
                 "depth_unit": "unknown",
                 "raw_mask_semantics": "unknown",
                 "scene_info_keys": list(scene_info.keys()) if scene_info is not None else None,
+                "_load_timing": timing,
             },
         )
         return clip
@@ -893,7 +1076,27 @@ class PointOdysseyAdapter(BaseAdapter):
         # HDF5 chunked format: O(frames) random access vs full zlib decompress for npz.
         h5_path = r.anno_path.with_suffix(".h5")
         if h5_path.exists():
-            if idx is not None and self.anno_frame_cache_dir is not None:
+            self._last_anno_range_stats = {}
+            if idx is not None and self._should_use_anno_local_h5_cache(h5_path):
+                try:
+                    local_h5_path, was_hit = self._ensure_anno_local_h5_cache(h5_path)
+                    import h5py
+                    with h5py.File(local_h5_path, "r") as f:
+                        anno = h5_read_frame_slice(f, idx)
+                    self._last_anno_range_stats = {
+                        "cache_hits": 1 if was_hit else 0,
+                        "cache_misses": 0 if was_hit else 1,
+                        "range_tasks": 0,
+                        "range_bytes": 0,
+                        "local_h5": 1,
+                    }
+                except Exception:
+                    if self.anno_read_mode in {"local_h5", "local_cache"}:
+                        raise
+                    anno = self._load_anno_h5_with_fallback(sequence_name, h5_path, idx)
+            elif idx is not None and self._should_use_anno_cos_range(h5_path):
+                anno = self._load_anno_h5_with_fallback(sequence_name, h5_path, idx)
+            elif idx is not None and self.anno_frame_cache_dir is not None:
                 anno = self._load_anno_from_frame_cache(sequence_name, h5_path, idx)
             else:
                 import h5py
@@ -903,6 +1106,7 @@ class PointOdysseyAdapter(BaseAdapter):
                     else:
                         anno = {k: f[k][()] for k in f.keys()}
         else:
+            self._last_anno_range_stats = {}
             z = np.load(r.anno_path, allow_pickle=True)
             if idx is not None:
                 idx_np = np.asarray(idx)
@@ -914,6 +1118,798 @@ class PointOdysseyAdapter(BaseAdapter):
                 anno = {k: z[k] for k in z.files}
 
         return anno
+
+    def _load_anno_h5_with_fallback(
+        self,
+        sequence_name: str,
+        h5_path: Path,
+        idx: list[int],
+    ) -> dict[str, Any]:
+        try:
+            return self._load_anno_h5_cos_range(h5_path, idx)
+        except Exception:
+            if self.anno_read_mode in {"cos_range", "range"}:
+                raise
+            if self.anno_frame_cache_dir is not None:
+                return self._load_anno_from_frame_cache(sequence_name, h5_path, idx)
+            import h5py
+            with h5py.File(h5_path, "r") as f:
+                return h5_read_frame_slice(f, idx)
+
+    def _should_use_anno_local_h5_cache(self, h5_path: Path) -> bool:
+        mode = self.anno_read_mode
+        if mode in {"h5py", "direct", "npz", "cos_range", "range"}:
+            return False
+        if mode not in {"auto", "local_h5", "local_cache"}:
+            return False
+        if mode == "auto" and not self._path_is_under_anno_cos_mount(h5_path):
+            return False
+        return True
+
+    def _anno_local_h5_cache_path(self, h5_path: Path) -> Optional[Path]:
+        raw = os.getenv("D4RT_H5_RANGE_CACHE_ROOT", "").strip()
+        if not raw:
+            default = Path("/tmp/d4rt_sample_stage/shared_raw_cache/data")
+            if default.exists():
+                raw = str(default)
+        if not raw:
+            return None
+        root = Path(raw) / ".d4rt_pointodyssey_anno_h5"
+        cache_key = (
+            self._anno_cos_key(h5_path)
+            if self._path_is_under_anno_cos_mount(h5_path)
+            else str(h5_path)
+        )
+        digest = hashlib.sha1(cache_key.encode("utf-8")).hexdigest()
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", h5_path.parent.name)[:80]
+        return root / f"{safe_name}_{digest}.h5"
+
+    def _ensure_anno_local_h5_cache(self, h5_path: Path) -> tuple[Path, bool]:
+        cache_path = self._anno_local_h5_cache_path(h5_path)
+        if cache_path is None:
+            raise RuntimeError("D4RT_H5_RANGE_CACHE_ROOT is not configured")
+        if cache_path.is_file():
+            try:
+                os.utime(cache_path, None)
+            except OSError:
+                pass
+            return cache_path, True
+
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = cache_path.with_suffix(cache_path.suffix + ".lock")
+        with open(lock_path, "a+b") as lock_f:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            try:
+                if cache_path.is_file():
+                    try:
+                        os.utime(cache_path, None)
+                    except OSError:
+                        pass
+                    return cache_path, True
+                self._download_anno_h5_to_cache(h5_path, cache_path)
+                self._evict_anno_local_h5_cache(keep_path=cache_path)
+                return cache_path, False
+            finally:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+
+    def _evict_anno_local_h5_cache(self, keep_path: Optional[Path] = None) -> None:
+        max_bytes = getattr(self, "anno_local_cache_max_bytes", 0)
+        if max_bytes <= 0:
+            return
+        cache_dir = self._anno_local_h5_cache_path(Path("/tmp/dummy/anno.h5"))
+        if cache_dir is None:
+            return
+        cache_root = cache_dir.parent
+        lock_path = cache_root / ".eviction.lock"
+        try:
+            cache_root.mkdir(parents=True, exist_ok=True)
+            with open(lock_path, "a+b") as lock_f:
+                try:
+                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                except BlockingIOError:
+                    return
+                try:
+                    entries: list[tuple[float, int, Path]] = []
+                    total_bytes = 0
+                    for path in cache_root.glob("*.h5"):
+                        if keep_path is not None and path == keep_path:
+                            continue
+                        try:
+                            stat = path.stat()
+                        except OSError:
+                            continue
+                        entries.append((stat.st_mtime, stat.st_size, path))
+                        total_bytes += stat.st_size
+                    if keep_path is not None:
+                        try:
+                            total_bytes += keep_path.stat().st_size
+                        except OSError:
+                            pass
+                    if total_bytes <= max_bytes:
+                        return
+                    target_bytes = int(max_bytes * 0.9)
+                    entries.sort(key=lambda item: item[0])
+                    for _, size, path in entries:
+                        if total_bytes <= target_bytes:
+                            break
+                        path.unlink(missing_ok=True)
+                        total_bytes -= size
+                finally:
+                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            return
+
+    def _download_anno_h5_to_cache(self, h5_path: Path, cache_path: Path) -> None:
+        tmp_path = cache_path.with_name(
+            f".{cache_path.name}.part.{os.getpid()}.{threading.get_ident()}"
+        )
+        last_exc: Optional[BaseException] = None
+        if self._path_is_under_anno_cos_mount(h5_path):
+            cos_key = self._anno_cos_key(h5_path)
+            for attempt in range(self.anno_cos_range_retries + 1):
+                try:
+                    resp = self._get_anno_cos_client().get_object(
+                        Bucket=self.anno_cos_bucket,
+                        Key=cos_key,
+                    )
+                    stream = resp["Body"].get_raw_stream()
+                    with open(tmp_path, "wb") as f:
+                        while True:
+                            chunk = stream.read(1024 * 1024)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                    os.replace(tmp_path, cache_path)
+                    return
+                except BaseException as exc:
+                    last_exc = exc
+                    tmp_path.unlink(missing_ok=True)
+                    if attempt < self.anno_cos_range_retries:
+                        time.sleep(min(2.0, 0.25 * (2 ** attempt)))
+                        continue
+                    raise
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+        else:
+            try:
+                with open(h5_path, "rb") as src, open(tmp_path, "wb") as dst:
+                    while True:
+                        chunk = src.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        dst.write(chunk)
+                os.replace(tmp_path, cache_path)
+                return
+            finally:
+                tmp_path.unlink(missing_ok=True)
+        if last_exc is not None:
+            raise last_exc
+
+    def _path_is_under_anno_cos_mount(self, path: Path) -> bool:
+        mount = str(self.anno_cos_mount_root).rstrip("/") + "/"
+        path_str = str(path)
+        return path_str == str(self.anno_cos_mount_root) or path_str.startswith(mount)
+
+    def _should_use_anno_cos_range(self, h5_path: Path) -> bool:
+        mode = self.anno_read_mode
+        if mode in {"h5py", "direct", "npz", "local_h5", "local_cache"}:
+            return False
+        if mode not in {"auto", "cos_range", "range"}:
+            return False
+        if mode == "auto" and not self._path_is_under_anno_cos_mount(h5_path):
+            return False
+        return True
+
+    def _get_anno_cos_client(self) -> Any:
+        client = getattr(self._anno_cos_tls, "client", None)
+        if client is None:
+            from qcloud_cos import CosConfig, CosS3Client
+
+            parts = Path(self.anno_cos_passwd_file).read_text().strip().split(":")
+            if len(parts) == 2:
+                secret_id, secret_key = parts
+            elif len(parts) == 3:
+                _bucket, secret_id, secret_key = parts
+            else:
+                raise ValueError(
+                    "Unsupported COS passwd file format: "
+                    f"{self.anno_cos_passwd_file}"
+                )
+            config = CosConfig(
+                Region=self.anno_cos_region,
+                SecretId=secret_id,
+                SecretKey=secret_key,
+                Scheme="https",
+                Timeout=self.anno_cos_timeout_s,
+            )
+            client = CosS3Client(config)
+            self._anno_cos_tls.client = client
+        return client
+
+    def _anno_cos_key(self, path: Path) -> str:
+        try:
+            return path.relative_to(self.anno_cos_mount_root).as_posix()
+        except ValueError:
+            mount = str(self.anno_cos_mount_root).rstrip("/") + "/"
+            path_str = str(path)
+            if path_str.startswith(mount):
+                return path_str[len(mount):]
+            raise
+
+    def _read_anno_cos_range(self, cos_key: str, start: int, end: int) -> bytes:
+        range_header = f"bytes={start}-{end - 1}"
+        last_exc: Optional[BaseException] = None
+        for attempt in range(self.anno_cos_range_retries + 1):
+            try:
+                resp = self._get_anno_cos_client().get_object(
+                    Bucket=self.anno_cos_bucket,
+                    Key=cos_key,
+                    Range=range_header,
+                )
+                return resp["Body"].get_raw_stream().read()
+            except BaseException as exc:
+                last_exc = exc
+                if attempt < self.anno_cos_range_retries:
+                    time.sleep(min(2.0, 0.25 * (2 ** attempt)))
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        raise IOError(f"COS range read failed: {cos_key} {range_header}")
+
+    def _anno_cos_object_size(self, cos_key: str) -> int:
+        try:
+            resp = self._get_anno_cos_client().head_object(
+                Bucket=self.anno_cos_bucket,
+                Key=cos_key,
+            )
+            for key in ("Content-Length", "content-length", "ContentLength"):
+                if key in resp:
+                    return int(resp[key])
+        except Exception:
+            pass
+
+        resp = self._get_anno_cos_client().get_object(
+            Bucket=self.anno_cos_bucket,
+            Key=cos_key,
+            Range="bytes=0-0",
+        )
+        try:
+            resp["Body"].get_raw_stream().read()
+        finally:
+            pass
+        content_range = (
+            resp.get("Content-Range")
+            or resp.get("content-range")
+            or resp.get("ContentRange")
+            or ""
+        )
+        if "/" in content_range:
+            return int(str(content_range).rsplit("/", 1)[1])
+        for key in ("Content-Length", "content-length", "ContentLength"):
+            if key in resp:
+                return int(resp[key])
+        raise IOError(f"Could not determine COS object size for {cos_key}")
+
+    @contextlib.contextmanager
+    def _open_anno_h5_metadata(self, h5_path: Path) -> Any:
+        import h5py
+
+        if self._path_is_under_anno_cos_mount(h5_path):
+            cos_key = self._anno_cos_key(h5_path)
+            object_size = self._anno_cos_object_size(cos_key)
+            block_mb = float(os.getenv("POINTODYSSEY_ANNO_METADATA_RANGE_BLOCK_MB", "4"))
+            cache_blocks = int(os.getenv("POINTODYSSEY_ANNO_METADATA_RANGE_CACHE_BLOCKS", "32"))
+            range_file = _CosRangeFile(
+                size=object_size,
+                read_range=lambda start, end: self._read_anno_cos_range(
+                    cos_key,
+                    int(start),
+                    int(end),
+                ),
+                block_size=int(max(0.25, block_mb) * 1024**2),
+                max_blocks=cache_blocks,
+            )
+            try:
+                with h5py.File(range_file, "r") as f:
+                    yield f
+            finally:
+                range_file.close()
+            return
+
+        with h5py.File(h5_path, "r") as f:
+            yield f
+
+    def _resolve_anno_h5_index_cache_root(self) -> Optional[Path]:
+        raw = os.getenv("D4RT_H5_RANGE_CACHE_ROOT", "").strip()
+        if not raw:
+            default = Path("/tmp/d4rt_sample_stage/shared_raw_cache/data")
+            if default.exists():
+                raw = str(default)
+        if not raw:
+            return None
+        root = Path(raw) / ".d4rt_h5_chunk_indexes" / "pointodyssey"
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+        return root
+
+    def _resolve_h5_range_cache_root(self) -> Optional[Path]:
+        raw = os.getenv("D4RT_H5_RANGE_CACHE_ROOT", "").strip()
+        if not raw:
+            default = Path("/tmp/d4rt_sample_stage/shared_raw_cache/data")
+            if default.exists():
+                raw = str(default)
+        if not raw:
+            return None
+        root = Path(raw) / ".d4rt_h5_range_chunks"
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+        return root
+
+    def _anno_h5_index_cache_path(self, h5_path: Path) -> Optional[Path]:
+        root = getattr(self, "_anno_h5_index_cache_root", None)
+        if root is None:
+            return None
+        cache_key = (
+            self._anno_cos_key(h5_path)
+            if self._path_is_under_anno_cos_mount(h5_path)
+            else str(h5_path)
+        )
+        digest = hashlib.sha1(cache_key.encode("utf-8")).hexdigest()
+        safe_name = re.sub(r"[^A-Za-z0-9_.-]+", "_", h5_path.parent.name)[:80]
+        return root / f"{safe_name}_{digest}.pkl"
+
+    def _load_anno_h5_chunk_index(
+        self,
+        h5_path: Path,
+        required_frames: Optional[list[int]] = None,
+    ) -> dict[str, Any]:
+        cache_key = str(h5_path)
+        cached = self._anno_h5_chunk_index_cache.get(cache_key)
+        if cached is not None:
+            if required_frames:
+                self._ensure_anno_h5_chunk_index_frames(h5_path, cached, required_frames)
+            return cached
+
+        cache_path = self._anno_h5_index_cache_path(h5_path)
+        if cache_path is not None and cache_path.is_file():
+            try:
+                with open(cache_path, "rb") as f:
+                    index = pickle.load(f)
+                if required_frames:
+                    self._ensure_anno_h5_chunk_index_frames(h5_path, index, required_frames)
+                self._anno_h5_chunk_index_cache[cache_key] = index
+                return index
+            except (OSError, ValueError, KeyError, EOFError, pickle.PickleError):
+                cache_path.unlink(missing_ok=True)
+
+        index = self._build_anno_h5_chunk_index(h5_path, required_frames=required_frames)
+        self._anno_h5_chunk_index_cache[cache_key] = index
+
+        if cache_path is not None:
+            tmp_path = cache_path.with_name(
+                f".{cache_path.name}.part.{os.getpid()}.{threading.get_ident()}"
+            )
+            try:
+                cache_path.parent.mkdir(parents=True, exist_ok=True)
+                with open(tmp_path, "wb") as f:
+                    pickle.dump(index, f, protocol=pickle.HIGHEST_PROTOCOL)
+                os.replace(tmp_path, cache_path)
+            except OSError:
+                pass
+            finally:
+                tmp_path.unlink(missing_ok=True)
+
+        return index
+
+    def _ensure_anno_h5_chunk_index_frames(
+        self,
+        h5_path: Path,
+        index: dict[str, Any],
+        required_frames: list[int],
+    ) -> None:
+        keys = ("trajs_2d", "trajs_3d", "valids", "visibs", "intrinsics", "extrinsics")
+        needs_update = False
+        for key in keys:
+            entry = index.get(key)
+            if not isinstance(entry, dict) or "offsets" not in entry:
+                needs_update = True
+                break
+            offsets = entry["offsets"]
+            if any(
+                int(frame_idx) >= len(offsets) or offsets[int(frame_idx)] is None
+                for frame_idx in required_frames
+            ):
+                needs_update = True
+                break
+        if not needs_update:
+            return
+
+        frames = self._expand_anno_h5_index_frames(h5_path, required_frames)
+        changed = False
+        with self._open_anno_h5_metadata(h5_path) as f:
+            for key in keys:
+                if key not in f:
+                    continue
+                ds = f[key]
+                entry = index.get(key)
+                if ds.chunks is None or ds.ndim < 1:
+                    if entry is None:
+                        index[key] = {
+                            "scalar": True,
+                            "value": ds[()],
+                            "dtype": ds.dtype.str,
+                            "shape": tuple(int(v) for v in ds.shape),
+                        }
+                        changed = True
+                    continue
+                if entry is None:
+                    entry = {
+                        "offsets": [None] * int(ds.shape[0]),
+                        "filter_masks": [0] * int(ds.shape[0]),
+                        "dtype": ds.dtype.str,
+                        "chunk_shape": tuple(int(v) for v in ds.chunks),
+                        "shape": tuple(int(v) for v in ds.shape),
+                        "compression": ds.compression,
+                    }
+                    index[key] = entry
+                    changed = True
+                offsets = entry.get("offsets")
+                filter_masks = entry.get("filter_masks")
+                if offsets is None or filter_masks is None:
+                    continue
+                coord_tail = tuple(0 for _ in range(ds.ndim - 1))
+                for frame_idx in frames:
+                    if frame_idx < 0 or frame_idx >= len(offsets) or offsets[frame_idx] is not None:
+                        continue
+                    info = ds.id.get_chunk_info_by_coord((frame_idx,) + coord_tail)
+                    offsets[frame_idx] = (int(info.byte_offset), int(info.size))
+                    filter_masks[frame_idx] = int(info.filter_mask)
+                    changed = True
+        if changed:
+            cache_path = self._anno_h5_index_cache_path(h5_path)
+            if cache_path is not None:
+                tmp_path = cache_path.with_name(
+                    f".{cache_path.name}.part.{os.getpid()}.{threading.get_ident()}"
+                )
+                try:
+                    cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(tmp_path, "wb") as f:
+                        pickle.dump(index, f, protocol=pickle.HIGHEST_PROTOCOL)
+                    os.replace(tmp_path, cache_path)
+                except OSError:
+                    pass
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+
+    def _expand_anno_h5_index_frames(
+        self,
+        h5_path: Path,
+        required_frames: list[int],
+    ) -> list[int]:
+        radius = self.anno_index_window_radius
+        if radius <= 0:
+            return sorted(set(int(i) for i in required_frames))
+        # Use the sequence size if already known; otherwise fall back to the
+        # requested window only.
+        total = None
+        try:
+            cache_path = self._anno_h5_index_cache_path(h5_path)
+            if cache_path is not None and cache_path.is_file():
+                with open(cache_path, "rb") as f:
+                    cached = pickle.load(f)
+                for entry in cached.values():
+                    if isinstance(entry, dict) and "shape" in entry and entry["shape"]:
+                        total = int(entry["shape"][0])
+                        break
+        except Exception:
+            total = None
+        frames: set[int] = set()
+        for frame_idx in required_frames:
+            start = max(0, int(frame_idx) - radius)
+            end = int(frame_idx) + radius
+            if total is not None:
+                end = min(total - 1, end)
+            frames.update(range(start, end + 1))
+        return sorted(frames)
+
+    def _build_anno_h5_chunk_index(
+        self,
+        h5_path: Path,
+        required_frames: Optional[list[int]] = None,
+    ) -> dict[str, Any]:
+        keys = ("trajs_2d", "trajs_3d", "valids", "visibs", "intrinsics", "extrinsics")
+        index: dict[str, Any] = {"_source": str(h5_path), "_kind": "pointodyssey_anno_h5"}
+        with self._open_anno_h5_metadata(h5_path) as f:
+            for key in keys:
+                if key not in f:
+                    continue
+                ds = f[key]
+                if ds.chunks is None or ds.ndim < 1:
+                    index[key] = {
+                        "scalar": True,
+                        "value": ds[()],
+                        "dtype": ds.dtype.str,
+                        "shape": tuple(int(v) for v in ds.shape),
+                    }
+                    continue
+                offsets: list[Optional[tuple[int, int]]] = [None] * int(ds.shape[0])
+                filter_masks = [0] * int(ds.shape[0])
+                coord_tail = tuple(0 for _ in range(ds.ndim - 1))
+                frames = (
+                    self._expand_anno_h5_index_frames(h5_path, required_frames)
+                    if required_frames is not None
+                    else list(range(int(ds.shape[0])))
+                )
+                for frame_idx in frames:
+                    if frame_idx < 0 or frame_idx >= len(offsets):
+                        continue
+                    info = ds.id.get_chunk_info_by_coord((frame_idx,) + coord_tail)
+                    offsets[frame_idx] = (int(info.byte_offset), int(info.size))
+                    filter_masks[frame_idx] = int(info.filter_mask)
+                index[key] = {
+                    "offsets": offsets,
+                    "filter_masks": filter_masks,
+                    "dtype": ds.dtype.str,
+                    "chunk_shape": tuple(int(v) for v in ds.chunks),
+                    "shape": tuple(int(v) for v in ds.shape),
+                    "compression": ds.compression,
+                }
+        return index
+
+    def _h5_chunk_cache_path(
+        self,
+        cos_key: str,
+        key: str,
+        frame_idx: int,
+        offset: int,
+        size: int,
+    ) -> Optional[Path]:
+        root = getattr(self, "_h5_range_cache_root", None)
+        if root is None:
+            return None
+        digest = hashlib.sha1(f"{cos_key}:{key}".encode("utf-8")).hexdigest()
+        return root / digest / f"{int(frame_idx):08d}_{int(offset)}_{int(size)}.chunk"
+
+    def _read_h5_chunk_cache(
+        self,
+        cos_key: str,
+        key: str,
+        frame_idx: int,
+        offset: int,
+        size: int,
+    ) -> Optional[bytes]:
+        path = self._h5_chunk_cache_path(cos_key, key, frame_idx, offset, size)
+        if path is None or not path.is_file():
+            return None
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return None
+        if len(raw) != int(size):
+            path.unlink(missing_ok=True)
+            return None
+        try:
+            os.utime(path, None)
+        except OSError:
+            pass
+        return raw
+
+    def _write_h5_chunk_cache(
+        self,
+        cos_key: str,
+        key: str,
+        frame_idx: int,
+        offset: int,
+        size: int,
+        raw: bytes,
+    ) -> None:
+        path = self._h5_chunk_cache_path(cos_key, key, frame_idx, offset, size)
+        if path is None or path.is_file() or len(raw) != int(size):
+            return
+        tmp: Optional[Path] = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.part.{os.getpid()}.{threading.get_ident()}")
+            tmp.write_bytes(raw)
+            os.replace(tmp, path)
+        except OSError:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+
+    def _load_anno_h5_cos_range(
+        self,
+        h5_path: Path,
+        frame_indices: list[int],
+    ) -> dict[str, Any]:
+        sorted_idx = sorted(set(int(i) for i in frame_indices))
+        if not sorted_idx:
+            raise ValueError("frame_indices is empty")
+        index = self._load_anno_h5_chunk_index(h5_path, required_frames=sorted_idx)
+        required_keys = ("trajs_2d", "trajs_3d", "valids", "visibs", "intrinsics", "extrinsics")
+        keys = [key for key in required_keys if key in index]
+        if not keys:
+            raise KeyError(f"No supported PointOdyssey anno keys in h5 index: {h5_path}")
+
+        tasks: list[dict[str, Any]] = []
+        chunks_by_key: dict[str, dict[int, np.ndarray]] = {key: {} for key in keys}
+        entries: dict[str, dict[str, Any]] = {}
+        range_stats = {
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "range_tasks": 0,
+            "range_bytes": 0,
+            "index_cache_hit": 1,
+        }
+        cos_key = self._anno_cos_key(h5_path)
+
+        for key in keys:
+            entry = index[key]
+            entries[key] = entry
+            self._validate_anno_h5_range_entry(key, entry, sorted_idx)
+            dtype = np.dtype(entry["dtype"])
+            chunk_shape = tuple(int(v) for v in entry["chunk_shape"])
+            for start, end, chunks in self._merge_anno_h5_range_chunks(entry, sorted_idx):
+                missing_chunks: list[tuple[int, int, int, int]] = []
+                for frame_idx, offset, size, filter_mask in chunks:
+                    raw = self._read_h5_chunk_cache(cos_key, key, frame_idx, offset, size)
+                    if raw is None:
+                        missing_chunks.append((frame_idx, offset, size, filter_mask))
+                        range_stats["cache_misses"] += 1
+                        continue
+                    chunks_by_key[key][int(frame_idx)] = self._decode_anno_h5_chunk(
+                        raw,
+                        entry=entry,
+                        dtype=dtype,
+                        chunk_shape=chunk_shape,
+                        filter_mask=int(filter_mask),
+                    )[0].copy()
+                    range_stats["cache_hits"] += 1
+                if missing_chunks:
+                    task_start = min(int(offset) for _, offset, _, _ in missing_chunks)
+                    task_end = max(
+                        int(offset) + int(size) for _, offset, size, _ in missing_chunks
+                    )
+                    tasks.append({
+                        "key": key,
+                        "start": task_start,
+                        "end": task_end,
+                        "chunks": missing_chunks,
+                    })
+                    range_stats["range_tasks"] += 1
+                    range_stats["range_bytes"] += task_end - task_start
+
+        def fetch_task(task: dict[str, Any]) -> dict[str, Any]:
+            data = self._read_anno_cos_range(cos_key, int(task["start"]), int(task["end"]))
+            return {**task, "data": data}
+
+        max_workers = min(self.anno_cos_range_workers, max(1, len(tasks)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(fetch_task, task) for task in tasks]
+            for future in as_completed(futures):
+                task = future.result()
+                entry = entries[task["key"]]
+                dtype = np.dtype(entry["dtype"])
+                chunk_shape = tuple(int(v) for v in entry["chunk_shape"])
+                start = int(task["start"])
+                data = task["data"]
+                for frame_idx, offset, size, filter_mask in task["chunks"]:
+                    rel = int(offset) - start
+                    raw = data[rel:rel + int(size)]
+                    if len(raw) != int(size):
+                        raise IOError(
+                            f"Short COS range read for {task['key']} frame {frame_idx}: "
+                            f"got {len(raw)} bytes, expected {size}"
+                        )
+                    chunks_by_key[task["key"]][int(frame_idx)] = self._decode_anno_h5_chunk(
+                        raw,
+                        entry=entry,
+                        dtype=dtype,
+                        chunk_shape=chunk_shape,
+                        filter_mask=int(filter_mask),
+                    )[0].copy()
+                    self._write_h5_chunk_cache(
+                        cos_key,
+                        task["key"],
+                        frame_idx,
+                        offset,
+                        size,
+                        raw,
+                    )
+        self._last_anno_range_stats = range_stats
+
+        pos = {frame_idx: idx for idx, frame_idx in enumerate(sorted_idx)}
+        reorder = [pos[int(frame_idx)] for frame_idx in frame_indices]
+        result: dict[str, Any] = {}
+        for key in keys:
+            arr_sorted = np.stack(
+                [chunks_by_key[key][frame_idx] for frame_idx in sorted_idx],
+                axis=0,
+            )
+            result[key] = arr_sorted[reorder]
+        return result
+
+    def _validate_anno_h5_range_entry(
+        self,
+        key: str,
+        entry: dict[str, Any],
+        sorted_idx: list[int],
+    ) -> None:
+        compression = entry.get("compression")
+        if compression not in (None, "None", "lzf"):
+            raise RuntimeError(f"Unsupported compressed h5 chunks for {key}: {compression}")
+        chunk_shape = tuple(int(v) for v in entry["chunk_shape"])
+        if not chunk_shape or chunk_shape[0] != 1:
+            raise RuntimeError(f"Unsupported h5 chunk_shape for {key}: {chunk_shape}")
+        offsets = entry["offsets"]
+        max_idx = sorted_idx[-1]
+        if max_idx >= len(offsets):
+            raise IndexError(f"Frame {max_idx} out of range for {key} ({len(offsets)})")
+        if any(offsets[int(frame_idx)] is None for frame_idx in sorted_idx):
+            raise RuntimeError(f"Missing h5 chunk offsets for {key}")
+
+    def _merge_anno_h5_range_chunks(
+        self,
+        entry: dict[str, Any],
+        sorted_idx: list[int],
+    ) -> list[tuple[int, int, list[tuple[int, int, int, int]]]]:
+        offsets = entry["offsets"]
+        filter_masks = entry.get("filter_masks") or [0] * len(offsets)
+        chunks = [
+            (
+                frame_idx,
+                int(offsets[frame_idx][0]),
+                int(offsets[frame_idx][1]),
+                int(filter_masks[frame_idx]),
+            )
+            for frame_idx in sorted_idx
+        ]
+        chunks.sort(key=lambda item: item[1])
+        spans: list[tuple[int, int, list[tuple[int, int, int, int]]]] = []
+        max_gap = self.anno_cos_range_merge_gap_bytes
+        cur_start: Optional[int] = None
+        cur_end: Optional[int] = None
+        cur_chunks: list[tuple[int, int, int, int]] = []
+        for frame_idx, offset, size, filter_mask in chunks:
+            end = offset + size
+            if cur_start is None or cur_end is None or offset > cur_end + max_gap:
+                if cur_start is not None and cur_end is not None:
+                    spans.append((cur_start, cur_end, cur_chunks))
+                cur_start = offset
+                cur_end = end
+                cur_chunks = [(frame_idx, offset, size, filter_mask)]
+            else:
+                cur_end = max(cur_end, end)
+                cur_chunks.append((frame_idx, offset, size, filter_mask))
+        if cur_start is not None and cur_end is not None:
+            spans.append((cur_start, cur_end, cur_chunks))
+        return spans
+
+    def _decode_anno_h5_chunk(
+        self,
+        raw: bytes,
+        entry: dict[str, Any],
+        dtype: np.dtype,
+        chunk_shape: tuple[int, ...],
+        filter_mask: int,
+    ) -> np.ndarray:
+        expected_nbytes = int(np.prod(chunk_shape)) * dtype.itemsize
+        compression = entry.get("compression")
+        if compression in (None, "None") or (filter_mask & 1):
+            payload = raw
+        elif compression == "lzf":
+            payload = _lzf_decompress(raw, expected_nbytes)
+        else:
+            raise RuntimeError(f"Unsupported h5 compression: {compression}")
+        if len(payload) != expected_nbytes:
+            raise IOError(
+                f"Decoded h5 chunk has {len(payload)} bytes, expected {expected_nbytes}"
+            )
+        return np.frombuffer(payload, dtype=dtype).reshape(chunk_shape)
 
     def _anno_frame_cache_path(self, sequence_name: str, frame_idx: int) -> Path:
         safe_name = sequence_name.replace("/", "__")

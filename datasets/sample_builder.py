@@ -106,6 +106,7 @@ class SampleBuilder:
 
     def run(self) -> None:
         """Main loop for builder process."""
+        self._configure_cpu_threads()
         enable_faulthandler = getattr(self, "_enable_faulthandler", False)
         verbose_builder = getattr(self, "_verbose_builder", False)
         if enable_faulthandler:
@@ -157,6 +158,24 @@ class SampleBuilder:
         finally:
             if verbose_builder:
                 print(f"[Builder {self.builder_id}] EXITED pid={os.getpid()}", flush=True)
+
+    def _configure_cpu_threads(self) -> None:
+        """Keep many builder processes from oversubscribing CPU thread pools."""
+        torch_threads = max(1, int(os.getenv("D4RT_BUILDER_TORCH_THREADS", "1")))
+        interop_threads = max(1, int(os.getenv("D4RT_BUILDER_TORCH_INTEROP_THREADS", "1")))
+        try:
+            import torch
+
+            torch.set_num_threads(torch_threads)
+            try:
+                torch.set_num_interop_threads(interop_threads)
+            except RuntimeError:
+                # PyTorch only allows this before inter-op work starts.  If a
+                # library touched it early, the environment caps still protect
+                # BLAS/OpenMP and intra-op threads.
+                pass
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Build with retry
@@ -296,6 +315,9 @@ class SampleBuilder:
                         f"cam_load={timing.get('cam_load_s', 0)*1000:.0f}ms "
                         f"precomputed={timing.get('precomputed_s', 0)*1000:.0f}ms "
                         f"process={timing.get('process_s', 0)*1000:.0f}ms | "
+                        f"h5_hit={int(timing.get('precomputed_range_cache_hits', 0))} "
+                        f"h5_miss={int(timing.get('precomputed_range_cache_misses', 0))} "
+                        f"h5_local={int(timing.get('precomputed_range_local_h5', 0))} | "
                         f"stage={self._last_profile.get('stage_s', 0)*1000:.0f}ms "
                         f"transform={self._last_profile.get('transform_s', 0)*1000:.0f}ms "
                         f"query={self._last_profile.get('query_s', 0)*1000:.0f}ms | "
@@ -382,6 +404,10 @@ class SampleBuilder:
         with stage_ctx as staged_adapter:
             t_stage = time.perf_counter() - t_stage0
             self._last_profile["stage_s"] = t_stage
+            if sample_stager is not None:
+                stage_stats = getattr(sample_stager, "_last_stage_stats", None)
+                if stage_stats:
+                    self._last_profile["stage_stats"] = dict(stage_stats)
             t_load0 = time.perf_counter()
             clip = staged_adapter.load_clip(spec.sequence_name, spec.frame_indices)
             t_load = time.perf_counter() - t_load0
@@ -425,6 +451,9 @@ class SampleBuilder:
             transform_s=t_transform,
             query_s=t_query,
         )
+        sample.metadata["_builder_profile"] = dict(self._last_profile)
+        if self._last_load_timing:
+            sample.metadata["_load_timing"] = dict(self._last_load_timing)
 
         return sample
 

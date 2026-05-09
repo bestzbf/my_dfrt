@@ -676,6 +676,8 @@ class ScanNetPPAdapter(BaseAdapter):
         self._precomputed_info_cache: dict[str, dict[str, Any]] = {}
         self._h5_chunk_index_cache: dict[str, dict[str, Any]] = {}
         self._cos_range_warned = False
+        self._h5_range_cache_root = self._resolve_h5_range_cache_root()
+        self._last_h5_range_stats: dict[str, int] = {}
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -1105,6 +1107,81 @@ class ScanNetPPAdapter(BaseAdapter):
             raise last_exc
         raise IOError(f"Failed to load h5 chunk index: {index_path}")
 
+    def _resolve_h5_range_cache_root(self) -> Optional[Path]:
+        raw = os.getenv("D4RT_H5_RANGE_CACHE_ROOT", "").strip()
+        if not raw:
+            default = Path("/tmp/d4rt_sample_stage/shared_raw_cache/data")
+            if default.exists():
+                raw = str(default)
+        if not raw:
+            return None
+        root = Path(raw) / ".d4rt_h5_range_chunks"
+        try:
+            root.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return None
+        return root
+
+    def _h5_chunk_cache_path(
+        self,
+        cos_key: str,
+        key: str,
+        frame_idx: int,
+        offset: int,
+        size: int,
+    ) -> Optional[Path]:
+        root = getattr(self, "_h5_range_cache_root", None)
+        if root is None:
+            return None
+        digest = hashlib.sha1(f"{cos_key}:{key}".encode("utf-8")).hexdigest()
+        return root / digest / f"{int(frame_idx):08d}_{int(offset)}_{int(size)}.chunk"
+
+    def _read_h5_chunk_cache(
+        self,
+        cos_key: str,
+        key: str,
+        frame_idx: int,
+        offset: int,
+        size: int,
+    ) -> Optional[bytes]:
+        path = self._h5_chunk_cache_path(cos_key, key, frame_idx, offset, size)
+        if path is None or not path.is_file():
+            return None
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            return None
+        if len(raw) != int(size):
+            path.unlink(missing_ok=True)
+            return None
+        try:
+            os.utime(path, None)
+        except OSError:
+            pass
+        return raw
+
+    def _write_h5_chunk_cache(
+        self,
+        cos_key: str,
+        key: str,
+        frame_idx: int,
+        offset: int,
+        size: int,
+        raw: bytes,
+    ) -> None:
+        path = self._h5_chunk_cache_path(cos_key, key, frame_idx, offset, size)
+        if path is None or path.is_file() or len(raw) != int(size):
+            return
+        tmp: Optional[Path] = None
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.part.{os.getpid()}.{threading.get_ident()}")
+            tmp.write_bytes(raw)
+            os.replace(tmp, path)
+        except OSError:
+            if tmp is not None:
+                tmp.unlink(missing_ok=True)
+
     def _load_precomputed_cos_range(
         self,
         h5_path: Path,
@@ -1129,19 +1206,42 @@ class ScanNetPPAdapter(BaseAdapter):
         tasks: list[dict[str, Any]] = []
         chunks_by_key: dict[str, dict[int, np.ndarray]] = {key: {} for key in keys}
         entries: dict[str, dict[str, Any]] = {}
+        range_stats = {
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "range_tasks": 0,
+            "range_bytes": 0,
+        }
+        cos_key = self._precomputed_cos_key(h5_path)
         for key in keys:
             entry = self._normalize_h5_range_entry(key, index[key])
             entries[key] = entry
             self._validate_h5_range_entry(key, entry, sorted_idx)
             for start, end, chunks in self._merge_h5_range_chunks(entry, sorted_idx):
-                tasks.append({
-                    "key": key,
-                    "start": start,
-                    "end": end,
-                    "chunks": chunks,
-                })
-
-        cos_key = self._precomputed_cos_key(h5_path)
+                missing_chunks: list[tuple[int, int, int]] = []
+                dtype = np.dtype(entry["dtype"])
+                chunk_shape = tuple(int(v) for v in entry["chunk_shape"])
+                for frame_idx, offset, size in chunks:
+                    raw = self._read_h5_chunk_cache(cos_key, key, frame_idx, offset, size)
+                    if raw is None:
+                        missing_chunks.append((frame_idx, offset, size))
+                        range_stats["cache_misses"] += 1
+                        continue
+                    chunks_by_key[key][int(frame_idx)] = (
+                        np.frombuffer(raw, dtype=dtype).reshape(chunk_shape)[0].copy()
+                    )
+                    range_stats["cache_hits"] += 1
+                if missing_chunks:
+                    task_start = min(int(offset) for _, offset, _ in missing_chunks)
+                    task_end = max(int(offset) + int(size) for _, offset, size in missing_chunks)
+                    tasks.append({
+                        "key": key,
+                        "start": task_start,
+                        "end": task_end,
+                        "chunks": missing_chunks,
+                    })
+                    range_stats["range_tasks"] += 1
+                    range_stats["range_bytes"] += task_end - task_start
 
         def fetch_task(task: dict[str, Any]) -> dict[str, Any]:
             data = self._read_cos_range(cos_key, int(task["start"]), int(task["end"]))
@@ -1167,7 +1267,16 @@ class ScanNetPPAdapter(BaseAdapter):
                             f"got {len(raw)} bytes, expected {expected}"
                         )
                     arr = np.frombuffer(raw, dtype=dtype).reshape(chunk_shape)[0].copy()
+                    self._write_h5_chunk_cache(
+                        cos_key,
+                        task["key"],
+                        frame_idx,
+                        offset,
+                        size,
+                        raw,
+                    )
                     chunks_by_key[task["key"]][int(frame_idx)] = arr
+        self._last_h5_range_stats = range_stats
 
         pos = {frame_idx: idx for idx, frame_idx in enumerate(sorted_idx)}
         reorder = [pos[int(frame_idx)] for frame_idx in frame_indices]
@@ -1405,6 +1514,10 @@ class ScanNetPPAdapter(BaseAdapter):
             t0 = _time.perf_counter()
             cache = self._load_precomputed(sequence_name, frame_indices)
             timing["precomputed_s"] = _time.perf_counter() - t0
+            range_stats = getattr(self, "_last_h5_range_stats", None)
+            if range_stats:
+                for key, value in range_stats.items():
+                    timing[f"precomputed_range_{key}"] = float(value)
 
             # Process intrinsics
             t0 = _time.perf_counter()

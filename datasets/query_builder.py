@@ -487,76 +487,74 @@ class D4RTQueryBuilder:
 
         targets = _build_empty_targets(self.num_queries)
 
-        # ---- 预计算每帧有效 source 点 ----
+        # ---- 批量预计算每帧有效 source 点（向量化替代 T 帧循环） ----
         valid_by_frame: list[np.ndarray] = []
         boundary_by_frame: list[np.ndarray] = []
 
+        # 批量 camera transform: [T,4,4] @ [T,N,4] → [T,N,3]
+        ones = np.ones((T, N, 1), dtype=np.float32)
+        world_h = np.concatenate([trajs_3d.astype(np.float32), ones], axis=-1)  # [T,N,4]
+        all_cam = np.einsum('tij,tnj->tni', extrinsics, world_h)[:, :, :3]     # [T,N,3]
+        depth_z = all_cam[:, :, 2]                                               # [T,N]
+        depth_valid = (depth_z > 1e-3) & (depth_z < z_max) & np.isfinite(depth_z)
+
+        # 批量 in-bounds / world-finite
+        in_bounds = (
+            (trajs_2d[:, :, 0] >= 0) & (trajs_2d[:, :, 0] < cw) &
+            (trajs_2d[:, :, 1] >= 0) & (trajs_2d[:, :, 1] < ch)
+        )  # [T,N]
+        world_finite = np.isfinite(trajs_3d).all(-1)  # [T,N]
+
+        # 批量 depth-map validity
+        sx_d, sy_d = S / cw, S / ch
+        depth_map_valid = np.ones((T, N), dtype=bool)
+        if result.depths is not None:
+            pts_finite = np.isfinite(trajs_2d).all(-1)  # [T,N]
+            pts_dok = pts_finite & in_bounds
+            d_px = np.zeros((T, N), dtype=np.float32)
+            if pts_dok.any():
+                pts_img_all = trajs_2d[pts_dok] * np.array([sx_d, sy_d], dtype=np.float32)
+                xi_all = np.clip(np.round(pts_img_all[:, 0]), 0, S - 1).astype(np.int32)
+                yi_all = np.clip(np.round(pts_img_all[:, 1]), 0, S - 1).astype(np.int32)
+                depths_arr = np.stack(result.depths, axis=0)  # [T,S,S]
+                fi_idx, ni_idx = np.where(pts_dok)
+                d_px[pts_dok] = depths_arr[fi_idx, yi_all, xi_all]
+            depth_map_valid = pts_dok & (d_px > 1e-3) & np.isfinite(d_px)
+
+        # 批量 reprojection error
+        K_fx = result.intrinsics[:, 0, 0]  # [T]
+        K_cx = result.intrinsics[:, 0, 2]  # [T]
+        K_fy = result.intrinsics[:, 1, 1]  # [T]
+        K_cy = result.intrinsics[:, 1, 2]  # [T]
+        with np.errstate(over='ignore'):
+            proj_x = all_cam[:, :, 0] / (depth_z + 1e-8) * K_fx[:, None] + K_cx[:, None]
+            proj_y = all_cam[:, :, 1] / (depth_z + 1e-8) * K_fy[:, None] + K_cy[:, None]
+            reproj_err = np.sqrt(
+                (proj_x - trajs_2d[:, :, 0] * sx_d) ** 2 +
+                (proj_y - trajs_2d[:, :, 1] * sy_d) ** 2
+            )  # [T,N]
+        reproj_valid = (reproj_err < 3.0) | ~depth_valid
+
+        # 合并 validity mask
+        all_valid = (
+            (valids > 0.5) & (visibs > 0.5) & in_bounds
+            & world_finite & depth_valid & depth_map_valid & reproj_valid
+        )  # [T,N]
+
+        # 批量 boundary 查表
+        bnd_stack = np.stack(boundary, axis=0)  # [T,S,S]
         for fi in range(T):
-            pts = trajs_2d[fi]                                  # [N,2]
-            in_bounds = (
-                (pts[:, 0] >= 0) & (pts[:, 0] < cw) &
-                (pts[:, 1] >= 0) & (pts[:, 1] < ch)
-            )
-            world_finite = np.isfinite(trajs_3d[fi]).all(-1)
-
-            # 保留相机前方、深度图一致且重投影一致的点，避免明显离群轨迹污染采样池。
-            E_fi = extrinsics[fi]  # [4,4]
-            world_h = np.concatenate([trajs_3d[fi].astype(np.float32),
-                                     np.ones((N, 1), dtype=np.float32)], axis=-1)  # [N,4]
-            cam_coords = (E_fi @ world_h.T).T[:, :3]  # [N,3]
-            depth_z = cam_coords[:, 2]
-            depth_valid = (depth_z > 1e-3) & (depth_z < z_max) & np.isfinite(depth_z)
-
-            depth_map_valid = np.ones(trajs_3d[fi].shape[0], dtype=bool)
-            if result.depths is not None:
-                sx, sy = S / cw, S / ch
-                # Only index the resized depth map for finite in-bounds points.
-                # Extremely large off-screen coords can still be finite, and
-                # casting them to int32 would raise RuntimeWarning before the
-                # later in_bounds mask filters them out.
-                pts_depth_ok = np.isfinite(pts).all(-1) & in_bounds
-                d_px = np.zeros(trajs_3d[fi].shape[0], dtype=np.float32)
-                if pts_depth_ok.any():
-                    pts_img = pts[pts_depth_ok] * np.array([sx, sy], dtype=np.float32)
-                    xi = np.clip(np.round(pts_img[:, 0]), 0, S - 1).astype(np.int32)
-                    yi = np.clip(np.round(pts_img[:, 1]), 0, S - 1).astype(np.int32)
-                    d_px[pts_depth_ok] = result.depths[fi][yi, xi]
-                depth_map_valid = pts_depth_ok & (d_px > 1e-3) & np.isfinite(d_px)
-
-            K_fi = result.intrinsics[fi]
-            proj_x = cam_coords[:, 0] / (depth_z + 1e-8) * K_fi[0, 0] + K_fi[0, 2]
-            proj_y = cam_coords[:, 1] / (depth_z + 1e-8) * K_fi[1, 1] + K_fi[1, 2]
-            sx, sy = S / cw, S / ch
-            with np.errstate(over='ignore'):
-                reproj_err = np.sqrt(
-                    (proj_x - pts[:, 0] * sx) ** 2 +
-                    (proj_y - pts[:, 1] * sy) ** 2
-                )
-            reproj_valid = (reproj_err < 3.0) | ~depth_valid
-
-            valid_src = np.where(
-                (valids[fi] > 0.5)
-                & (visibs[fi] > 0.5)
-                & in_bounds
-                & world_finite
-                & depth_valid
-                & depth_map_valid
-                & reproj_valid
-            )[0]
+            valid_src = np.where(all_valid[fi])[0]
             valid_by_frame.append(valid_src)
 
             if len(valid_src) == 0 or self.boundary_ratio <= 0:
                 boundary_by_frame.append(np.empty(0, dtype=np.int64))
                 continue
 
-            # boundary mask は img_size 解像度、trajs は crop 解像度
-            # → trajs を img_size へスケール
-            sx = S / cw
-            sy = S / ch
-            xy_img = np.round(pts[valid_src] * np.array([sx, sy])).astype(np.int32)
+            xy_img = np.round(trajs_2d[fi, valid_src] * np.array([sx_d, sy_d])).astype(np.int32)
             xy_img[:, 0] = np.clip(xy_img[:, 0], 0, S - 1)
             xy_img[:, 1] = np.clip(xy_img[:, 1], 0, S - 1)
-            on_boundary = boundary[fi][xy_img[:, 1], xy_img[:, 0]]
+            on_boundary = bnd_stack[fi, xy_img[:, 1], xy_img[:, 0]]
             boundary_by_frame.append(valid_src[on_boundary])
 
         valid_frames = [fi for fi, v in enumerate(valid_by_frame) if len(v) > 0]
@@ -632,7 +630,7 @@ class D4RTQueryBuilder:
         src_ix  = np.clip(np.round(src_xy[:, 0] * sx).astype(np.int32), 0, S - 1)
         src_iy  = np.clip(np.round(src_xy[:, 1] * sy).astype(np.int32), 0, S - 1)
 
-        bnd_stack  = np.stack(boundary,        axis=0)   # [T,S,S]
+        # bnd_stack 已在上方批量 validity 计算中构建
         dbnd_stack = np.stack(depth_boundary,  axis=0)   # [T,S,S]
         mbnd_stack = np.stack(motion_boundary, axis=0)   # [T,S,S]
         src_is_bnd  = bnd_stack [src_frames, src_iy, src_ix]

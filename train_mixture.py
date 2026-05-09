@@ -400,6 +400,37 @@ def format_batch_sample_details(batch: dict, max_samples: int = 8) -> list[str]:
                 f"depth={timing.get('depth_load_s', 0)*1000:.0f}ms "
                 f"precomputed={timing.get('precomputed_s', 0)*1000:.0f}ms"
             )
+            if "precomputed_range_cache_hits" in timing:
+                local_h5 = int(timing.get("precomputed_range_local_h5", 0))
+                lines.append(
+                    f"    h5_range_cache: "
+                    f"hit={int(timing.get('precomputed_range_cache_hits', 0))} "
+                    f"miss={int(timing.get('precomputed_range_cache_misses', 0))} "
+                    f"tasks={int(timing.get('precomputed_range_range_tasks', 0))} "
+                    f"bytes={timing.get('precomputed_range_range_bytes', 0) / 1024**2:.1f}MB"
+                    + (f" local_h5={local_h5}" if local_h5 else "")
+                )
+        builder_profile = md.get("_builder_profile")
+        if isinstance(builder_profile, dict) and builder_profile.get("load_s", 0) > 0:
+            lines.append(
+                f"    build_time: "
+                f"stage={builder_profile.get('stage_s', 0)*1000:.0f}ms "
+                f"load={builder_profile.get('load_s', 0)*1000:.0f}ms "
+                f"transform={builder_profile.get('transform_s', 0)*1000:.0f}ms "
+                f"query={builder_profile.get('query_s', 0)*1000:.0f}ms"
+            )
+            stage_stats = builder_profile.get("stage_stats")
+            if isinstance(stage_stats, dict):
+                lines.append(
+                    f"    stage_cache: files={stage_stats.get('manifest_files')} "
+                    f"hit={stage_stats.get('cache_hits')} "
+                    f"miss={stage_stats.get('cache_misses')} "
+                    f"linked={stage_stats.get('linked')} "
+                    f"copied={stage_stats.get('copied')} "
+                    f"bytes={int(stage_stats.get('bytes', 0)) / 1024**2:.1f}MB "
+                    f"materialize={stage_stats.get('materialize_s', 0)*1000:.0f}ms "
+                    f"scannetpp_depth={stage_stats.get('scannetpp_depth_stage_s', 0)*1000:.0f}ms"
+                )
 
     if batch_size > max_samples:
         lines.append(f"  ... {batch_size - max_samples} more samples omitted")

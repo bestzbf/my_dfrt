@@ -131,6 +131,7 @@ class SampleLocalStager:
         self.work_root.mkdir(parents=True, exist_ok=True)
         self._tls = threading.local()
         self._last_cache_scan_s = 0.0
+        self._last_stage_stats: dict[str, Any] = {}
 
     def _get_client(self) -> CosS3Client:
         client = getattr(self._tls, "cos_client", None)
@@ -193,11 +194,22 @@ class SampleLocalStager:
             tempfile.mkdtemp(prefix=f"sample_stage_{sample_tag}_", dir=self.work_root)
         )
         try:
-            self._materialize_manifest(manifest, temp_dir)
+            t_materialize0 = time.perf_counter()
+            materialize_stats = self._materialize_manifest(manifest, temp_dir)
+            materialize_s = time.perf_counter() - t_materialize0
+            self._last_stage_stats = {
+                "dataset": str(getattr(adapter, "dataset_name", "")),
+                "sequence": sequence_name,
+                "requested_frames": len(frame_indices),
+                "manifest_files": len(manifest),
+                "materialize_s": materialize_s,
+                **materialize_stats,
+            }
             staged_dataset_root = temp_dir / self._to_cos_key(Path(adapter.root))
             # scannetpp: warm _scene_cache from staged files so _get_scene_data
             # reads local cameras.txt/images.txt instead of COS mount
             if str(getattr(adapter, "dataset_name", "")) == "scannetpp":
+                t_depth0 = time.perf_counter()
                 if sequence_name not in adapter._scene_cache:
                     old_data_root = adapter.data_root
                     adapter.data_root = staged_dataset_root
@@ -213,7 +225,18 @@ class SampleLocalStager:
                                 adapter._scene_cache[sequence_name] = dict(sd, scene_dir=cos_scene_dir)
                             except ValueError:
                                 adapter._scene_cache.pop(sequence_name, None)
-                self._prepare_scannetpp_depth_stage(adapter, sequence_name, frame_indices, staged_dataset_root)
+                depth_frame_indices = self._expand_frame_indices(
+                    adapter,
+                    sequence_name,
+                    frame_indices,
+                )
+                self._prepare_scannetpp_depth_stage(
+                    adapter,
+                    sequence_name,
+                    depth_frame_indices,
+                    staged_dataset_root,
+                )
+                self._last_stage_stats["scannetpp_depth_stage_s"] = time.perf_counter() - t_depth0
             with self._rebase_adapter(adapter, sequence_name, staged_dataset_root):
                 yield adapter
         finally:
@@ -254,16 +277,43 @@ class SampleLocalStager:
         frame_indices: list[int],
     ) -> list[int]:
         radius = self.config.window_radius
-        if radius <= 0 or not frame_indices:
+        if not frame_indices:
             return frame_indices
+        unique_indices = sorted(set(int(i) for i in frame_indices))
+        if radius <= 0:
+            return unique_indices
         try:
             num_frames = int(adapter.get_num_frames(sequence_name))
         except Exception:
-            return frame_indices
+            return unique_indices
         if num_frames <= 0:
-            return frame_indices
-        low = max(0, min(frame_indices) - radius)
-        high = min(num_frames - 1, max(frame_indices) + radius)
+            return unique_indices
+
+        positive_gaps = [
+            b - a for a, b in zip(unique_indices, unique_indices[1:]) if b > a
+        ]
+        if positive_gaps and min(positive_gaps) > 1 and len(set(positive_gaps)) == 1:
+            # Strided clips should not pull every intermediate frame into the
+            # raw cache.  Extend only along the observed stride so staging stays
+            # proportional to the frames the adapter will actually load.
+            stride = positive_gaps[0]
+            extra_steps = radius // stride
+            if extra_steps <= 0:
+                return unique_indices
+            expanded = set(unique_indices)
+            first = unique_indices[0]
+            last = unique_indices[-1]
+            for step in range(1, extra_steps + 1):
+                before = first - step * stride
+                after = last + step * stride
+                if before >= 0:
+                    expanded.add(before)
+                if after < num_frames:
+                    expanded.add(after)
+            return sorted(expanded)
+
+        low = max(0, unique_indices[0] - radius)
+        high = min(num_frames - 1, unique_indices[-1] + radius)
         return list(range(low, high + 1))
 
     def _manifest_kubric(
@@ -276,7 +326,7 @@ class SampleLocalStager:
         paths: list[Path] = [record.rank_path]
         if record.h5_path is not None:
             paths.append(record.h5_path)
-            if record.depth_names is not None or record.depth_dir.exists():
+            if record.depth_names is not None or getattr(record, "has_depth_dir", False):
                 paths.extend(
                     record.depth_dir / adapter._depth_name_for_index(record, i)
                     for i in frame_indices
@@ -404,17 +454,43 @@ class SampleLocalStager:
         depth_key = f"{rel_key}/iphone/depth.bin"
         index_key = f"{rel_key}/iphone/depth_chunk_index.pkl"
 
-        # download chunk index (~100KB)
-        resp = self._get_client().get_object(Bucket=self.config.bucket, Key=index_key)
-        chunk_offsets: list[tuple[int, int]] = pickle.loads(resp["Body"].get_raw_stream().read())
+        # cache chunk index (~100KB)
+        index_cache_path = self._ensure_cached(original_scene_dir / "iphone" / "depth_chunk_index.pkl")
+        chunk_offsets: list[tuple[int, int]] = pickle.loads(index_cache_path.read_bytes())
 
         needed = sorted(set(frame_indices))
 
         def fetch_chunk(fi: int) -> tuple[int, bytes]:
+            chunk_cache_path = self.cache_data_root / Path(f"{depth_key}.chunks") / f"{fi:08d}.bin"
+            if chunk_cache_path.is_file():
+                self._touch_cache_entry(chunk_cache_path)
+                return fi, chunk_cache_path.read_bytes()
+
             offset, chunk_size = chunk_offsets[fi]
-            range_header = f"bytes={offset}-{offset + chunk_size - 1}"
-            r = self._get_client().get_object(Bucket=self.config.bucket, Key=depth_key, Range=range_header)
-            return fi, r["Body"].get_raw_stream().read()
+            lock_key = Path(f"{depth_key}.chunks") / f"{fi:08d}.lock"
+            with self._path_lock(lock_key):
+                if chunk_cache_path.is_file():
+                    self._touch_cache_entry(chunk_cache_path)
+                    return fi, chunk_cache_path.read_bytes()
+                range_header = f"bytes={offset}-{offset + chunk_size - 1}"
+                r = self._get_client().get_object(
+                    Bucket=self.config.bucket,
+                    Key=depth_key,
+                    Range=range_header,
+                )
+                raw = r["Body"].get_raw_stream().read()
+                chunk_cache_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path = chunk_cache_path.with_name(
+                    f".{chunk_cache_path.name}.part.{os.getpid()}.{threading.get_ident()}"
+                )
+                try:
+                    tmp_path.write_bytes(raw)
+                    os.replace(tmp_path, chunk_cache_path)
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+                self._touch_cache_entry(chunk_cache_path, force=True)
+                self._maybe_evict_cache()
+                return fi, raw
 
         with ThreadPoolExecutor(max_workers=min(16, len(needed))) as ex:
             chunks = dict(ex.map(lambda fi: fetch_chunk(fi), needed))
@@ -525,24 +601,84 @@ class SampleLocalStager:
             rel_path = path.resolve().relative_to(self.mount_root)
         return str(rel_path).replace(os.sep, "/")
 
-    def _materialize_manifest(self, manifest: list[Path], temp_dir: Path) -> None:
+    def _materialize_manifest(self, manifest: list[Path], temp_dir: Path) -> dict[str, Any]:
+        stats: dict[str, Any] = {
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "linked": 0,
+            "copied": 0,
+            "bytes": 0,
+        }
+        stats_lock = threading.Lock()
+
         def stage_one(src_path: Path) -> None:
             rel_key = Path(self._to_cos_key(src_path))
+            cache_path = self.cache_data_root / rel_key
+            was_hit = cache_path.is_file()
             dst = temp_dir / rel_key
             dst.parent.mkdir(parents=True, exist_ok=True)
-            self._link_cached_file(src_path, dst)
+            mode, size = self._link_cached_file(src_path, dst)
+            with stats_lock:
+                stats["cache_hits" if was_hit else "cache_misses"] += 1
+                stats[mode] = int(stats.get(mode, 0)) + 1
+                stats["bytes"] = int(stats.get("bytes", 0)) + int(size)
 
         with ThreadPoolExecutor(max_workers=self.config.sdk_workers) as executor:
             futures = [executor.submit(stage_one, path) for path in manifest]
             for future in as_completed(futures):
                 future.result()
+        return stats
 
     def _maybe_prefetch_scene(self, adapter: Any, sequence_name: str) -> None:
         dataset_name = str(getattr(adapter, "dataset_name", "")).strip()
         if dataset_name not in self.config.scene_prefetch_datasets:
             return
-        if dataset_name == "blendedmvs":
-            self._prefetch_blendedmvs_scene(adapter, sequence_name)
+        # Non-blocking: check marker first, skip if already prefetched
+        marker_path = self._get_scene_marker_path(adapter, sequence_name)
+        if marker_path is not None and marker_path.is_file():
+            return
+        # Fire-and-forget background prefetch (don't block the builder)
+        threading.Thread(
+            target=self._do_scene_prefetch,
+            args=(adapter, dataset_name, sequence_name),
+            daemon=True,
+        ).start()
+
+    def _get_scene_marker_path(self, adapter: Any, sequence_name: str) -> Optional[Path]:
+        dataset_name = str(getattr(adapter, "dataset_name", "")).strip()
+        try:
+            if dataset_name == "blendedmvs":
+                record = adapter._get_record(sequence_name)
+                return self.cache_data_root / Path(self._to_cos_key(record.scene_dir)) / ".d4rt_scene_complete"
+            elif dataset_name == "co3dv2":
+                record = adapter._get_record(sequence_name)
+                return self.cache_data_root / Path(self._to_cos_key(adapter.root / record.category / record.sequence_name)) / ".d4rt_scene_complete"
+            elif dataset_name == "kubric":
+                record = adapter._get_record(sequence_name)
+                return self.cache_data_root / Path(self._to_cos_key(record.scene_dir)) / ".d4rt_scene_complete"
+            elif dataset_name == "dynamic_replica":
+                record = adapter._get_record(sequence_name)
+                return self.cache_data_root / Path(self._to_cos_key(adapter.split_root / record.image_rel_paths[0])).parent.parent / ".d4rt_scene_complete"
+            elif dataset_name == "scannetpp":
+                return self.cache_data_root / Path(self._to_cos_key(adapter.data_root / sequence_name)) / ".d4rt_scene_complete"
+        except Exception:
+            return None
+        return None
+
+    def _do_scene_prefetch(self, adapter: Any, dataset_name: str, sequence_name: str) -> None:
+        try:
+            if dataset_name == "blendedmvs":
+                self._prefetch_blendedmvs_scene(adapter, sequence_name)
+            elif dataset_name == "co3dv2":
+                self._prefetch_co3dv2_scene(adapter, sequence_name)
+            elif dataset_name == "kubric":
+                self._prefetch_kubric_scene(adapter, sequence_name)
+            elif dataset_name == "dynamic_replica":
+                self._prefetch_dynamic_replica_scene(adapter, sequence_name)
+            elif dataset_name == "scannetpp":
+                self._prefetch_scannetpp_scene(adapter, sequence_name)
+        except Exception as e:
+            print(f"[ScenePrefetch] {dataset_name}/{sequence_name} failed: {e}", flush=True)
 
     def _prefetch_blendedmvs_scene(self, adapter: Any, sequence_name: str) -> None:
         record = adapter._get_record(sequence_name)
@@ -586,12 +722,206 @@ class SampleLocalStager:
             paths.append(record.cam_path(frame_id))
         return self._dedupe_keep_order(paths)
 
-    def _link_cached_file(self, src_path: Path, dst: Path) -> None:
+    def _prefetch_co3dv2_scene(self, adapter: Any, sequence_name: str) -> None:
+        record = adapter._get_record(sequence_name)
+        scene_rel_key = Path(
+            self._to_cos_key(adapter.root / record.category / record.sequence_name)
+        )
+        marker_path = self.cache_data_root / scene_rel_key / ".d4rt_scene_complete"
+        if marker_path.is_file():
+            return
+
+        scene_paths = self._co3dv2_scene_paths(adapter, sequence_name)
+        lock_key = scene_rel_key / ".d4rt_scene_prefetch_lock"
+        with self._path_lock(lock_key):
+            if marker_path.is_file():
+                return
+
+            with ThreadPoolExecutor(max_workers=self.config.sdk_workers) as executor:
+                futures = [executor.submit(self._ensure_cached, path) for path in scene_paths]
+                for future in as_completed(futures):
+                    future.result()
+
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_marker = marker_path.with_name(
+                f".{marker_path.name}.part.{os.getpid()}.{threading.get_ident()}"
+            )
+            try:
+                tmp_marker.write_text(
+                    f"dataset=co3dv2\nsequence={sequence_name}\nfiles={len(scene_paths)}\n",
+                    encoding="utf-8",
+                )
+                os.replace(tmp_marker, marker_path)
+            finally:
+                tmp_marker.unlink(missing_ok=True)
+
+            self._maybe_evict_cache()
+
+    def _co3dv2_scene_paths(self, adapter: Any, sequence_name: str) -> list[Path]:
+        record = adapter._get_record(sequence_name)
+        paths: list[Path] = []
+        for fn in record.frame_numbers:
+            anno = adapter._get_frame_anno(record.category, record.sequence_name, fn)
+            paths.append(adapter.root / anno["image"]["path"])
+            paths.append(adapter.root / anno["depth"]["path"])
+            depth_mask_path = anno.get("depth", {}).get("mask_path")
+            if depth_mask_path:
+                paths.append(adapter.root / depth_mask_path)
+        return self._dedupe_keep_order(paths)
+
+    def _prefetch_kubric_scene(self, adapter: Any, sequence_name: str) -> None:
+        record = adapter._get_record(sequence_name)
+        scene_rel_key = Path(self._to_cos_key(record.scene_dir))
+        marker_path = self.cache_data_root / scene_rel_key / ".d4rt_scene_complete"
+        if marker_path.is_file():
+            return
+
+        scene_paths = self._kubric_scene_paths(adapter, sequence_name)
+        lock_key = scene_rel_key / ".d4rt_scene_prefetch_lock"
+        with self._path_lock(lock_key):
+            if marker_path.is_file():
+                return
+
+            with ThreadPoolExecutor(max_workers=self.config.sdk_workers) as executor:
+                futures = [executor.submit(self._ensure_cached, path) for path in scene_paths]
+                for future in as_completed(futures):
+                    future.result()
+
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_marker = marker_path.with_name(
+                f".{marker_path.name}.part.{os.getpid()}.{threading.get_ident()}"
+            )
+            try:
+                tmp_marker.write_text(
+                    f"dataset=kubric\nsequence={sequence_name}\nfiles={len(scene_paths)}\n",
+                    encoding="utf-8",
+                )
+                os.replace(tmp_marker, marker_path)
+            finally:
+                tmp_marker.unlink(missing_ok=True)
+
+            self._maybe_evict_cache()
+
+    def _kubric_scene_paths(self, adapter: Any, sequence_name: str) -> list[Path]:
+        record = adapter._get_record(sequence_name)
+        paths: list[Path] = [record.rank_path]
+        if record.h5_path is not None:
+            paths.append(record.h5_path)
+            if record.depth_names is not None or getattr(record, "has_depth_dir", False):
+                paths.extend(
+                    record.depth_dir / adapter._depth_name_for_index(record, i)
+                    for i in range(record.num_frames)
+                )
+        else:
+            paths.append(record.ann_path)
+        paths.extend(
+            record.frame_dir / adapter._frame_name_for_index(record, i)
+            for i in range(record.num_frames)
+        )
+        return self._dedupe_keep_order(paths)
+
+    def _prefetch_dynamic_replica_scene(self, adapter: Any, sequence_name: str) -> None:
+        record = adapter._get_record(sequence_name)
+        scene_rel_key = Path(
+            self._to_cos_key(adapter.split_root / record.image_rel_paths[0])
+        ).parent.parent
+        marker_path = self.cache_data_root / scene_rel_key / ".d4rt_scene_complete"
+        if marker_path.is_file():
+            return
+
+        scene_paths = self._dynamic_replica_scene_paths(adapter, sequence_name)
+        lock_key = scene_rel_key / ".d4rt_scene_prefetch_lock"
+        with self._path_lock(lock_key):
+            if marker_path.is_file():
+                return
+
+            with ThreadPoolExecutor(max_workers=self.config.sdk_workers) as executor:
+                futures = [executor.submit(self._ensure_cached, path) for path in scene_paths]
+                for future in as_completed(futures):
+                    future.result()
+
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_marker = marker_path.with_name(
+                f".{marker_path.name}.part.{os.getpid()}.{threading.get_ident()}"
+            )
+            try:
+                tmp_marker.write_text(
+                    f"dataset=dynamic_replica\nsequence={sequence_name}\nfiles={len(scene_paths)}\n",
+                    encoding="utf-8",
+                )
+                os.replace(tmp_marker, marker_path)
+            finally:
+                tmp_marker.unlink(missing_ok=True)
+
+            self._maybe_evict_cache()
+
+    def _dynamic_replica_scene_paths(self, adapter: Any, sequence_name: str) -> list[Path]:
+        record = adapter._get_record(sequence_name)
+        paths: list[Path] = []
+        for idx in range(record.num_frames):
+            paths.append(adapter.split_root / record.image_rel_paths[idx])
+            paths.append(adapter.split_root / record.depth_rel_paths[idx])
+            traj_rel = record.traj_rel_paths[idx]
+            if traj_rel is not None:
+                paths.append(adapter.split_root / traj_rel)
+        return self._dedupe_keep_order(paths)
+
+    def _prefetch_scannetpp_scene(self, adapter: Any, sequence_name: str) -> None:
+        scene_dir = adapter.data_root / sequence_name
+        scene_rel_key = Path(self._to_cos_key(scene_dir))
+        marker_path = self.cache_data_root / scene_rel_key / ".d4rt_scene_complete"
+        if marker_path.is_file():
+            return
+
+        scene_paths = self._scannetpp_scene_paths(adapter, sequence_name)
+        lock_key = scene_rel_key / ".d4rt_scene_prefetch_lock"
+        with self._path_lock(lock_key):
+            if marker_path.is_file():
+                return
+
+            with ThreadPoolExecutor(max_workers=self.config.sdk_workers) as executor:
+                futures = [executor.submit(self._ensure_cached, path) for path in scene_paths]
+                for future in as_completed(futures):
+                    future.result()
+
+            marker_path.parent.mkdir(parents=True, exist_ok=True)
+            tmp_marker = marker_path.with_name(
+                f".{marker_path.name}.part.{os.getpid()}.{threading.get_ident()}"
+            )
+            try:
+                tmp_marker.write_text(
+                    f"dataset=scannetpp\nsequence={sequence_name}\nfiles={len(scene_paths)}\n",
+                    encoding="utf-8",
+                )
+                os.replace(tmp_marker, marker_path)
+            finally:
+                tmp_marker.unlink(missing_ok=True)
+
+            self._maybe_evict_cache()
+
+    def _scannetpp_scene_paths(self, adapter: Any, sequence_name: str) -> list[Path]:
+        scene_dir = adapter.data_root / sequence_name
+        colmap_dir = scene_dir / "iphone" / "colmap"
+        frames_dir = scene_dir / "iphone" / "frames"
+        paths: list[Path] = [
+            colmap_dir / "cameras.txt",
+            colmap_dir / "images.txt",
+            scene_dir / "iphone" / "pose_intrinsic_imu.json",
+        ]
+        num_frames = adapter.get_num_frames(sequence_name)
+        paths += [frames_dir / f"{i:06d}.jpg" for i in range(num_frames)]
+        if getattr(adapter, "use_precomputed_tracks", False):
+            index_path = scene_dir / "precomputed.h5_chunk_index.pkl"
+            if index_path.exists():
+                paths.append(index_path)
+        return self._dedupe_keep_order(paths)
+
+    def _link_cached_file(self, src_path: Path, dst: Path) -> tuple[str, int]:
         for attempt in range(2):
             cache_path = self._ensure_cached(src_path)
             try:
                 os.link(cache_path, dst)
-                return
+                return "linked", cache_path.stat().st_size
             except FileNotFoundError:
                 if attempt == 0:
                     continue
@@ -600,12 +930,13 @@ class SampleLocalStager:
                 if exc.errno in {errno.EXDEV, errno.EPERM, errno.EACCES}:
                     try:
                         shutil.copy2(cache_path, dst)
-                        return
+                        return "copied", cache_path.stat().st_size
                     except FileNotFoundError:
                         if attempt == 0:
                             continue
                         raise
                 raise
+        raise FileNotFoundError(src_path)
 
     def _ensure_cached(self, src_path: Path) -> Path:
         src_path = Path(src_path)
@@ -713,6 +1044,12 @@ class SampleLocalStager:
             if path.name.startswith(".") or ".part." in path.name:
                 continue
             try:
+                rel_parts = path.relative_to(self.cache_data_root).parts
+            except ValueError:
+                continue
+            if any(part.startswith(".d4rt_") for part in rel_parts):
+                continue
+            try:
                 stat = path.stat()
             except OSError:
                 continue
@@ -743,14 +1080,51 @@ class SampleLocalStager:
             return
         if len(rel_parts) < 4:
             return
-        if rel_parts[0] != "hdu_datasets" or rel_parts[1] != "BlendedMVS":
-            return
         if cache_path.name == ".d4rt_scene_complete":
             return
-        marker_path = self.cache_data_root.joinpath(
-            rel_parts[0], rel_parts[1], rel_parts[2], ".d4rt_scene_complete"
-        )
-        marker_path.unlink(missing_ok=True)
+
+        # BlendedMVS: hdu_datasets/BlendedMVS/<scene>/...
+        if rel_parts[0] == "hdu_datasets" and rel_parts[1] == "BlendedMVS" and len(rel_parts) >= 3:
+            marker_path = self.cache_data_root.joinpath(
+                rel_parts[0], rel_parts[1], rel_parts[2], ".d4rt_scene_complete"
+            )
+            marker_path.unlink(missing_ok=True)
+            return
+
+        # Co3Dv2: hdu_datasets/Co3Dv2/<category>/<sequence>/...
+        if rel_parts[0] == "hdu_datasets" and rel_parts[1] == "Co3Dv2" and len(rel_parts) >= 4:
+            marker_path = self.cache_data_root.joinpath(
+                rel_parts[0], rel_parts[1], rel_parts[2], rel_parts[3],
+                ".d4rt_scene_complete",
+            )
+            marker_path.unlink(missing_ok=True)
+            return
+
+        # Kubric: hdu_datasets/Kubric/<scene_id>/...
+        if rel_parts[0] == "hdu_datasets" and rel_parts[1] == "Kubric" and len(rel_parts) >= 3:
+            marker_path = self.cache_data_root.joinpath(
+                rel_parts[0], rel_parts[1], rel_parts[2],
+                ".d4rt_scene_complete",
+            )
+            marker_path.unlink(missing_ok=True)
+            return
+
+        # DynamicReplica: hdu_datasets/Dynamic_Replica/<split>/<seq>/...
+        if rel_parts[0] == "hdu_datasets" and rel_parts[1] == "Dynamic_Replica" and len(rel_parts) >= 4:
+            marker_path = self.cache_data_root.joinpath(
+                rel_parts[0], rel_parts[1], rel_parts[2], rel_parts[3],
+                ".d4rt_scene_complete",
+            )
+            marker_path.unlink(missing_ok=True)
+            return
+
+        # ScanNet++: hdu_datasets/scannetpp/data/<scene>/...
+        if rel_parts[0] == "hdu_datasets" and rel_parts[1] == "scannetpp" and len(rel_parts) >= 4:
+            marker_path = self.cache_data_root.joinpath(
+                rel_parts[0], rel_parts[1], rel_parts[2], rel_parts[3],
+                ".d4rt_scene_complete",
+            )
+            marker_path.unlink(missing_ok=True)
 
     @contextlib.contextmanager
     def _rebase_adapter(

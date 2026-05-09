@@ -192,10 +192,19 @@ class SampleSpool:
         building_path = self._get_building_path(index, generation)
         ready_path = self._get_ready_path(index, generation)
 
-        with open(building_path, "wb") as f:
-            pickle.dump(sample, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-        os.replace(building_path, ready_path)
+        data = pickle.dumps(sample, protocol=pickle.HIGHEST_PROTOCOL)
+        for _attempt in range(2):
+            with open(building_path, "wb") as f:
+                f.write(data)
+            try:
+                os.replace(building_path, ready_path)
+                return
+            except FileNotFoundError:
+                # Rare race: file vanished between write and rename (e.g. NFS).
+                # Re-write and retry once.
+                if _attempt == 0:
+                    continue
+                raise
 
     def write_error(
         self, index: int, exception: Exception, generation: int

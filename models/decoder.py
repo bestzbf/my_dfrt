@@ -4,15 +4,13 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from typing import Optional
-from torch.nn.attention import SDPBackend, sdpa_kernel
 
-from utils.patches import extract_local_patches_with_valid_hw
+from utils.patches import (
+    extract_local_patches_from_frame_list,
+    extract_local_patches_with_valid_hw,
+)
 from .embeddings import FourierEmbedding, TimestepEmbedding, PatchEmbeddingFast
-
-def _is_blackwell():
-    if not torch.cuda.is_available():
-        return False
-    return torch.cuda.get_device_capability()[0] >= 10
+from .sdpa_backends import sdpa_kernel_context
 
 
 CANONICAL_QUERY_SPACE_CROP_NORMALIZED = 0
@@ -80,16 +78,9 @@ class CrossAttention(nn.Module):
         k = self.k_proj(key).reshape(B, N_kv, self.num_heads, self.head_dim).transpose(1, 2)
         v = self.v_proj(value).reshape(B, N_kv, self.num_heads, self.head_dim).transpose(1, 2)
 
-        # Use PyTorch's efficient attention (FlashAttention when available)
-        # On Blackwell (sm_103+) cuDNN frontend fails; fall back to math backend
-        if _is_blackwell():
-            with sdpa_kernel(SDPBackend.MATH):
-                x = F.scaled_dot_product_attention(
-                    q, k, v,
-                    attn_mask=mask,
-                    dropout_p=self.attn_drop if self.training else 0.0
-                )
-        else:
+        # Use PyTorch's efficient attention. On Blackwell, avoid cuDNN SDPA
+        # execution-plan failures while keeping FlashAttention enabled.
+        with sdpa_kernel_context(q):
             x = F.scaled_dot_product_attention(
                 q, k, v,
                 attn_mask=mask,
@@ -349,7 +340,7 @@ class D4RTDecoder(nn.Module):
 
     def _embed_query_patches(
         self,
-        frames: torch.Tensor,
+        frames: torch.Tensor | list[torch.Tensor],
         coords: torch.Tensor,
         t_src: torch.Tensor,
         local_patches: torch.Tensor | None,
@@ -363,24 +354,36 @@ class D4RTDecoder(nn.Module):
                 raise ValueError(f"patch_provider='{provider}' requires local_patches in the batch")
             return self.patch_embed(frames, coords, t_src, local_patches=local_patches)
         if provider == "sampled_resized":
+            if isinstance(frames, list):
+                raise ValueError("patch_provider='sampled_resized' requires batched tensor frames")
             return self.patch_embed(frames, coords, t_src, local_patches=None)
         if provider == "sampled_highres":
             if transform_metadata is None:
                 raise ValueError("patch_provider='sampled_highres' requires transform_metadata in the batch")
-            crop_size_hw = transform_metadata["crop_size_hw"].to(device=frames.device)
-            patches = extract_local_patches_with_valid_hw(
-                frames_btchw=frames,
-                coords=coords,
-                t_src=t_src,
-                patch_size=self.patch_embed.patch_size,
-                valid_hw=crop_size_hw,
-            )
+            if isinstance(frames, list):
+                crop_size_hw = transform_metadata["crop_size_hw"].to(device=coords.device)
+                patches = extract_local_patches_from_frame_list(
+                    frames_btchw=frames,
+                    coords=coords,
+                    t_src=t_src,
+                    patch_size=self.patch_embed.patch_size,
+                    valid_hw=crop_size_hw,
+                )
+            else:
+                crop_size_hw = transform_metadata["crop_size_hw"].to(device=frames.device)
+                patches = extract_local_patches_with_valid_hw(
+                    frames_btchw=frames,
+                    coords=coords,
+                    t_src=t_src,
+                    patch_size=self.patch_embed.patch_size,
+                    valid_hw=crop_size_hw,
+                )
             return self.patch_embed.embed_patches(patches)
         raise ValueError(f"Unhandled patch provider: {provider}")
 
     def build_query(
         self,
-        frames: torch.Tensor,
+        frames: torch.Tensor | list[torch.Tensor],
         coords: torch.Tensor,
         t_src: torch.Tensor,
         t_tgt: torch.Tensor,
@@ -417,7 +420,12 @@ class D4RTDecoder(nn.Module):
 
         # Local RGB patch embedding
         # Reshape frames for patch extraction: (B, T, C, H, W)
-        if frames.dim() == 5 and frames.shape[-1] == 3:
+        if isinstance(frames, list):
+            if len(frames) != B:
+                raise ValueError(
+                    f"Expected frame list length to match batch size {B}, got {len(frames)}"
+                )
+        elif frames.dim() == 5 and frames.shape[-1] == 3:
             frames = frames.permute(0, 1, 4, 2, 3)  # (B, T, H, W, C) -> (B, T, C, H, W)
 
         if self.disable_query_patch_embedding:
@@ -485,7 +493,7 @@ class D4RTDecoder(nn.Module):
     def forward(
         self,
         encoder_features: torch.Tensor,
-        frames: torch.Tensor,
+        frames: torch.Tensor | list[torch.Tensor],
         coords: torch.Tensor,
         t_src: torch.Tensor,
         t_tgt: torch.Tensor,
@@ -527,7 +535,7 @@ class D4RTDecoder(nn.Module):
     def decode_3d_position(
         self,
         encoder_features: torch.Tensor,
-        frames: torch.Tensor,
+        frames: torch.Tensor | list[torch.Tensor],
         coords: torch.Tensor,
         t_src: torch.Tensor,
         t_tgt: torch.Tensor,

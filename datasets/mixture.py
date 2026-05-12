@@ -182,6 +182,7 @@ class MixtureDataset:
         num_queries: int = 2048,
         boundary_ratio: float = 0.3,
         t_tgt_eq_t_cam_ratio: float = 0.4,
+        use_motion_boundaries: bool = True,
         seed: int = 42,
         allowed_sequences_per_adapter: Optional[list[Optional[list[str]]]] = None,
         sampling_mode: str = 'stride',
@@ -189,7 +190,14 @@ class MixtureDataset:
         custom_stride_range: Optional[tuple[int, int]] = None,
         precompute_patches: bool = True,
         precompute_from_highres: bool = False,
+        return_highres_video: Optional[bool] = None,
         allow_track_fallback: bool = False,
+        store_video_uint8: bool = False,
+        store_auxiliary_tensors: bool = True,
+        keep_cropped_images: bool = True,
+        color_aug_after_resize: bool = False,
+        motion_boundary_on_resized: bool = True,
+        max_track_points: Optional[int] = None,
         reshuffle_each_epoch: bool = False,
         dataset_locality_size: Optional[int] = None,
         sequence_locality_size: Optional[int] = None,
@@ -252,6 +260,9 @@ class MixtureDataset:
         self.transform = GeometryTransformPipeline(
             img_size=img_size,
             use_augs=use_augs,
+            keep_cropped_images=keep_cropped_images,
+            color_aug_after_resize=color_aug_after_resize,
+            max_track_points=max_track_points,
         )
 
         # Build query builder
@@ -259,9 +270,14 @@ class MixtureDataset:
             num_queries=num_queries,
             boundary_ratio=boundary_ratio,
             t_tgt_eq_t_cam_ratio=t_tgt_eq_t_cam_ratio,
+            use_motion_boundaries=use_motion_boundaries,
             precompute_patches=precompute_patches,
             precompute_from_highres=precompute_from_highres,
+            return_highres_video=return_highres_video,
             allow_track_fallback=allow_track_fallback,
+            store_video_uint8=store_video_uint8,
+            store_auxiliary_tensors=store_auxiliary_tensors,
+            motion_boundary_on_resized=motion_boundary_on_resized,
         )
 
     @property

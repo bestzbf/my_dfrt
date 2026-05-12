@@ -39,7 +39,7 @@ def h5_read_frame_slice(
     result: dict = {}
     for key in (keys if keys is not None else h5file.keys()):
         ds = h5file[key]
-        if ds.ndim >= 1 and ds.shape[0] > 1:
+        if ds.ndim >= 2 and ds.shape[0] > 1:
             # Guard against frame_indices that exceed this dataset's length.
             clipped = [i for i in sorted_idx if i < ds.shape[0]]
             data = ds[clipped]              # reads only the needed chunks
@@ -88,7 +88,7 @@ def load_precomputed_fast(
             if k in _skip:
                 continue
             arr = raw[k]
-            if arr.ndim >= 1 and arr.shape[0] > 1 and k not in ('origin_shift',):
+            if arr.ndim >= 2 and arr.shape[0] > 1 and k not in ('origin_shift',):
                 result[k] = arr[np.array(frame_indices)]
             else:
                 result[k] = arr[()]

@@ -29,18 +29,52 @@ def compute_depth_normalizers(
                 f"Expected groups to match points batch/query shape, got {tuple(groups.shape)} "
                 f"for points {tuple(points.shape)}"
             )
-        mean_depth_safe = torch.ones_like(z_coords)
-        for batch_idx in range(z_coords.shape[0]):
-            valid_queries = valid_mask[batch_idx]
-            if not valid_queries.any():
+        B, N = z_coords.shape
+        out = torch.ones_like(z_coords)
+        # Per-batch vectorized median; B is small, each iteration stays GPU-vectorized.
+        for batch_idx in range(B):
+            z_b = z_coords[batch_idx]
+            g_b = groups[batch_idx]
+            v_b = valid_mask[batch_idx]
+
+            valid_z = z_b[v_b]
+            valid_g = g_b[v_b]
+
+            if valid_z.numel() == 0:
                 continue
-            for group_id in torch.unique(groups[batch_idx, valid_queries]):
-                group_mask = valid_queries & (groups[batch_idx] == group_id)
-                group_z = z_coords[batch_idx, group_mask]
-                group_median = group_z.median()
-                group_median = torch.nan_to_num(group_median, nan=1.0, posinf=1.0, neginf=1.0)
-                mean_depth_safe[batch_idx, group_mask] = torch.clamp(torch.abs(group_median), min=eps)
-        return mean_depth_safe, valid_mask
+
+            num_groups = int(g_b.max().item()) + 1
+
+            group_order = valid_g.argsort()
+            sorted_z = valid_z[group_order]
+            sorted_g = valid_g[group_order]
+
+            group_sizes = torch.bincount(valid_g, minlength=num_groups)
+            group_starts = torch.cumsum(group_sizes, 0) - group_sizes
+
+            z_min, z_max = sorted_z.min(), sorted_z.max()
+            z_range = z_max - z_min
+            if z_range > 0:
+                z_norm = (sorted_z - z_min) / z_range
+            else:
+                z_norm = torch.zeros_like(sorted_z)
+            key = sorted_g.to(torch.double) * 2.0 + z_norm.to(torch.double)
+            segment_order = key.argsort()
+            segment_z = sorted_z[segment_order]
+
+            # Lower median matches torch.Tensor.median() for even-sized groups.
+            median_pos = group_starts + (group_sizes - 1) // 2
+            median_pos = median_pos.clamp(max=len(segment_z) - 1)
+            median_vals = segment_z[median_pos]
+
+            empty = group_sizes == 0
+            median_vals = median_vals.masked_fill(empty, 1.0)
+            median_vals = torch.nan_to_num(median_vals, nan=1.0, posinf=1.0, neginf=1.0)
+            median_vals = torch.clamp(torch.abs(median_vals), min=eps)
+
+            out[batch_idx, v_b] = median_vals[valid_g]
+
+        return out, valid_mask
 
     if mask is not None:
         # median over valid points only

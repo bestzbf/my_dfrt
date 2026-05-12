@@ -264,9 +264,24 @@ class GeometryTransformPipeline:
                     If False, keep the full frame and only resize to square.
     """
 
-    def __init__(self, img_size: int = 256, use_augs: bool = True) -> None:
+    def __init__(
+        self,
+        img_size: int = 256,
+        use_augs: bool = True,
+        *,
+        keep_cropped_images: bool = True,
+        color_aug_after_resize: bool = False,
+        max_track_points: Optional[int] = None,
+    ) -> None:
         self.img_size = img_size
         self.use_augs = use_augs
+        self.keep_cropped_images = bool(keep_cropped_images)
+        self.color_aug_after_resize = bool(color_aug_after_resize)
+        if max_track_points is None:
+            self.max_track_points = None
+        else:
+            value = int(max_track_points)
+            self.max_track_points = value if value > 0 else None
 
     def __call__(
         self,
@@ -277,6 +292,31 @@ class GeometryTransformPipeline:
             rng = _random_module.Random()
 
         h, w = clip.image_size
+        clip_trajs_2d = clip.trajs_2d
+        clip_trajs_3d_world = clip.trajs_3d_world
+        clip_valids = clip.valids
+        clip_visibs = clip.visibs
+        if (
+            self.max_track_points is not None
+            and clip_trajs_2d is not None
+            and clip_trajs_2d.shape[1] > self.max_track_points
+        ):
+            seed = rng.randint(0, 2**32 - 1)
+            np_rng = np.random.default_rng(seed)
+            keep_idx = np.sort(
+                np_rng.choice(
+                    clip_trajs_2d.shape[1],
+                    size=self.max_track_points,
+                    replace=False,
+                ).astype(np.int64)
+            )
+            clip_trajs_2d = clip_trajs_2d[:, keep_idx]
+            if clip_trajs_3d_world is not None:
+                clip_trajs_3d_world = clip_trajs_3d_world[:, keep_idx]
+            if clip_valids is not None:
+                clip_valids = clip_valids[:, keep_idx]
+            if clip_visibs is not None:
+                clip_visibs = clip_visibs[:, keep_idx]
 
         # ------------------------------------------------------------------ #
         # 1. Spatial crop                                                      #
@@ -292,10 +332,20 @@ class GeometryTransformPipeline:
         # ------------------------------------------------------------------ #
         # 2. Crop images / depth / normals                                     #
         # ------------------------------------------------------------------ #
-        cropped_images = [
-            _to_float01_image(img[y0:y0 + ch, x0:x0 + cw])
-            for img in clip.images
-        ]
+        # High-res RGB crops are only needed for high-res patch providers, or
+        # when colour augmentation must run before resize.  In resized-patch
+        # mode with post-resize colour aug, resize the uint8 crop first and
+        # avoid materialising 48 float32 high-res frames.
+        need_float_crops = self.keep_cropped_images or (
+            self.use_augs and not self.color_aug_after_resize
+        )
+        if need_float_crops:
+            cropped_images = [
+                _to_float01_image(img[y0:y0 + ch, x0:x0 + cw])
+                for img in clip.images
+            ]
+        else:
+            cropped_images = []
 
         cropped_depths: Optional[list[np.ndarray]] = None
         if clip.depths is not None:
@@ -308,14 +358,22 @@ class GeometryTransformPipeline:
         # ------------------------------------------------------------------ #
         # 3. Colour augmentation (RGB only, no depth/normal aug)              #
         # ------------------------------------------------------------------ #
-        if self.use_augs:
+        if self.use_augs and not self.color_aug_after_resize:
             cropped_images = _apply_color_aug(cropped_images, rng)
 
         # ------------------------------------------------------------------ #
         # 4. Resize to img_size × img_size                                    #
         # ------------------------------------------------------------------ #
         S = self.img_size
-        resized_images = [_resize_image(img, S, S) for img in cropped_images]
+        if cropped_images:
+            resized_images = [_resize_image(img, S, S) for img in cropped_images]
+        else:
+            resized_images = [
+                _to_float01_image(_resize_image(img[y0:y0 + ch, x0:x0 + cw], S, S))
+                for img in clip.images
+            ]
+        if self.use_augs and self.color_aug_after_resize:
+            resized_images = _apply_color_aug(resized_images, rng)
 
         resized_depths: Optional[list[np.ndarray]] = None
         if cropped_depths is not None:
@@ -344,23 +402,23 @@ class GeometryTransformPipeline:
         valids_new:    Optional[np.ndarray] = None
         visibs_new:    Optional[np.ndarray] = None
 
-        if clip.trajs_2d is not None:
-            trajs_2d_crop = _crop_trajs_2d(clip.trajs_2d, x0=float(x0), y0=float(y0))
+        if clip_trajs_2d is not None:
+            trajs_2d_crop = _crop_trajs_2d(clip_trajs_2d, x0=float(x0), y0=float(y0))
             inbounds = _compute_inbounds_mask(trajs_2d_crop, crop_w=cw, crop_h=ch)
 
-            if clip.valids is not None:
-                valids_new = clip.valids & inbounds
-            if clip.visibs is not None:
-                visibs_new = clip.visibs & inbounds
+            if clip_valids is not None:
+                valids_new = clip_valids & inbounds
+            if clip_visibs is not None:
+                visibs_new = clip_visibs & inbounds
 
         return TransformResult(
             images=resized_images,
-            cropped_images=cropped_images,
+            cropped_images=cropped_images if self.keep_cropped_images else [],
             depths=resized_depths,
             normals=resized_normals,
             normal_valids=normal_valids,
             trajs_2d=trajs_2d_crop,
-            trajs_3d_world=clip.trajs_3d_world,   # world coords are view-independent
+            trajs_3d_world=clip_trajs_3d_world,   # world coords are view-independent
             valids=valids_new,
             visibs=visibs_new,
             intrinsics=K_resize,

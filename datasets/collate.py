@@ -20,9 +20,17 @@ Usage:
 
 from __future__ import annotations
 
+import os
 from typing import Any
 
 import torch
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def d4rt_collate_fn(batch: list[Any]) -> dict[str, Any]:
@@ -38,8 +46,15 @@ def d4rt_collate_fn(batch: list[Any]) -> dict[str, Any]:
     if len(batch) == 0:
         raise ValueError("Cannot collate empty batch")
 
-    # Stack video tensors [B, S, 3, H, W]
-    videos = torch.stack([s.video for s in batch], dim=0)
+    defer_large_stack = _env_flag("D4RT_DEFER_LARGE_COLLATE_STACK", False)
+
+    # Stack video tensors [B, S, 3, H, W].  In planned mode this copy dominates
+    # CPU collate for bs=40, so allow training to defer large tensor stacking to
+    # move_batch_to_device where the tensors are already going to CUDA.
+    if defer_large_stack:
+        videos = [s.video for s in batch]
+    else:
+        videos = torch.stack([s.video for s in batch], dim=0)
 
     # Stack query data [B, Q, ...]
     coords = torch.stack([s.coords for s in batch], dim=0)
@@ -61,7 +76,10 @@ def d4rt_collate_fn(batch: list[Any]) -> dict[str, Any]:
 
     # Stack local patches [B, Q, 3, P, P] (may be None if precompute_patches=False)
     if batch[0].local_patches is not None:
-        local_patches = torch.stack([s.local_patches for s in batch], dim=0)
+        if defer_large_stack:
+            local_patches = [s.local_patches for s in batch]
+        else:
+            local_patches = torch.stack([s.local_patches for s in batch], dim=0)
     else:
         local_patches = None
 

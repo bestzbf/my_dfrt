@@ -240,6 +240,7 @@ class BlendedMVSAdapter(BaseAdapter):
         io_workers: int = 1,
         depth_cache_dir: Optional[str] = None,
         load_precomputed: bool = True,
+        load_normals: bool = True,
     ) -> None:
         """
         Parameters
@@ -274,6 +275,7 @@ class BlendedMVSAdapter(BaseAdapter):
         self.index_workers = index_workers
         self.io_workers = max(1, int(io_workers))
         self.load_precomputed = bool(load_precomputed)
+        self.load_normals = bool(load_normals)
         resolved_depth_cache_dir = depth_cache_dir or os.getenv(
             "D4RT_BLENDEDMVS_DEPTH_CACHE_DIR", ""
         )
@@ -422,7 +424,8 @@ class BlendedMVSAdapter(BaseAdapter):
         if self.precompute_root is not None:
             cache = self._load_precomputed(sequence_name, frame_indices)
             if cache is not None:
-                normals_out     = [n.astype(np.float32) for n in cache["normals"]]
+                if self.load_normals and "normals" in cache:
+                    normals_out = [n.astype(np.float32) for n in cache["normals"]]
                 trajs_2d_out    = cache["trajs_2d"]
                 trajs_3d_out    = cache["trajs_3d_world"]
                 valids_out      = cache["valids"]
@@ -447,7 +450,7 @@ class BlendedMVSAdapter(BaseAdapter):
                     active_track_semantics_version = TRACK_SEMANTICS_VERSION
                     precomputed_track_semantics_refreshed = True
 
-                has_normals_out = True
+                has_normals_out = normals_out is not None
                 has_tracks_out  = True
 
         return UnifiedClip(
@@ -505,7 +508,8 @@ class BlendedMVSAdapter(BaseAdapter):
             n = int(np.load(path, allow_pickle=False)["num_frames"])
         if n < max(frame_indices) + 1:
             return None
-        return load_precomputed_fast(path, frame_indices)
+        skip_keys = set() if self.load_normals else {"normals"}
+        return load_precomputed_fast(path, frame_indices, skip_keys=skip_keys)
 
     def sanity_check(self, sequence_name: str) -> dict[str, Any]:
         """Run consistency checks on a sequence.

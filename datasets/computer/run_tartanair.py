@@ -15,6 +15,11 @@ Usage:
         [--output-root /data2/d4rt/datasets/TartanAir] \\
         [--camera left] \\
         [--num-points 8000] \\
+        [--num-ref-segments 20] \\
+        [--track-depth-max 200] \\
+        [--track-depth-sampling log_balanced] \\
+        [--track-depth-bin-edges 0,5,10,20,40,80,200] \\
+        [--track-depth-bin-weights 6,6,4,2,1,1] \\
         [--workers 4] \\
         [--overwrite]
 """
@@ -32,6 +37,15 @@ from computer._run_common import run_precompute
 from adapters.TartanAir import TartanAirAdapter
 
 
+def _parse_float_list(raw: str | None) -> list[float] | None:
+    if raw is None:
+        return None
+    raw = raw.strip()
+    if raw == "" or raw.lower() in {"none", "auto"}:
+        return None
+    return [float(part.strip()) for part in raw.split(",") if part.strip()]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="Precompute TartanAir normals + pseudo-static tracks from depth+pose"
@@ -46,6 +60,21 @@ def main() -> None:
                         help="Number of track points to sample per sequence (default: 8000)")
     parser.add_argument("--workers", type=int, default=4,
                         help="Number of parallel worker processes (default: 4)")
+    parser.add_argument("--num-ref-segments", type=int, default=20,
+                        help="How many temporal segments to split each sequence into when sampling track reference frames (default: 20)")
+    parser.add_argument("--ref-frame-strategy", default="max_valid", choices=["first", "max_valid", "middle"],
+                        help="How to choose a reference frame inside each temporal segment")
+    parser.add_argument("--track-depth-max", type=float, default=200.0,
+                        help="Maximum metric depth used when sampling/projecting precomputed tracks (default: 200 for TartanAir)")
+    parser.add_argument("--track-depth-sampling", default="log_balanced",
+                        choices=["uniform", "log_balanced", "linear_balanced"],
+                        help="How to sample source pixels in each reference frame (default: log_balanced)")
+    parser.add_argument("--track-depth-bin-edges", default="0,5,10,20,40,80,200",
+                        help="Comma-separated metric depth bin edges for balanced source sampling; use 'none' for dynamic bins")
+    parser.add_argument("--track-depth-bin-weights", default="6,6,4,2,1,1",
+                        help="Comma-separated per-bin weights; length must be len(edges)-1")
+    parser.add_argument("--track-depth-num-bins", type=int, default=7,
+                        help="Number of dynamic depth bins when --track-depth-bin-edges=none")
     parser.add_argument("--overwrite", action="store_true",
                         help="Re-compute even if precomputed.npz already exists")
     args = parser.parse_args()
@@ -59,6 +88,15 @@ def main() -> None:
         num_points=args.num_points,
         workers=args.workers,
         overwrite=args.overwrite,
+        track_kwargs={
+            "num_ref_segments": args.num_ref_segments,
+            "ref_frame_strategy": args.ref_frame_strategy,
+            "depth_max": args.track_depth_max,
+            "source_depth_sampling": args.track_depth_sampling,
+            "source_depth_bin_edges": _parse_float_list(args.track_depth_bin_edges),
+            "source_depth_bin_weights": _parse_float_list(args.track_depth_bin_weights),
+            "source_depth_num_bins": args.track_depth_num_bins,
+        },
     )
 
 

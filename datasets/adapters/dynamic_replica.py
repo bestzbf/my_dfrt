@@ -4,8 +4,10 @@ import gzip
 import hashlib
 import json
 import os
+import threading
+import time
 from dataclasses import dataclass
-from functools import lru_cache
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Optional
 
@@ -13,6 +15,29 @@ import numpy as np
 from PIL import Image
 
 from .base import BaseAdapter, UnifiedClip
+
+try:
+    import cv2
+except Exception:  # pragma: no cover - optional fast path
+    cv2 = None
+
+try:
+    _TRAJECTORY_CACHE_SIZE = max(
+        1, int(os.getenv("D4RT_DYNAMIC_REPLICA_TRAJ_CACHE_SIZE", "64"))
+    )
+except ValueError:
+    _TRAJECTORY_CACHE_SIZE = 64
+
+try:
+    _DEFAULT_RGB_CACHE_SIZE = max(
+        0, int(os.getenv("D4RT_DYNAMIC_REPLICA_RGB_CACHE_SIZE", "96"))
+    )
+except ValueError:
+    _DEFAULT_RGB_CACHE_SIZE = 96
+
+_TRAJECTORY_CACHE_LOCK = threading.Lock()
+_TrajectoryCacheValue = tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.ndarray]]
+_TRAJECTORY_CACHE: "OrderedDict[tuple[int, int, int, int], _TrajectoryCacheValue]" = OrderedDict()
 
 
 # ---------------------------------------------------------------------------
@@ -96,11 +121,40 @@ def _load_jgz(path: Path) -> Any:
 
 
 def _load_rgb(path: Path) -> np.ndarray:
+    if cv2 is not None:
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is not None:
+            return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     return np.asarray(Image.open(path).convert("RGB"))
+
+
+def _coerce_rgb_array(value: Any) -> np.ndarray:
+    """Convert a trajectory-embedded image tensor/array to HWC uint8 RGB."""
+    if hasattr(value, "detach"):
+        value = value.detach().cpu().numpy()
+    arr = np.asarray(value)
+    if arr.ndim != 3:
+        raise ValueError(f"trajectory img must be rank-3, got shape={arr.shape}")
+    if arr.shape[-1] not in {3, 4} and arr.shape[0] in {3, 4}:
+        arr = np.transpose(arr, (1, 2, 0))
+    if arr.shape[-1] == 4:
+        arr = arr[..., :3]
+    if arr.shape[-1] != 3:
+        raise ValueError(f"trajectory img must have 3 RGB channels, got shape={arr.shape}")
+    if arr.dtype != np.uint8:
+        arr_f = arr.astype(np.float32, copy=False)
+        if arr_f.size and float(np.nanmax(arr_f)) <= 1.0:
+            arr_f = arr_f * 255.0
+        arr = np.rint(np.clip(arr_f, 0.0, 255.0)).astype(np.uint8)
+    return np.ascontiguousarray(arr)
 
 
 def _load_depth_raw(path: Path) -> np.ndarray:
     """Load a raw Dynamic_Replica depth PNG as float32."""
+    if cv2 is not None:
+        raw = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if raw is not None:
+            return np.asarray(raw, dtype=np.float32)
     return np.array(Image.open(path), dtype=np.float32)
 
 
@@ -252,9 +306,10 @@ def _load_trajectory_pth(path: Path) -> dict[str, np.ndarray]:
         traj_3d_world : (N, 3) float32  – 3D world positions at this frame
         traj_2d       : (N, 3) float32  – 2D pixel positions (cols 0–1 are u,v)
         verts_inds_vis: (N,)   bool     – per-vertex visibility flag
+        img           : (H, W, 3) uint8 – RGB frame duplicated in the .pth
 
     Returns:
-        dict with keys "traj_3d_world", "traj_2d", "verts_inds_vis".
+        dict with keys "traj_3d_world", "traj_2d", "verts_inds_vis", "img".
 
     Raises:
         ImportError  if PyTorch is not installed.
@@ -277,18 +332,104 @@ def _load_trajectory_pth(path: Path) -> dict[str, np.ndarray]:
         "traj_3d_world": data["traj_3d_world"].numpy().astype(np.float32),  # (N, 3)
         "traj_2d": data["traj_2d"].numpy().astype(np.float32),              # (N, 3)
         "verts_inds_vis": data["verts_inds_vis"].numpy().astype(bool),      # (N,)
+        "img": _coerce_rgb_array(data["img"]),
     }
 
 
-@lru_cache(maxsize=128)
-def _load_trajectory_pth_cached(path_str: str) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Process-local cache for per-frame trajectory files."""
-    data = _load_trajectory_pth(Path(path_str))
-    return (
+def _trajectory_npz_path(path: Path) -> Path:
+    return path.with_suffix(".npz")
+
+
+def _load_trajectory_npz(path: Path) -> dict[str, np.ndarray]:
+    if not path.exists():
+        raise FileNotFoundError(f"Trajectory npz file not found: {path}")
+    with np.load(path, allow_pickle=False) as data:
+        return {
+            "traj_3d_world": data["traj_3d_world"].astype(np.float32),
+            "traj_2d": data["traj_2d"].astype(np.float32),
+            "verts_inds_vis": data["verts_inds_vis"].astype(bool),
+        }
+
+
+def _trajectory_cache_key(path: Path) -> tuple[int, int, int, int]:
+    stat = path.stat()
+    return (int(stat.st_dev), int(stat.st_ino), int(stat.st_mtime_ns), int(stat.st_size))
+
+
+def _load_trajectory_pth_cached(
+    path_str: str,
+) -> _TrajectoryCacheValue:
+    """Process-local cache for per-frame trajectory files.
+
+    The planned sample builder stages trajectory files through per-sample
+    temporary hardlinks, so caching by path string misses almost every time.
+    Use inode-level identity instead so repeated windows can reuse a decoded
+    trajectory even when the staged path changes.
+    """
+    path = Path(path_str)
+    cache_key = _trajectory_cache_key(path)
+    with _TRAJECTORY_CACHE_LOCK:
+        cached = _TRAJECTORY_CACHE.get(cache_key)
+        if cached is not None:
+            _TRAJECTORY_CACHE.move_to_end(cache_key)
+            return cached
+
+    data = _load_trajectory_pth(path)
+    value = (
         data["traj_3d_world"],
         data["traj_2d"],
         data["verts_inds_vis"],
+        data["img"],
     )
+    with _TRAJECTORY_CACHE_LOCK:
+        existing = _TRAJECTORY_CACHE.get(cache_key)
+        if existing is not None:
+            _TRAJECTORY_CACHE.move_to_end(cache_key)
+            return existing
+        _TRAJECTORY_CACHE[cache_key] = value
+        _TRAJECTORY_CACHE.move_to_end(cache_key)
+        while len(_TRAJECTORY_CACHE) > _TRAJECTORY_CACHE_SIZE:
+            _TRAJECTORY_CACHE.popitem(last=False)
+    return value
+
+
+def _load_trajectory_cached(
+    path_str: str,
+    *,
+    prefer_npz: bool,
+) -> _TrajectoryCacheValue:
+    path = Path(path_str)
+    if prefer_npz:
+        npz_path = _trajectory_npz_path(path)
+        try:
+            cache_key = _trajectory_cache_key(npz_path)
+            with _TRAJECTORY_CACHE_LOCK:
+                cached = _TRAJECTORY_CACHE.get(cache_key)
+                if cached is not None:
+                    _TRAJECTORY_CACHE.move_to_end(cache_key)
+                    return cached
+
+            data = _load_trajectory_npz(npz_path)
+            value: _TrajectoryCacheValue = (
+                data["traj_3d_world"],
+                data["traj_2d"],
+                data["verts_inds_vis"],
+                None,
+            )
+            with _TRAJECTORY_CACHE_LOCK:
+                existing = _TRAJECTORY_CACHE.get(cache_key)
+                if existing is not None:
+                    _TRAJECTORY_CACHE.move_to_end(cache_key)
+                    return existing
+                _TRAJECTORY_CACHE[cache_key] = value
+                _TRAJECTORY_CACHE.move_to_end(cache_key)
+                while len(_TRAJECTORY_CACHE) > _TRAJECTORY_CACHE_SIZE:
+                    _TRAJECTORY_CACHE.popitem(last=False)
+            return value
+        except FileNotFoundError:
+            pass
+
+    return _load_trajectory_pth_cached(path_str)
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +532,10 @@ class DynamicReplicaAdapter(BaseAdapter):
         verbose: bool = True,
         cache_dir: Optional[str] = None,
         index_workers: int = 8,
+        rgb_from_trajectory: bool = True,
+        skip_depth_when_tracks: bool = False,
+        prefer_trajectory_npz: Optional[bool] = None,
+        io_workers: Optional[int] = None,
     ) -> None:
         """
         Parameters
@@ -415,6 +560,23 @@ class DynamicReplicaAdapter(BaseAdapter):
             fully parsed per-sequence metadata index and per-sequence depth
             calibration on local disk, which avoids repeated remote reads of
             ``frame_annotations_<split>.jgz`` on COS-backed mounts.
+        rgb_from_trajectory :
+            If True, left-camera frames with trajectory ``.pth`` files use the
+            embedded ``img`` tensor instead of reading the duplicate image PNG.
+        skip_depth_when_tracks :
+            If True, left-camera clips with trajectory supervision do not load
+            depth PNG files. The track path can train from trajectory 2D/3D
+            labels directly; skipping depth removes 48 extra COS objects per
+            48-frame sample at the cost of disabling DynamicReplica depth-edge
+            sampling and depth-map consistency filtering.
+        prefer_trajectory_npz :
+            Prefer same-name ``.npz`` trajectory files when available.  These
+            contain the same trajectory arrays without the duplicated RGB image,
+            so RGB is loaded from the image PNG and COS traffic is much smaller
+            than the legacy ``.pth`` path.
+        io_workers :
+            Number of per-sample threads used to read RGB/trajectory frames.
+            Keep this small when many builder processes run in parallel.
         """
         self.root = Path(root)
         if not self.root.exists():
@@ -433,9 +595,26 @@ class DynamicReplicaAdapter(BaseAdapter):
         self.strict = strict
         self.verbose = verbose
         self.index_workers = index_workers
+        self.rgb_from_trajectory = bool(rgb_from_trajectory)
+        self.skip_depth_when_tracks = bool(skip_depth_when_tracks)
+        if io_workers is None:
+            raw_io_workers = os.getenv("D4RT_DYNAMIC_REPLICA_IO_WORKERS", "1")
+            try:
+                io_workers = int(raw_io_workers)
+            except ValueError:
+                io_workers = 1
+        self.io_workers = max(1, int(io_workers))
+        if prefer_trajectory_npz is None:
+            prefer_trajectory_npz = os.getenv(
+                "D4RT_DYNAMIC_REPLICA_PREFER_TRAJ_NPZ", "1"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+        self.prefer_trajectory_npz = bool(prefer_trajectory_npz)
         self.cache_dir = Path(cache_dir) if cache_dir is not None else None
         self._cache_suffix = self._build_cache_suffix()
         self._depth_calibration_cache: dict[str, tuple[float, float]] = {}
+        self.rgb_cache_items = _DEFAULT_RGB_CACHE_SIZE
+        self._rgb_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
+        self._rgb_cache_lock = threading.RLock()
         self._depth_calibration_cache_dir = (
             self.cache_dir / f"{self.dataset_name}_{self.split}_{self._cache_suffix}_depth_calibration"
             if self.cache_dir is not None
@@ -470,8 +649,27 @@ class DynamicReplicaAdapter(BaseAdapter):
                 f"[DynamicReplicaAdapter] split={split!r}, "
                 f"sequences={len(self._records)} "
                 f"(left={n_left}, right={n_right}), "
-                f"load_trajectories={load_trajectories}"
+                f"load_trajectories={load_trajectories} "
+                f"rgb_from_trajectory={self.rgb_from_trajectory} "
+                f"skip_depth_when_tracks={self.skip_depth_when_tracks} "
+                f"prefer_trajectory_npz={self.prefer_trajectory_npz} "
+                f"io_workers={self.io_workers}"
             )
+
+    def __getstate__(self) -> dict[str, Any]:
+        state = self.__dict__.copy()
+        # Avoid pickling decoded frame arrays into multiprocessing workers.
+        # Each worker rebuilds its own bounded cache on demand.
+        state["_rgb_cache"] = OrderedDict()
+        state["_rgb_cache_lock"] = None
+        return state
+
+    def __setstate__(self, state: dict[str, Any]) -> None:
+        self.__dict__.update(state)
+        self._rgb_cache = OrderedDict()
+        self._rgb_cache_lock = threading.RLock()
+        if not hasattr(self, "rgb_cache_items"):
+            self.rgb_cache_items = _DEFAULT_RGB_CACHE_SIZE
 
     # ------------------------------------------------------------------
     # BaseAdapter interface
@@ -494,6 +692,7 @@ class DynamicReplicaAdapter(BaseAdapter):
         r = self._get_record(sequence_name)
         H, W = r.image_size
         has_tracks = r.has_trajectories and self.load_trajectories
+        has_depth = not (has_tracks and self.skip_depth_when_tracks)
         return {
             "dataset_name": self.dataset_name,
             "split": self.split,
@@ -504,7 +703,7 @@ class DynamicReplicaAdapter(BaseAdapter):
             "num_frames": r.num_frames,
             "height": H,
             "width": W,
-            "has_depth": True,
+            "has_depth": has_depth,
             "has_normals": False,
             "has_tracks": has_tracks,
             "has_visibility": has_tracks,
@@ -533,35 +732,120 @@ class DynamicReplicaAdapter(BaseAdapter):
             for left-camera sequences when ``load_trajectories=True``,
             otherwise ``None``.
         """
+        total_t0 = time.perf_counter()
+        timing = {
+            "traj_load_s": 0.0,
+            "rgb_load_s": 0.0,
+            "depth_load_s": 0.0,
+            "stack_s": 0.0,
+            "total_s": 0.0,
+        }
         r = self._get_record(sequence_name)
         self._check_indices(frame_indices, r.num_frames, sequence_name)
+        clip_has_tracks = r.has_trajectories and self.load_trajectories
+        load_depths = not (clip_has_tracks and self.skip_depth_when_tracks)
 
         images: list[np.ndarray] = []
         dep_paths: list[Path] = []
         frame_paths: list[str] = []
         frame_numbers_clip: list[int] = []
         traj_paths_clip: list[Optional[Path]] = []
+        traj_cache_clip: list[
+            Optional[_TrajectoryCacheValue]
+        ] = []
         selected_positions: list[int] = []
 
-        for idx in frame_indices:
-            selected_positions.append(idx)
+        def _load_frame(idx: int) -> tuple[
+            int,
+            np.ndarray,
+            Path,
+            str,
+            int,
+            Optional[Path],
+            Optional[_TrajectoryCacheValue],
+            float,
+            float,
+        ]:
             fn = r.frame_numbers[idx]
             img_path = self.split_root / r.image_rel_paths[idx]
             dep_path = self.split_root / r.depth_rel_paths[idx]
-
-            frame_paths.append(str(img_path))
-            frame_numbers_clip.append(fn)
-            images.append(_load_rgb(img_path))
-            dep_paths.append(dep_path)
-
             traj_rel = r.traj_rel_paths[idx]
-            if traj_rel is not None:
-                traj_paths_clip.append(self.split_root / traj_rel)
+            traj_path = self.split_root / traj_rel if traj_rel is not None else None
+            traj_load_s = 0.0
+            rgb_load_s = 0.0
+            loaded_traj: Optional[_TrajectoryCacheValue] = None
+            use_traj_rgb = (
+                self.rgb_from_trajectory
+                and self.load_trajectories
+                and r.has_trajectories
+                and traj_path is not None
+            )
+            if use_traj_rgb and traj_path is not None:
+                t0 = time.perf_counter()
+                loaded_traj = _load_trajectory_cached(
+                    str(traj_path),
+                    prefer_npz=self.prefer_trajectory_npz,
+                )
+                traj_load_s += time.perf_counter() - t0
+                if loaded_traj[3] is not None:
+                    image = loaded_traj[3]
+                else:
+                    t0 = time.perf_counter()
+                    image = self._load_rgb_cached(img_path)
+                    rgb_load_s += time.perf_counter() - t0
+            else:
+                t0 = time.perf_counter()
+                image = self._load_rgb_cached(img_path)
+                rgb_load_s += time.perf_counter() - t0
+
+            return (
+                idx,
+                image,
+                dep_path,
+                str(img_path),
+                fn,
+                traj_path,
+                loaded_traj,
+                traj_load_s,
+                rgb_load_s,
+            )
+
+        if self.io_workers > 1 and len(frame_indices) > 1:
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=min(len(frame_indices), self.io_workers)) as ex:
+                frame_rows = list(ex.map(_load_frame, frame_indices))
+        else:
+            frame_rows = [_load_frame(idx) for idx in frame_indices]
+
+        for (
+            idx,
+            image,
+            dep_path,
+            frame_path,
+            fn,
+            traj_path,
+            loaded_traj,
+            traj_load_s,
+            rgb_load_s,
+        ) in frame_rows:
+            selected_positions.append(idx)
+            images.append(image)
+            frame_paths.append(frame_path)
+            frame_numbers_clip.append(fn)
+            timing["traj_load_s"] += traj_load_s
+            timing["rgb_load_s"] += rgb_load_s
+            if load_depths:
+                dep_paths.append(dep_path)
+            if traj_path is not None:
+                traj_paths_clip.append(traj_path)
             else:
                 traj_paths_clip.append(None)
+            traj_cache_clip.append(loaded_traj)
 
+        t0 = time.perf_counter()
         intrinsics = r.intrinsics[selected_positions].copy()
         extrinsics = r.extrinsics[selected_positions].copy()
+        timing["stack_s"] += time.perf_counter() - t0
 
         # Load trajectories if enabled and available
         has_tracks = (
@@ -580,12 +864,21 @@ class DynamicReplicaAdapter(BaseAdapter):
             traj_2d_list: list[np.ndarray] = []
             vis_list: list[np.ndarray] = []
 
-            for p in traj_paths_clip:
-                traj_3d, traj_2d, traj_vis = _load_trajectory_pth_cached(str(p))
+            for p, cached in zip(traj_paths_clip, traj_cache_clip):
+                if cached is None:
+                    t0 = time.perf_counter()
+                    traj_3d, traj_2d, traj_vis, _ = _load_trajectory_cached(
+                        str(p),
+                        prefer_npz=self.prefer_trajectory_npz,
+                    )
+                    timing["traj_load_s"] += time.perf_counter() - t0
+                else:
+                    traj_3d, traj_2d, traj_vis, _ = cached
                 traj_3d_list.append(traj_3d)        # (N, 3)
                 traj_2d_list.append(traj_2d[:, :2]) # (N, 2) – drop 3rd col
                 vis_list.append(traj_vis)           # (N,)
 
+            t0 = time.perf_counter()
             trajs_3d_world = np.stack(traj_3d_list, axis=0)  # (T, N, 3)
             trajs_2d = np.stack(traj_2d_list, axis=0)        # (T, N, 2)
             raw_vis = np.stack(vis_list, axis=0)              # (T, N) bool, occlusion-free per raycast
@@ -604,13 +897,19 @@ class DynamicReplicaAdapter(BaseAdapter):
             # visibs: a point is "visible" iff (raycast says not occluded) AND (in-frame).
             # Out-of-frame raycast hits default to True in the raw label, so we must AND inbounds.
             visibs = raw_vis & in_bounds
+            timing["stack_s"] += time.perf_counter() - t0
 
-        raw_depths = [_load_depth_raw(p) for p in dep_paths]
+        if load_depths:
+            t0 = time.perf_counter()
+            raw_depths = [_load_depth_raw(p) for p in dep_paths]
+            timing["depth_load_s"] += time.perf_counter() - t0
+        else:
+            raw_depths = []
 
         # Calibrate depth linear parameters (scale, offset) from trajectory GT
         # depth = (raw - offset) * scale  — both are per-sequence
         depth_scale, depth_offset = 0.00142, 14800.0  # fallback
-        if has_tracks and trajs_3d_world is not None:
+        if load_depths and has_tracks and trajs_3d_world is not None:
             depth_scale, depth_offset = self._get_depth_calibration(
                 sequence_name=sequence_name,
                 raw_depths=raw_depths,
@@ -620,7 +919,14 @@ class DynamicReplicaAdapter(BaseAdapter):
                 extrinsics=extrinsics,
             )
 
-        depths = [_decode_depth_raw(raw, depth_scale, depth_offset) for raw in raw_depths]
+        if load_depths:
+            t0 = time.perf_counter()
+            depths = [_decode_depth_raw(raw, depth_scale, depth_offset) for raw in raw_depths]
+            timing["stack_s"] += time.perf_counter() - t0
+        else:
+            depths = None
+
+        timing["total_s"] = time.perf_counter() - total_t0
 
         return UnifiedClip(
             dataset_name=self.dataset_name,
@@ -644,7 +950,7 @@ class DynamicReplicaAdapter(BaseAdapter):
                 "frame_indices": list(frame_indices),
                 "frame_numbers": frame_numbers_clip,
                 "num_frames_in_sequence": r.num_frames,
-                "has_depth": True,
+                "has_depth": load_depths,
                 "has_normals": False,
                 "has_tracks": has_tracks,
                 "has_visibility": has_tracks,
@@ -654,10 +960,43 @@ class DynamicReplicaAdapter(BaseAdapter):
                 "pose_convention": "w2c",
                 "extrinsics_convention": "w2c",
                 "intrinsics_convention": "pinhole",
-                "depth_encoding": "raw_uint16 / 65535.0 * scale_adjustment",
-                "depth_unit": "dynamic_replica_world_units",
+                "depth_encoding": (
+                    "raw_uint16 / 65535.0 * scale_adjustment" if load_depths else None
+                ),
+                "depth_unit": "dynamic_replica_world_units" if load_depths else None,
+                "_load_timing": timing,
             },
         )
+
+    def _rgb_cache_key(self, path: Path) -> tuple:
+        """Build a stable cache key that changes when the file changes."""
+        try:
+            st = path.stat()
+            return ("rgb", int(st.st_dev), int(st.st_ino), int(st.st_mtime_ns), int(st.st_size))
+        except OSError:
+            return ("rgb", str(path))
+
+    def _load_rgb_cached(self, path: Path) -> np.ndarray:
+        if self.rgb_cache_items <= 0:
+            return _load_rgb(path)
+
+        key = self._rgb_cache_key(path)
+        with self._rgb_cache_lock:
+            cached = self._rgb_cache.get(key)
+            if cached is not None:
+                self._rgb_cache.move_to_end(key)
+                return cached.copy()
+
+        arr = _load_rgb(path)
+        with self._rgb_cache_lock:
+            cached = self._rgb_cache.get(key)
+            if cached is not None:
+                self._rgb_cache.move_to_end(key)
+                return cached.copy()
+            self._rgb_cache[key] = arr
+            while len(self._rgb_cache) > self.rgb_cache_items:
+                self._rgb_cache.popitem(last=False)
+            return arr.copy()
 
     def sanity_check(self, sequence_name: str) -> dict[str, Any]:
         """Run consistency checks on a sequence.

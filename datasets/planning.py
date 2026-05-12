@@ -18,12 +18,32 @@ Key design decisions:
 
 from __future__ import annotations
 
+import math
+import os
 import pickle
 import random as _random_module
-from dataclasses import dataclass
+from collections import deque
+from dataclasses import dataclass, replace
 from typing import Any
 
 from .mixture import MixtureSampler
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    if value is None or not value.strip():
+        return default
+    try:
+        return int(value)
+    except ValueError:
+        return default
 
 
 @dataclass
@@ -158,11 +178,102 @@ class SamplePlanner:
                 ))
                 local_index += 1
 
+        if _env_flag("D4RT_PLANNED_BATCH_BALANCE", False) and plan:
+            batch_size = _env_int("D4RT_PLANNED_BATCH_SIZE", 0)
+            if batch_size > 1:
+                plan = self._balance_plan_batches(plan, batch_size)
+
         return plan
 
     def reset_for_epoch(self) -> None:
         """Reset the mixture sampler's locality state for a fresh epoch."""
         self.mixture_sampler.reset_locality_state()
+
+    def _balance_plan_batches(
+        self,
+        plan: list[SampleSpec],
+        batch_size: int,
+    ) -> list[SampleSpec]:
+        """Reorder each rank plan so local batches follow dataset weights.
+
+        This does not change the sampled set for the epoch; it only avoids long
+        local windows of the same expensive dataset draining the planned spool.
+        Per-dataset order is preserved inside each bucket, so sequence/frame
+        locality within a dataset is mostly retained.
+        """
+        probs = list(getattr(self.mixture_sampler, "dataset_probs", []))
+        if not probs:
+            return plan
+        num_datasets = len(probs)
+        buckets: list[deque[SampleSpec]] = [deque() for _ in range(num_datasets)]
+        overflow: deque[SampleSpec] = deque()
+        for spec in plan:
+            if 0 <= int(spec.dataset_idx) < num_datasets:
+                buckets[int(spec.dataset_idx)].append(spec)
+            else:
+                overflow.append(spec)
+
+        targets = self._balanced_batch_targets(probs, batch_size)
+        balanced: list[SampleSpec] = []
+
+        while any(buckets) or overflow:
+            batch: list[SampleSpec] = []
+            counts = [0] * num_datasets
+
+            for dataset_idx, target in enumerate(targets):
+                take = min(target, len(buckets[dataset_idx]))
+                for _ in range(take):
+                    batch.append(buckets[dataset_idx].popleft())
+                counts[dataset_idx] = take
+
+            while len(batch) < batch_size and (any(buckets) or overflow):
+                if overflow:
+                    batch.append(overflow.popleft())
+                    continue
+                best_idx = max(
+                    range(num_datasets),
+                    key=lambda idx: len(buckets[idx]) - max(0, targets[idx] - counts[idx]),
+                )
+                if not buckets[best_idx]:
+                    break
+                batch.append(buckets[best_idx].popleft())
+                counts[best_idx] += 1
+
+            balanced.extend(self._interleave_batch_by_dataset(batch, num_datasets))
+
+        return [replace(spec, local_index=i) for i, spec in enumerate(balanced)]
+
+    @staticmethod
+    def _balanced_batch_targets(probs: list[float], batch_size: int) -> list[int]:
+        raw = [max(0.0, float(p)) * batch_size for p in probs]
+        targets = [int(math.floor(v)) for v in raw]
+        remainder = batch_size - sum(targets)
+        order = sorted(range(len(raw)), key=lambda idx: raw[idx] - targets[idx], reverse=True)
+        for idx in order[: max(0, remainder)]:
+            targets[idx] += 1
+        return targets
+
+    @staticmethod
+    def _interleave_batch_by_dataset(
+        batch: list[SampleSpec],
+        num_datasets: int,
+    ) -> list[SampleSpec]:
+        grouped: list[deque[SampleSpec]] = [deque() for _ in range(num_datasets)]
+        other: deque[SampleSpec] = deque()
+        for spec in batch:
+            if 0 <= int(spec.dataset_idx) < num_datasets:
+                grouped[int(spec.dataset_idx)].append(spec)
+            else:
+                other.append(spec)
+
+        out: list[SampleSpec] = []
+        while any(grouped) or other:
+            for bucket in grouped:
+                if bucket:
+                    out.append(bucket.popleft())
+            if other:
+                out.append(other.popleft())
+        return out
 
 
 # ---------------------------------------------------------------------------

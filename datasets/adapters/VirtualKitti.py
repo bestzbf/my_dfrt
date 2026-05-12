@@ -166,9 +166,10 @@ class VKITTI2Adapter(BaseAdapter):
         all_depth_paths = sorted(depth_dir.glob("*.png")) if depth_dir.exists() else []
         all_flow_paths = sorted(flow_dir.glob("*.png")) if flow_dir.exists() else []
 
-        # Parse extrinsics
-        # VKITTI2 extrinsic.txt stores camera-to-world (c2w) transforms.
-        # We invert analytically to get world-to-camera (w2c).
+        # Parse extrinsics.
+        # VKITTI2 extrinsic.txt stores world-to-camera (w2c) transforms in the
+        # same camera convention as its RGB/depth/flow files.  Do not invert:
+        # inverting makes depth+pose static flow move in the wrong direction.
         pose_dict = {}
         if extrinsic_file.exists():
             with open(extrinsic_file, 'r') as f:
@@ -177,19 +178,8 @@ class VKITTI2Adapter(BaseAdapter):
                     parts = line.strip().split()
                     if len(parts) > 2 and parts[1] == self.camera[-1]:
                         frame_id = int(parts[0])
-                        c2w_mat = np.array(list(map(float, parts[2:14]))).reshape(3, 4)
-                        c2w = np.eye(4, dtype=np.float32)
-                        c2w[:3, :4] = c2w_mat
-
-                        # VKITTI2 extrinsic.txt stores camera-to-world (c2w) transforms.
-                        # Invert analytically to get world-to-camera (w2c).
-                        # No coordinate system conversion needed: the precomputed tracks
-                        # were generated using the same raw c2w convention.
-                        R = c2w[:3, :3]
-                        t = c2w[:3, 3]
                         w2c = np.eye(4, dtype=np.float32)
-                        w2c[:3, :3] = R.T
-                        w2c[:3, 3] = -R.T @ t
+                        w2c[:3, :4] = np.array(list(map(float, parts[2:14])), dtype=np.float32).reshape(3, 4)
                         pose_dict[frame_id] = w2c
 
         # Parse intrinsics
@@ -242,7 +232,9 @@ class VKITTI2Adapter(BaseAdapter):
 
         # Load precomputed normals/tracks if available
         normals_out, trajs_2d_out, trajs_3d_out, valids_out, visibs_out = None, None, None, None, None
+        track_types_out, track_object_ids_out, track_ref_frames_out = None, None, None
         has_precomputed = False
+        track_source = "none"
         cache = self._load_precomputed(sequence_name, frame_indices)
         if cache is not None:
             try:
@@ -250,8 +242,12 @@ class VKITTI2Adapter(BaseAdapter):
                 trajs_2d_out = cache["trajs_2d"]
                 trajs_3d_out = cache["trajs_3d_world"]
                 valids_out   = cache["valids"].copy()
-                visibs_out   = cache["visibs"]
+                visibs_out   = cache["visibs"].copy()
+                track_types_out = cache.get("track_types")
+                track_object_ids_out = cache.get("track_object_ids")
+                track_ref_frames_out = cache.get("track_ref_frames")
                 has_precomputed = True
+                track_source = "precomputed"
 
                 # Invalidate tracks whose 2D position falls on sky/invalid pixels
                 # (depth=0). These tracks have valid=True but their stored 3D world
@@ -265,14 +261,53 @@ class VKITTI2Adapter(BaseAdapter):
                             continue
                         H_d, W_d = depth_t.shape[:2]
                         uv = trajs_2d_out[ti]  # (N, 2)
-                        xs = np.clip(np.round(uv[:, 0]).astype(int), 0, W_d - 1)
-                        ys = np.clip(np.round(uv[:, 1]).astype(int), 0, H_d - 1)
+                        finite = np.isfinite(uv).all(axis=-1)
+                        in_bounds = (
+                            finite
+                            & (uv[:, 0] >= 0.0)
+                            & (uv[:, 0] < W_d)
+                            & (uv[:, 1] >= 0.0)
+                            & (uv[:, 1] < H_d)
+                        )
+                        if valids_out is not None:
+                            in_bounds &= valids_out[ti].astype(bool)
+                        idx = np.flatnonzero(in_bounds)
+                        if len(idx) == 0:
+                            continue
+                        xs = np.clip(np.round(uv[idx, 0]).astype(int), 0, W_d - 1)
+                        ys = np.clip(np.round(uv[idx, 1]).astype(int), 0, H_d - 1)
                         sky_mask = depth_t[ys, xs] == 0.0
-                        valids_out[ti][sky_mask] = False
+                        if np.any(sky_mask):
+                            bad_idx = idx[sky_mask]
+                            valids_out[ti][bad_idx] = False
+                            if visibs_out is not None:
+                                visibs_out[ti][bad_idx] = False
 
             except Exception as e:
                 if self.verbose:
                     print(f"[VKITTI2Adapter] Warning: precomputed indexing failed for {sequence_name}: {e}")
+
+        metadata = {
+            "dataset_name": self.dataset_name,
+            "split": self.split,
+            "has_depth": len(depths) > 0,
+            "has_flow": any(f is not None for f in flows),
+            "has_normals": has_precomputed,
+            "has_tracks": has_precomputed,
+            "has_visibility": has_precomputed,
+            "pose_convention": "world_to_camera",
+            "intrinsics_convention": "pinhole",
+            "extrinsics_convention": "w2c",
+            "vkitti_extrinsics_source": "extrinsic.txt_raw_w2c",
+            "track_source": track_source,
+            "depth_unit": "meters",
+        }
+        if track_types_out is not None:
+            metadata["track_types"] = np.asarray(track_types_out, dtype=np.int8)
+        if track_object_ids_out is not None:
+            metadata["track_object_ids"] = np.asarray(track_object_ids_out, dtype=np.int32)
+        if track_ref_frames_out is not None:
+            metadata["track_ref_frames"] = np.asarray(track_ref_frames_out, dtype=np.int32)
 
         return UnifiedClip(
             dataset_name=self.dataset_name,
@@ -288,18 +323,7 @@ class VKITTI2Adapter(BaseAdapter):
             intrinsics=np.stack(intrinsics, axis=0),
             extrinsics=np.stack(extrinsics, axis=0),
             flows=flows if any(f is not None for f in flows) else None,
-            metadata={
-                "dataset_name": self.dataset_name,
-                "split": self.split,
-                "has_depth": len(depths) > 0,
-                "has_flow": any(f is not None for f in flows),
-                "has_normals": has_precomputed,
-                "has_tracks": has_precomputed,
-                "has_visibility": has_precomputed,
-                "pose_convention": "world_to_camera",
-                "intrinsics_convention": "pinhole",
-                "depth_unit": "meters",
-            }
+            metadata=metadata,
         )
 
     def sanity_check(self, sequence_name: str) -> dict[str, Any]:

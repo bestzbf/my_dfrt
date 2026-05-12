@@ -42,10 +42,16 @@ def extract_local_patches(
             f"got coords={tuple(coords.shape)} and t_src={tuple(t_src.shape)}"
         )
 
+    if frames_btchw.dtype == torch.uint8:
+        target_dtype = coords.dtype if coords.is_floating_point() else torch.float32
+        frames_btchw = frames_btchw.to(dtype=target_dtype).div_(255.0)
+    elif not frames_btchw.is_floating_point():
+        frames_btchw = frames_btchw.float()
+
     # Use 5D grid_sample to avoid duplicating high-res frames in memory
     # Input: (B, C, T, H, W)
     input_5d = frames_btchw.permute(0, 2, 1, 3, 4)
-    grid_dtype = frames_btchw.dtype if frames_btchw.is_floating_point() else coords.dtype
+    grid_dtype = frames_btchw.dtype
 
     offsets = _build_patch_offsets(patch_size, device=frames_btchw.device, dtype=grid_dtype)
 
@@ -167,3 +173,68 @@ def extract_local_patches_with_valid_hw(
         align_corners=True,
     )
     return patches.permute(0, 2, 1, 3, 4)
+
+
+def extract_local_patches_from_frame_list(
+    frames_btchw: list[torch.Tensor],
+    coords: torch.Tensor,
+    t_src: torch.Tensor,
+    patch_size: int,
+    valid_hw: torch.Tensor,
+) -> torch.Tensor:
+    """Extract patches from a list of per-sample frame tensors without padding.
+
+    Each list entry is expected to be (T, C, H, W). This is intentionally
+    per-sample to avoid padding an entire batch to one large high-res crop.
+    """
+    if coords.dim() != 3 or coords.shape[-1] != 2:
+        raise ValueError(f"Expected coords to have shape (B, N, 2), got {tuple(coords.shape)}")
+    if t_src.dim() != 2:
+        raise ValueError(f"Expected t_src to have shape (B, N), got {tuple(t_src.shape)}")
+    if valid_hw.dim() != 2 or valid_hw.shape[-1] != 2:
+        raise ValueError(f"Expected valid_hw to have shape (B, 2), got {tuple(valid_hw.shape)}")
+
+    batch_size, num_queries, _ = coords.shape
+    if len(frames_btchw) != batch_size:
+        raise ValueError(
+            "Expected frame list length to match coords batch dimension, "
+            f"got {len(frames_btchw)} and {batch_size}"
+        )
+    if t_src.shape != (batch_size, num_queries):
+        raise ValueError(
+            "Expected t_src shape to match coords batch/query dimensions, "
+            f"got coords={tuple(coords.shape)} and t_src={tuple(t_src.shape)}"
+        )
+    if valid_hw.shape[0] != batch_size:
+        raise ValueError(
+            "Expected valid_hw batch dimension to match coords batch dimension, "
+            f"got coords={tuple(coords.shape)} and valid_hw={tuple(valid_hw.shape)}"
+        )
+
+    patches = []
+    for b, frames_i in enumerate(frames_btchw):
+        if frames_i.dim() != 4:
+            raise ValueError(
+                f"Expected frame list entry {b} to have shape (T, C, H, W), "
+                f"got {tuple(frames_i.shape)}"
+            )
+        if frames_i.shape[1] != 3:
+            raise ValueError(
+                f"Expected frame list entry {b} channel dimension to be 3, "
+                f"got {tuple(frames_i.shape)}"
+            )
+        target_dtype = coords.dtype if coords.is_floating_point() else torch.float32
+        if frames_i.dtype == torch.uint8:
+            frames_i = frames_i.to(device=coords.device, dtype=target_dtype).div_(255.0)
+        else:
+            frames_i = frames_i.to(device=coords.device, dtype=target_dtype)
+        patches_i = extract_local_patches_with_valid_hw(
+            frames_btchw=frames_i.unsqueeze(0),
+            coords=coords[b:b + 1],
+            t_src=t_src[b:b + 1],
+            patch_size=patch_size,
+            valid_hw=valid_hw[b:b + 1],
+        )
+        patches.append(patches_i.squeeze(0))
+
+    return torch.stack(patches, dim=0)

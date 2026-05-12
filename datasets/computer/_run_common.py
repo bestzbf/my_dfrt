@@ -28,7 +28,7 @@ def _process_sequence(args: tuple) -> tuple[str, str | None]:
     Process one sequence.  Returns (seq_name, error_message_or_None).
     Must be a top-level function for multiprocessing pickle.
     """
-    seq_name, adapter_state, output_root, num_points, overwrite = args
+    seq_name, adapter_state, output_root, num_points, overwrite, track_kwargs = args
 
     out_path = Path(output_root) / seq_name / "precomputed.npz"
     if out_path.exists() and not overwrite:
@@ -64,6 +64,7 @@ def _process_sequence(args: tuple) -> tuple[str, str | None]:
             intrinsics=intrinsics,
             extrinsics=extrinsics,
             num_points=num_points,
+            **track_kwargs,
         )
 
         # ---- save ----
@@ -75,10 +76,38 @@ def _process_sequence(args: tuple) -> tuple[str, str | None]:
             "valids": tracks["valids"],
             "visibs": tracks["visibs"],
             "ref_frame": np.array(tracks["ref_frame"], dtype=np.int32),
+            "ref_frames": np.asarray(
+                tracks.get("ref_frames", np.array([tracks["ref_frame"]], dtype=np.int32)),
+                dtype=np.int32,
+            ),
             "num_frames": np.array(num_frames, dtype=np.int32),
             "num_points": np.array(tracks["num_points"], dtype=np.int32),
             "track_semantics_version": np.array(
                 tracks.get("track_semantics_version", 0),
+                dtype=np.int32,
+            ),
+            "num_ref_segments": np.array(
+                tracks.get("num_ref_segments", 1),
+                dtype=np.int32,
+            ),
+            "track_depth_max": np.array(
+                tracks.get("track_depth_max", np.nan),
+                dtype=np.float32,
+            ),
+            "source_depth_sampling_mode": np.array(
+                tracks.get("source_depth_sampling_mode", 0),
+                dtype=np.int32,
+            ),
+            "source_depth_bin_edges": np.asarray(
+                tracks.get("source_depth_bin_edges", np.empty(0, dtype=np.float32)),
+                dtype=np.float32,
+            ),
+            "source_depth_bin_weights": np.asarray(
+                tracks.get("source_depth_bin_weights", np.empty(0, dtype=np.float32)),
+                dtype=np.float32,
+            ),
+            "source_depth_num_bins": np.array(
+                tracks.get("source_depth_num_bins", 0),
                 dtype=np.int32,
             ),
         }
@@ -105,6 +134,7 @@ def run_precompute(
     num_points: int = 8000,
     workers: int = 4,
     overwrite: bool = False,
+    track_kwargs: dict | None = None,
 ) -> None:
     """
     Run precomputation for all sequences in an adapter.
@@ -121,11 +151,13 @@ def run_precompute(
     total = len(sequences)
     print(f"[precompute] {adapter.dataset_name}: {total} sequences → {output_root}")
 
+    track_kwargs = dict(track_kwargs or {})
+
     # Build a picklable description of the adapter so workers can reconstruct it
     adapter_state = _make_adapter_state(adapter)
 
     job_args = [
-        (seq, adapter_state, str(output_root), num_points, overwrite)
+        (seq, adapter_state, str(output_root), num_points, overwrite, track_kwargs)
         for seq in sequences
     ]
 

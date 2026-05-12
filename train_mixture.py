@@ -21,6 +21,7 @@ import contextlib
 import math
 import queue
 import threading
+import re
 from datetime import timedelta
 
 
@@ -28,11 +29,73 @@ def unwrap_model(model: nn.Module) -> nn.Module:
     return model.module if hasattr(model, "module") else model
 
 
+def align_config_to_patch_provider(config: dict, patch_provider: str) -> dict:
+    """Keep dataset patch materialization consistent with explicit patch providers."""
+    if patch_provider not in {
+        "precomputed_resized",
+        "precomputed_highres",
+        "sampled_resized",
+        "sampled_highres",
+    }:
+        return config
+
+    config = dict(config)
+    if patch_provider == "precomputed_highres":
+        config["precompute_patches"] = True
+        config["precompute_from_highres"] = True
+        config["return_highres_video"] = False
+    elif patch_provider == "precomputed_resized":
+        config["precompute_patches"] = True
+        config["precompute_from_highres"] = False
+        config["return_highres_video"] = False
+    elif patch_provider == "sampled_resized":
+        config["precompute_patches"] = False
+        config["precompute_from_highres"] = False
+        config["return_highres_video"] = False
+    elif patch_provider == "sampled_highres":
+        config["precompute_patches"] = False
+        config["precompute_from_highres"] = False
+        config["return_highres_video"] = True
+    return config
+
+
+def infer_resume_start_epoch_from_path(resume_path: str | None) -> int | None:
+    """Best-effort first training epoch hint before the checkpoint is loaded."""
+    if not resume_path:
+        return None
+    name = Path(resume_path).name
+    match = re.search(r"_(\d+)\.pth$", name)
+    if match is None:
+        return None
+    # Checkpoints are named with the 1-based completed epoch
+    # (checkpoint_latest_428.pth stores epoch=427), so the first post-resume
+    # training epoch is the number in the filename.
+    return int(match.group(1))
+
+
 def move_batch_to_device(batch: dict, device: torch.device) -> dict:
+    video = batch.get("video")
+    local_patches = batch.get("local_patches")
     batch = {
-        k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
+        k: v.to(device, non_blocking=True)
+        if isinstance(v, torch.Tensor) and k not in {"video", "local_patches"}
+        else v
         for k, v in batch.items()
     }
+    if isinstance(video, (list, tuple)):
+        batch["video"] = torch.stack(
+            [v.to(device, non_blocking=True) for v in video],
+            dim=0,
+        )
+    elif isinstance(video, torch.Tensor):
+        batch["video"] = video.to(device, non_blocking=True)
+    if isinstance(local_patches, (list, tuple)):
+        batch["local_patches"] = torch.stack(
+            [v.to(device, non_blocking=True) for v in local_patches],
+            dim=0,
+        )
+    elif isinstance(local_patches, torch.Tensor):
+        batch["local_patches"] = local_patches.to(device, non_blocking=True)
     batch["targets"] = {
         k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v
         for k, v in batch["targets"].items()
@@ -45,6 +108,9 @@ def move_batch_to_device(batch: dict, device: torch.device) -> dict:
         }
     if batch["video"].dtype == torch.uint8:
         batch["video"] = batch["video"].float() / 255.0
+    local_patches = batch.get("local_patches")
+    if isinstance(local_patches, torch.Tensor) and local_patches.dtype == torch.uint8:
+        batch["local_patches"] = local_patches.float() / 255.0
     return batch
 
 
@@ -337,6 +403,19 @@ def format_batch_sample_details(batch: dict, max_samples: int = 8) -> list[str]:
             f"static={_target_ratio(batch, 'is_static_reprojection', i)}"
         )
         lines.append(line)
+
+        # Add load timing info if available
+        load_timing = md.get("_load_timing")
+        if isinstance(load_timing, dict) and load_timing.get("total_s", 0) > 0:
+            timing = load_timing
+            lines.append(
+                f"    load_time={timing.get('total_s', 0)*1000:.0f}ms: "
+                f"scene_data={timing.get('scene_data_s', 0)*1000:.0f}ms "
+                f"rgb={timing.get('rgb_load_s', 0)*1000:.0f}ms "
+                f"depth={timing.get('depth_load_s', 0)*1000:.0f}ms "
+                f"precomputed={timing.get('precomputed_s', 0)*1000:.0f}ms"
+            )
+
     if batch_size > max_samples:
         lines.append(f"  ... {batch_size - max_samples} more samples omitted")
     return lines
@@ -349,15 +428,23 @@ class ProfilingCollateFn:
         self.rank = rank
         self.interval = max(1, int(interval))
         self.count = 0
+        self.print_periodic = os.getenv("D4RT_PROFILE_COLLATE_PERIODIC", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        self.slow_threshold_s = float(os.getenv("D4RT_COLLATE_SLOW_THRESHOLD_S", "2.0"))
 
     def __call__(self, batch):
         t0 = time.perf_counter()
         result = d4rt_collate_fn(batch)
         dt = time.perf_counter() - t0
         self.count += 1
-        if self.count <= 3 or self.count % self.interval == 0:
+        if (
+            (self.print_periodic and (self.count <= 3 or self.count % self.interval == 0))
+            or dt >= self.slow_threshold_s
+        ):
+            tag = "DataProfileSlow" if dt >= self.slow_threshold_s else "DataProfile"
             print(
-                f"[DataProfile rank{self.rank}] collate "
+                f"[{tag} rank{self.rank}] collate "
                 f"batch={self.count} samples={len(batch)} time={dt * 1000:.1f}ms",
                 flush=True,
             )
@@ -490,10 +577,11 @@ def main():
     parser.add_argument(
         "--patch-provider", type=str, default="auto",
         help=(
-            "Patch provider: auto | precomputed_resized | sampled_resized | sampled_highres.\n"
+            "Patch provider: auto | precomputed_resized | precomputed_highres | sampled_resized | sampled_highres.\n"
             "  auto              → resolves to precomputed_resized when local_patches is precomputed.\n"
-            "  sampled_highres   → samples from highres_video (original crop res); requires\n"
-            "                      dataset config with precompute_patches: false.\n"
+            "  precomputed_highres → uses local_patches extracted from highres_video during sample build.\n"
+            "  sampled_resized   → samples patches on GPU from the resized encoder video.\n"
+            "  sampled_highres   → samples from highres_video (original crop res).\n"
             "  NOTE: 'auto' does NOT enable high-res patches. For the paper's strongest setting\n"
             "  use --patch-provider sampled_highres with a config that sets precompute_patches: false."
         )
@@ -555,20 +643,32 @@ def main():
     # Load config
     with open(args.config) as f:
         config = yaml.safe_load(f)
+    config = align_config_to_patch_provider(config, args.patch_provider)
 
     # Inject planned mode settings into config
     if args.planned_mode:
         config['planned_mode'] = True
         config['builder_workers'] = args.builder_workers
         config['prefetch_depth'] = args.prefetch_depth
+        resume_start_epoch = infer_resume_start_epoch_from_path(args.resume)
+        if resume_start_epoch is not None:
+            config['planned_initial_epoch'] = resume_start_epoch
+            config['planned_start_immediately'] = True
         if local_rank == 0:
             print(f"[Planned Mode] Enabled with {args.builder_workers} builder workers, prefetch depth {args.prefetch_depth}")
+            if resume_start_epoch is not None:
+                print(
+                    f"[Planned Mode] Initial prefetch epoch={resume_start_epoch} "
+                    f"(from resume filename {Path(args.resume).name})",
+                    flush=True,
+                )
 
     # Load val config (if separate)
     val_config = config
     if args.val_config is not None:
         with open(args.val_config) as f:
             val_config = yaml.safe_load(f)
+        val_config = align_config_to_patch_provider(val_config, args.patch_provider)
 
     # Validation must NOT use planned mode.  Planned mode assumes sequential
     # single-worker access (SequentialSampler + num_workers=0) which conflicts
@@ -869,6 +969,8 @@ def main():
         "1", "true", "yes", "on",
     }
     data_wait_detail_max_samples = int(os.getenv("D4RT_DATA_WAIT_DETAIL_MAX_SAMPLES", "8"))
+    # Auto-print slow data diagnostics when data time exceeds this threshold
+    slow_data_threshold_s = float(os.getenv("D4RT_SLOW_DATA_THRESHOLD_S", "3.0"))
     for epoch in range(start_epoch, args.epochs):
         if distributed and isinstance(train_sampler, DistributedSampler):
             train_sampler.set_epoch(epoch)
@@ -928,31 +1030,44 @@ def main():
             ctx = model.no_sync() if use_no_sync else contextlib.nullcontext()
             with ctx:
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=amp_enabled):
+                    t_model_start = time.perf_counter()
                     outputs = model(batch['video'], batch['coords'], batch['t_src'], batch['t_tgt'], batch['t_cam'],
                                     aspect_ratio=batch.get('aspect_ratio'),
                                     local_patches=batch.get('local_patches'),
                                     transform_metadata=batch.get('transform_metadata'),
                                     query_frames=query_frames_arg,)
+                    torch.cuda.synchronize()
+                    t_model = time.perf_counter() - t_model_start
+
                     # Per-(dataset, frame) depth normalization:
                     # dataset_id * num_frames + t_cam gives each (dataset, frame) pair a unique
                     # group id, so median depth is computed independently per frame within each
                     # dataset. This is correct for both single- and multi-dataset batches.
+                    t_loss_start = time.perf_counter()
                     normalize_groups = batch['dataset_id'] * args.num_frames + batch['t_cam']
                     loss_dict = loss_fn(outputs, batch['targets'], normalize_groups=normalize_groups)
                     loss = loss_dict['loss'] / args.grad_accum
+                    torch.cuda.synchronize()
+                    t_loss = time.perf_counter() - t_loss_start
 
+                t_bwd_start = time.perf_counter()
                 loss.backward()
+                torch.cuda.synchronize()
+                t_bwd = time.perf_counter() - t_bwd_start
 
+            t_opt_start = time.perf_counter()
             if is_last_accum:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 global_step += 1
+            torch.cuda.synchronize()
+            t_opt = time.perf_counter() - t_opt_start
 
             t_fwd = time.perf_counter() - t_fwd_start
+            reasons = []
             if profile_data_wait:
-                reasons = []
                 if t_data >= data_wait_threshold_s:
                     reasons.append(f"threshold>={data_wait_threshold_s:.3f}s")
                 if data_wait_compare_fwd and t_data > t_fwd:
@@ -965,7 +1080,9 @@ def main():
                         f"[DataWaitDetail rank{local_rank}] "
                         f"reason={','.join(reasons)} "
                         f"epoch={epoch} batch={batch_idx} "
-                        f"data={t_data * 1000:.0f}ms fwd+bwd={t_fwd * 1000:.0f}ms "
+                        f"data={t_data * 1000:.0f}ms | "
+                        f"model={t_model*1000:.0f}ms loss={t_loss*1000:.0f}ms bwd={t_bwd*1000:.0f}ms opt={t_opt*1000:.0f}ms | "
+                        f"total={t_fwd * 1000:.0f}ms "
                         f"datasets={format_dataset_counts(batch.get('dataset_names'))} "
                         f"batch_prefetch_wait={prefetch_stats_for_batch.get('get_wait_s', 0.0) * 1000:.0f}ms "
                         f"q_before={prefetch_stats_for_batch.get('qsize_before')} "
@@ -986,6 +1103,27 @@ def main():
                         ):
                             print(f"[DataWaitDetail rank{local_rank}] {detail_line}", flush=True)
 
+            # Auto-print slow data diagnostics
+            if t_data >= slow_data_threshold_s and not reasons:
+                spool_stats = summarize_spool_ready(
+                    train_dataset, focus_index=next_planned_index_for_batch
+                )
+                dataset_counts = format_dataset_counts(batch.get('dataset_names'))
+                print(
+                    f"[SlowData rank{local_rank}] "
+                    f"epoch={epoch} batch={batch_idx} "
+                    f"data={t_data * 1000:.0f}ms "
+                    f"datasets={dataset_counts} "
+                    f"spool_ready={spool_stats.get('ready_count')} "
+                    f"spool_min={spool_stats.get('ready_min')} "
+                    f"spool_max={spool_stats.get('ready_max')}",
+                    flush=True,
+                )
+                for detail_line in format_batch_sample_details(
+                    batch, max_samples=data_wait_detail_max_samples
+                ):
+                    print(f"[SlowData rank{local_rank}] {detail_line}", flush=True)
+
             real_loss = loss.item() * args.grad_accum  # 还原除法，得到真实loss值
             epoch_loss += real_loss
             if batch_idx % args.log_interval == 0:
@@ -997,7 +1135,9 @@ def main():
                     lr_info += f" [min {min(current_lrs):.2e}]"
                 # Print from ALL ranks so we can compare data/compute time per rank
                 print(f"[{time.strftime('%H:%M:%S')}][rank{local_rank}] Epoch {epoch}, Batch {batch_idx}, "
-                      f"data={t_data*1000:.0f}ms fwd+bwd={t_fwd*1000:.0f}ms Loss: {real_loss:.4f}, {lr_info}", flush=True)
+                      f"data={t_data*1000:.0f}ms | "
+                      f"model={t_model*1000:.0f}ms loss={t_loss*1000:.0f}ms bwd={t_bwd*1000:.0f}ms opt={t_opt*1000:.0f}ms | "
+                      f"total={t_fwd*1000:.0f}ms Loss: {real_loss:.4f}, {lr_info}", flush=True)
 
                 if local_rank == 0:
                     # Save loss log

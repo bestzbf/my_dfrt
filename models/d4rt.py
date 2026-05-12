@@ -124,7 +124,7 @@ class D4RT(nn.Module):
     def decode(
         self,
         encoder_features: torch.Tensor,
-        frames: torch.Tensor,
+        frames: torch.Tensor | list[torch.Tensor],
         coords: torch.Tensor,
         t_src: torch.Tensor,
         t_tgt: torch.Tensor,
@@ -162,13 +162,12 @@ class D4RT(nn.Module):
     def _prepare_query_frames(
         video: torch.Tensor,
         query_frames: Optional[torch.Tensor | list[Optional[torch.Tensor]]],
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | list[torch.Tensor]:
         """Normalize patch-extraction frames to (B, T, C, H, W)."""
         if query_frames is not None and isinstance(query_frames, list):
             # query_frames is a list of Optional[Tensor] with variable crop sizes.
-            # Pad all non-None entries to (H_max, W_max); crop_size_hw will clamp
-            # valid sampling inside each sample's real crop bounds.
-            device = video.device
+            # Keep it as a list: padding all entries to one outlier high-res crop
+            # can allocate tens of GiB before we only need tiny local patches.
             if video.dim() == 5 and video.shape[1] == 3:
                 resized_frames = video.permute(0, 2, 1, 3, 4)  # (B,C,T,H,W) -> (B,T,C,H,W)
             elif video.dim() == 5 and video.shape[2] == 3:
@@ -181,26 +180,18 @@ class D4RT(nn.Module):
             resolved: list[torch.Tensor] = []
             for i, qf in enumerate(query_frames):
                 if qf is not None:
-                    qf_device = qf.to(device=device)
-                    if qf_device.dtype == torch.uint8:
-                        qf_device = qf_device.to(dtype=video.dtype).div_(255.0)
+                    if qf.dim() == 4 and qf.shape[1] == 3:
+                        resolved.append(qf)  # [T, C, H, W]
+                    elif qf.dim() == 4 and qf.shape[-1] == 3:
+                        resolved.append(qf.permute(0, 3, 1, 2))  # [T, H, W, C] -> [T, C, H, W]
                     else:
-                        qf_device = qf_device.to(dtype=video.dtype)
-                    resolved.append(qf_device)
+                        raise ValueError(
+                            "Unsupported query frame shape for list entry "
+                            f"{i}: {tuple(qf.shape)}"
+                        )
                 else:
                     resolved.append(resized_frames[i])  # [T, C, H, W]
-
-            max_h = max(f.shape[-2] for f in resolved)
-            max_w = max(f.shape[-1] for f in resolved)
-            if all(f.shape[-2] == max_h and f.shape[-1] == max_w for f in resolved):
-                return torch.stack(resolved, dim=0)  # [B, T, C, H, W]
-
-            padded = []
-            for f in resolved:
-                pad_h = max_h - f.shape[-2]
-                pad_w = max_w - f.shape[-1]
-                padded.append(torch.nn.functional.pad(f, (0, pad_w, 0, pad_h)))
-            return torch.stack(padded, dim=0)  # [B, T, C, max_h, max_w]
+            return resolved
 
         if query_frames is not None:
             return query_frames

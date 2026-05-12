@@ -192,10 +192,17 @@ class SampleSpool:
         building_path = self._get_building_path(index, generation)
         ready_path = self._get_ready_path(index, generation)
 
-        with open(building_path, "wb") as f:
-            pickle.dump(sample, f, protocol=pickle.HIGHEST_PROTOCOL)
-
-        os.replace(building_path, ready_path)
+        data = pickle.dumps(sample, protocol=pickle.HIGHEST_PROTOCOL)
+        for attempt in range(2):
+            with open(building_path, "wb") as f:
+                f.write(data)
+            try:
+                os.replace(building_path, ready_path)
+                return
+            except FileNotFoundError:
+                if attempt == 0:
+                    continue
+                raise
 
     def write_error(
         self, index: int, exception: Exception, generation: int
@@ -317,6 +324,21 @@ class SampleSpool:
         """
         return self._get_ready_path(index, generation).exists()
 
+    def list_ready_indices(self, generation: int) -> list[int]:
+        """Return sorted ready bundle indices for a generation."""
+        prefix = f"g{generation:04d}_"
+        indices: list[int] = []
+        for path in self.spool_dir.iterdir():
+            name = path.name
+            if not (name.startswith(prefix) and name.endswith(".ready")):
+                continue
+            try:
+                indices.append(int(name[len(prefix):len(prefix) + 8]))
+            except ValueError:
+                continue
+        indices.sort()
+        return indices
+
     def has_error(self, index: int, generation: int) -> bool:
         """Check if a bundle has an error marker.
 
@@ -328,6 +350,21 @@ class SampleSpool:
             True if bundle has error
         """
         return self._get_error_path(index, generation).exists()
+
+    def list_error_indices(self, generation: int) -> list[int]:
+        """Return sorted error marker indices for a generation."""
+        prefix = f"g{generation:04d}_"
+        indices: list[int] = []
+        for path in self.spool_dir.iterdir():
+            name = path.name
+            if not (name.startswith(prefix) and name.endswith(".error")):
+                continue
+            try:
+                indices.append(int(name[len(prefix):len(prefix) + 8]))
+            except ValueError:
+                continue
+        indices.sort()
+        return indices
 
     # ------------------------------------------------------------------
     # Convenience queries

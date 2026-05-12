@@ -30,6 +30,7 @@ class TartanAirAdapter(BaseAdapter):
         split: str = "train",
         camera: str = "left",
         precompute_root: Optional[str] = None,
+        load_precomputed: bool = True,
         verbose: bool = True,
         strict: bool = True,
         cache_dir: Optional[str] = None,
@@ -47,7 +48,11 @@ class TartanAirAdapter(BaseAdapter):
         self.root = Path(root)
         self.split = split
         self.camera = camera
-        self.precompute_root = Path(precompute_root) if precompute_root else self.root
+        self.load_precomputed = bool(load_precomputed)
+        self.precompute_root = (
+            Path(precompute_root) if precompute_root and self.load_precomputed
+            else (self.root if self.load_precomputed else None)
+        )
         self.verbose = verbose
 
         # TartanAir standard intrinsics (640x480)
@@ -160,12 +165,11 @@ class TartanAirAdapter(BaseAdapter):
 
     def _load_precomputed(self, sequence_name: str, frame_indices: list[int]) -> Optional[dict]:
         """Load precomputed normals/tracks for frame_indices. Prefers .h5 over .npz."""
-        if self.precompute_root is None:
+        if not self.load_precomputed or self.precompute_root is None:
             return None
         from datasets.adapters.base import load_precomputed_fast
-        seq_dir = self.seq_to_dir[sequence_name]
-        cache_path = seq_dir / "precomputed.npz"
-        h5_path = seq_dir / "precomputed.h5"
+        cache_path = self.precompute_root / sequence_name / "precomputed.npz"
+        h5_path = cache_path.with_suffix(".h5")
         if not cache_path.exists() and not h5_path.exists():
             return None
         try:
@@ -244,6 +248,10 @@ class TartanAirAdapter(BaseAdapter):
 
             flows.append(None)
 
+        R_ned2enu = np.array([[0,1,0],[1,0,0],[0,0,-1]], dtype=np.float32)
+        R_ned2cv  = np.array([[0,1,0],[0,0,1],[1,0,0]], dtype=np.float32)
+        R_edn2enu = np.array([[1,0,0],[0,0,1],[0,-1,0]], dtype=np.float32)
+
         # ---- precomputed normals / tracks ----
         normals_out    = None
         trajs_2d_out   = None
@@ -251,12 +259,19 @@ class TartanAirAdapter(BaseAdapter):
         valids_out     = None
         visibs_out     = None
         has_precomputed = False
+        trajs_3d_source = None
 
         cache = self._load_precomputed(sequence_name, actual_indices)
         if cache is not None:
             try:
                 normals_out  = [n.astype(np.float32) for n in cache["normals"]]
                 trajs_2d_out = cache["trajs_2d"]
+                if "trajs_3d_world" in cache:
+                    trajs_3d_cache = cache["trajs_3d_world"].astype(np.float32)
+                    sh = trajs_3d_cache.shape
+                    pts = trajs_3d_cache.reshape(-1, 3)
+                    trajs_3d_out = (R_edn2enu @ pts.T).T.reshape(sh).astype(np.float32)
+                    trajs_3d_source = "precomputed_trajs_3d_world_edn_to_enu"
                 valids_out   = cache["valids"]
                 visibs_out   = cache["visibs"]
                 has_precomputed = True
@@ -267,8 +282,9 @@ class TartanAirAdapter(BaseAdapter):
 
         extrinsics_arr = np.stack(extrinsics, axis=0)  # [T,4,4] w2c in NED world
 
-        # Recompute trajs_3d_world from trajs_2d + depth (OpenCV cam coords -> NED world)
-        if trajs_2d_out is not None and len(depths) > 0:
+        # Fallback for older caches that do not contain trajs_3d_world:
+        # recompute from trajs_2d + depth (OpenCV cam coords -> NED world).
+        if trajs_3d_out is None and trajs_2d_out is not None and len(depths) > 0:
             T_frames = len(actual_indices)
             N = trajs_2d_out.shape[1]
             trajs_3d_ned = np.zeros((T_frames, N, 3), dtype=np.float32)
@@ -294,7 +310,10 @@ class TartanAirAdapter(BaseAdapter):
                 R_c2w = R.T; t_c2w = -R.T @ t_w
                 pts_world = (R_c2w @ pts_cam_ned.T).T + t_c2w
                 trajs_3d_ned[ti] = pts_world
-            trajs_3d_out = trajs_3d_ned
+            sh = trajs_3d_ned.shape
+            pts = trajs_3d_ned.reshape(-1, 3).astype(np.float32)
+            trajs_3d_out = (R_ned2enu @ pts.T).T.reshape(sh).astype(np.float32)
+            trajs_3d_source = "depth_recomputed_ned_to_enu"
 
         # TartanAir uses NED world frame and NED camera frame.
         # Convert to: ENU world frame + OpenCV camera frame (x=right, y=down, z=fwd).
@@ -303,19 +322,10 @@ class TartanAirAdapter(BaseAdapter):
         # R_ned2cv:  NED cam  → OpenCV cam  [[0,1,0],[0,0,1],[1,0,0]]
         #
         # Full extrinsic: p_cam_cv = R_ned2cv @ w2c_ned @ R_ned2enu^T @ p_enu
-        R_ned2enu = np.array([[0,1,0],[1,0,0],[0,0,-1]], dtype=np.float32)
-        R_ned2cv  = np.array([[0,1,0],[0,0,1],[1,0,0]], dtype=np.float32)
-
         T_left  = np.eye(4, dtype=np.float32); T_left[:3,:3]  = R_ned2cv
         T_right = np.eye(4, dtype=np.float32); T_right[:3,:3] = R_ned2enu.T  # = R_enu2ned
 
         extrinsics_arr = T_left @ extrinsics_arr @ T_right  # [T,4,4]
-
-        # Transform 3-D tracks: p_enu = R_ned2enu @ p_ned
-        if trajs_3d_out is not None:
-            sh = trajs_3d_out.shape
-            pts = trajs_3d_out.reshape(-1, 3).astype(np.float32)
-            trajs_3d_out = (R_ned2enu @ pts.T).T.reshape(sh).astype(np.float32)
 
         return UnifiedClip(
             dataset_name=self.dataset_name,
@@ -339,6 +349,8 @@ class TartanAirAdapter(BaseAdapter):
                 "has_normals": has_precomputed,
                 "has_tracks": has_precomputed,
                 "has_visibility": has_precomputed,
+                "trajs_3d_source": trajs_3d_source,
+                "world_convention": "enu",
                 "pose_convention": "world_to_camera",
                 "intrinsics_convention": "pinhole",
                 "depth_unit": "meters",

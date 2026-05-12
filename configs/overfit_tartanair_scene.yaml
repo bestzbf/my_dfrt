@@ -1,10 +1,10 @@
 mode: scene
 name: tartanair
-root: /tmp/tartanair_test
+root: /data_cos/hdu_datasets/tartanairv1
 sequences:
   - abandonedfactory/Easy/P000
 adapter_kwargs:
-  precompute_root: /tmp/tartanair_test
+  precompute_root: /data_cos/hdu_datasets/tartanairv1
 
 clip_len: 48
 img_size: 256

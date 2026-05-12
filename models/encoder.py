@@ -9,12 +9,7 @@ from typing import Optional, Tuple
 from functools import partial
 from pathlib import Path
 from torch.utils.checkpoint import checkpoint
-from torch.nn.attention import SDPBackend, sdpa_kernel
-
-def _is_blackwell():
-    if not torch.cuda.is_available():
-        return False
-    return torch.cuda.get_device_capability()[0] >= 10
+from .sdpa_backends import sdpa_kernel_context
 
 try:
     import timm
@@ -46,17 +41,23 @@ def canonicalize_video(video: torch.Tensor) -> torch.Tensor:
         raise ValueError(f"Expected 5D video tensor, got shape {tuple(video.shape)}")
 
     if video.shape[1] == 3:
-        return video
-    if video.shape[2] == 3:
-        return video.permute(0, 2, 1, 3, 4)
-    if video.shape[-1] == 3:
-        return video.permute(0, 4, 1, 2, 3)
+        out = video
+    elif video.shape[2] == 3:
+        out = video.permute(0, 2, 1, 3, 4)
+    elif video.shape[-1] == 3:
+        out = video.permute(0, 4, 1, 2, 3)
+    else:
+        raise ValueError(
+            "Unsupported video layout. Expected one of "
+            "(B, C, T, H, W), (B, T, C, H, W), or (B, T, H, W, C). "
+            f"Got shape {tuple(video.shape)}"
+        )
 
-    raise ValueError(
-        "Unsupported video layout. Expected one of "
-        "(B, C, T, H, W), (B, T, C, H, W), or (B, T, H, W, C). "
-        f"Got shape {tuple(video.shape)}"
-    )
+    if out.dtype == torch.uint8:
+        return out.float().div_(255.0)
+    if not out.is_floating_point():
+        return out.float()
+    return out
 
 
 def canonicalize_aspect_ratio(aspect_ratio: torch.Tensor) -> torch.Tensor:
@@ -259,15 +260,9 @@ class EfficientAttention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, heads, N, head_dim)
         q, k, v = qkv.unbind(0)
 
-        # Use PyTorch's efficient attention (FlashAttention when available)
-        # On Blackwell (sm_103+) cuDNN frontend fails; fall back to math backend
-        if _is_blackwell():
-            with sdpa_kernel(SDPBackend.MATH):
-                x = F.scaled_dot_product_attention(
-                    q, k, v,
-                    dropout_p=self.attn_drop if self.training else 0.0
-                )
-        else:
+        # Use PyTorch's efficient attention. On Blackwell, avoid cuDNN SDPA
+        # execution-plan failures while keeping FlashAttention enabled.
+        with sdpa_kernel_context(q):
             x = F.scaled_dot_product_attention(
                 q, k, v,
                 dropout_p=self.attn_drop if self.training else 0.0

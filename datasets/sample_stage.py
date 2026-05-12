@@ -38,17 +38,21 @@ class SampleStageConfig:
     backend: str
     stage_root: str
     sdk_workers: int = 8
+    request_timeout_s: float = 20.0
+    request_retries: int = 1
     cache_max_bytes: int = 100 * 1024**3
     cache_low_watermark_ratio: float = 0.9
     cache_touch_interval_s: float = 30.0
     cache_scan_interval_s: float = 30.0
-    window_radius: int = 48
+    eviction_mode: str = "background"
+    window_radius: int = 0
     mount_root: str = "/data_cos"
     bucket: str = "hd-ai-data-1251882982"
     region: str = "ap-beijing"
     passwd_file: str = "/etc/passwd-s3fs-data_cos"
     enabled_datasets: tuple[str, ...] = ()
     scene_prefetch_datasets: tuple[str, ...] = ()
+    pinned_manifest_root: str = ""
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> "SampleStageConfig":
@@ -74,10 +78,28 @@ class SampleStageConfig:
                 for item in scene_prefetch_datasets
                 if str(item).strip()
             )
+        pinned_manifest_root = str(
+            raw.get(
+                "pinned_manifest_root",
+                os.getenv("D4RT_ROLLING_WARM_READY_DIR", "")
+                or os.getenv("D4RT_ROLLING_WARM_PROGRESS_DIR", ""),
+            )
+        ).strip()
+        eviction_mode = str(
+            raw.get("eviction_mode", raw.get("cache_eviction_mode", "background"))
+        ).strip().lower()
+        if eviction_mode in {"", "on", "true", "1"}:
+            eviction_mode = "background"
+        elif eviction_mode in {"off", "none", "disable"}:
+            eviction_mode = "disabled"
+        elif eviction_mode not in {"background", "external", "disabled"}:
+            eviction_mode = "background"
         return cls(
             backend=str(raw.get("backend", "")).strip().lower(),
             stage_root=str(raw.get("stage_root", "")).strip(),
             sdk_workers=max(1, int(raw.get("sdk_workers", 8))),
+            request_timeout_s=max(1.0, float(raw.get("request_timeout_s", 20.0))),
+            request_retries=max(0, int(raw.get("request_retries", 1))),
             cache_max_bytes=max(0, int(raw.get("cache_max_bytes", 100 * 1024**3))),
             cache_low_watermark_ratio=min(
                 0.99,
@@ -89,13 +111,15 @@ class SampleStageConfig:
             cache_scan_interval_s=max(
                 1.0, float(raw.get("cache_scan_interval_s", 30.0))
             ),
-            window_radius=max(0, int(raw.get("window_radius", 48))),
+            eviction_mode=eviction_mode,
+            window_radius=max(0, int(raw.get("window_radius", 0))),
             mount_root=str(raw.get("mount_root", "/data_cos")).strip(),
             bucket=str(raw.get("bucket", "hd-ai-data-1251882982")).strip(),
             region=str(raw.get("region", "ap-beijing")).strip(),
             passwd_file=str(raw.get("passwd_file", "/etc/passwd-s3fs-data_cos")).strip(),
             enabled_datasets=datasets,
             scene_prefetch_datasets=scene_prefetch_datasets,
+            pinned_manifest_root=pinned_manifest_root,
         )
 
 
@@ -111,13 +135,21 @@ class SampleLocalStager:
         self.stage_root.mkdir(parents=True, exist_ok=True)
         self.cache_root = self.stage_root / "shared_raw_cache"
         self.cache_data_root = self.cache_root / "data"
-        self.lock_root = self.cache_root / "locks"
+        # The original flat lock directory can accumulate millions of lock
+        # files on long runs.  Keep new locks in a sharded v2 tree so each
+        # directory stays small and metadata lookups do not dominate staging.
+        self.lock_root = self.cache_root / "locks_v2"
         self.work_root = self.stage_root / "work"
         self.cache_data_root.mkdir(parents=True, exist_ok=True)
         self.lock_root.mkdir(parents=True, exist_ok=True)
         self.work_root.mkdir(parents=True, exist_ok=True)
+        self.cache_usage_path = self.cache_root / "cache_usage_v1.txt"
+        self.cache_usage_scan_stamp_path = self.cache_root / "cache_usage_full_scan.stamp"
+        self.cache_usage_lock_path = self.lock_root / "cache_usage.lock"
         self._tls = threading.local()
-        self._last_cache_scan_s = 0.0
+        self._last_cache_scan_s = time.time()
+        self._eviction_thread: threading.Thread | None = None
+        self._pinned_manifest_root = Path(config.pinned_manifest_root) if config.pinned_manifest_root else None
 
     def _get_client(self) -> CosS3Client:
         client = getattr(self._tls, "cos_client", None)
@@ -128,11 +160,37 @@ class SampleLocalStager:
                 SecretId=secret_id,
                 SecretKey=secret_key,
                 Scheme="https",
-                Timeout=60,
+                Timeout=max(1, int(self.config.request_timeout_s)),
             )
             client = CosS3Client(cos_config)
             self._tls.cos_client = client
         return client
+
+    def _reset_client(self) -> None:
+        self._tls.__dict__.pop("cos_client", None)
+
+    def _get_object(self, key: str, range_header: str | None = None) -> Any:
+        kwargs: dict[str, Any] = {
+            "Bucket": self.config.bucket,
+            "Key": key,
+        }
+        if range_header is not None:
+            kwargs["Range"] = range_header
+
+        last_exc: Exception | None = None
+        for attempt in range(self.config.request_retries + 1):
+            try:
+                return self._get_client().get_object(**kwargs)
+            except Exception as exc:
+                last_exc = exc
+                self._reset_client()
+                if attempt < self.config.request_retries:
+                    time.sleep(min(2.0, 0.25 * (2 ** attempt)))
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError(f"COS get_object failed unexpectedly: {key}")
 
     def supports(self, adapter: Any) -> bool:
         dataset_name = str(getattr(adapter, "dataset_name", "")).strip()
@@ -156,20 +214,37 @@ class SampleLocalStager:
             yield adapter
             return
 
+        t_stage0 = time.perf_counter()
         manifest = self._build_manifest(adapter, sequence_name, frame_indices)
         if not manifest:
             yield adapter
             return
+        t_prefetch0 = time.perf_counter()
         self._maybe_prefetch_scene(adapter, sequence_name)
+        prefetch_s = time.perf_counter() - t_prefetch0
 
-        temp_dir = Path(
-            tempfile.mkdtemp(prefix=f"sample_stage_{sample_tag}_", dir=self.work_root)
-        )
+        direct_cache_rebase = self._use_direct_cache_rebase(adapter)
+        temp_dir: Path | None = None
         try:
-            self._materialize_manifest(manifest, temp_dir)
-            staged_dataset_root = temp_dir / self._to_cos_key(Path(adapter.root))
+            t_materialize0 = time.perf_counter()
+            if direct_cache_rebase:
+                materialize_stats = self._materialize_manifest_cache_only(manifest)
+                staged_dataset_root = self.cache_data_root / Path(
+                    self._to_cos_key(Path(adapter.root))
+                )
+            else:
+                temp_dir = Path(
+                    tempfile.mkdtemp(
+                        prefix=f"sample_stage_{sample_tag}_",
+                        dir=self.work_root,
+                    )
+                )
+                materialize_stats = self._materialize_manifest(manifest, temp_dir)
+                staged_dataset_root = temp_dir / self._to_cos_key(Path(adapter.root))
+            materialize_s = time.perf_counter() - t_materialize0
             # scannetpp: warm _scene_cache from staged files so _get_scene_data
             # reads local cameras.txt/images.txt instead of COS mount
+            depth_s = 0.0
             if str(getattr(adapter, "dataset_name", "")) == "scannetpp":
                 if sequence_name not in adapter._scene_cache:
                     old_data_root = adapter.data_root
@@ -186,11 +261,34 @@ class SampleLocalStager:
                                 adapter._scene_cache[sequence_name] = dict(sd, scene_dir=cos_scene_dir)
                             except ValueError:
                                 adapter._scene_cache.pop(sequence_name, None)
+                t_depth0 = time.perf_counter()
                 self._prepare_scannetpp_depth_stage(adapter, sequence_name, frame_indices, staged_dataset_root)
+                depth_s = time.perf_counter() - t_depth0
+            stage_ready_s = time.perf_counter() - t_stage0
+            slow_threshold = float(os.environ.get("D4RT_SAMPLE_STAGE_SLOW_THRESHOLD_S", "10.0"))
+            profile_enabled = os.environ.get("D4RT_SAMPLE_STAGE_PROFILE", "").strip().lower() in {
+                "1", "true", "yes", "on"
+            }
+            if profile_enabled or stage_ready_s >= slow_threshold:
+                dataset_name = str(getattr(adapter, "dataset_name", ""))
+                print(
+                    f"[SampleStageProfile] dataset={dataset_name} seq={sequence_name} "
+                    f"frames={len(frame_indices)} total={stage_ready_s:.3f}s "
+                    f"prefetch={prefetch_s:.3f}s materialize={materialize_s:.3f}s "
+                    f"depth={depth_s:.3f}s files={len(manifest)} "
+                    f"cold={materialize_stats.get('cold_files', 0)} "
+                    f"file_max={materialize_stats.get('file_max_s', 0.0):.3f}s "
+                    f"file_sum={materialize_stats.get('file_sum_s', 0.0):.3f}s "
+                    f"sdk_workers={self.config.sdk_workers} "
+                    f"timeout={self.config.request_timeout_s:.1f}s "
+                    f"retries={self.config.request_retries}",
+                    flush=True,
+                )
             with self._rebase_adapter(adapter, sequence_name, staged_dataset_root):
                 yield adapter
         finally:
-            shutil.rmtree(temp_dir, ignore_errors=True)
+            if temp_dir is not None:
+                shutil.rmtree(temp_dir, ignore_errors=True)
 
     def _build_manifest(
         self,
@@ -218,6 +316,8 @@ class SampleLocalStager:
             return self._manifest_mvssynth(adapter, sequence_name, manifest_frame_indices)
         if dataset_name == "scannet":
             return self._manifest_scannet(adapter, sequence_name, manifest_frame_indices)
+        if dataset_name == "tartanair":
+            return self._manifest_tartanair(adapter, sequence_name, manifest_frame_indices)
         return []
 
     def _expand_frame_indices(
@@ -293,12 +393,28 @@ class SampleLocalStager:
     ) -> list[Path]:
         record = adapter._get_record(sequence_name)
         paths: list[Path] = []
+        rgb_from_trajectory = bool(getattr(adapter, "rgb_from_trajectory", False))
+        prefer_trajectory_npz = bool(getattr(adapter, "prefer_trajectory_npz", False))
+        load_trajectories = bool(getattr(adapter, "load_trajectories", False))
+        skip_depth_when_tracks = bool(getattr(adapter, "skip_depth_when_tracks", False))
+        has_record_tracks = bool(getattr(record, "has_trajectories", False))
+        use_track_files = load_trajectories and has_record_tracks
+        load_depths = not (use_track_files and skip_depth_when_tracks)
         for idx in frame_indices:
-            paths.append(adapter.split_root / record.image_rel_paths[idx])
-            paths.append(adapter.split_root / record.depth_rel_paths[idx])
             traj_rel = record.traj_rel_paths[idx]
+            use_traj_npz = bool(prefer_trajectory_npz and use_track_files and traj_rel is not None)
+            if not (
+                rgb_from_trajectory
+                and use_track_files
+                and traj_rel is not None
+                and not use_traj_npz
+            ):
+                paths.append(adapter.split_root / record.image_rel_paths[idx])
+            if load_depths:
+                paths.append(adapter.split_root / record.depth_rel_paths[idx])
             if traj_rel is not None:
-                paths.append(adapter.split_root / traj_rel)
+                traj_path = adapter.split_root / traj_rel
+                paths.append(traj_path.with_suffix(".npz") if use_traj_npz else traj_path)
         return self._dedupe_keep_order(paths)
 
     def _manifest_scannet(
@@ -326,15 +442,62 @@ class SampleLocalStager:
         scene_dir = adapter.data_root / sequence_name
         colmap_dir = scene_dir / "iphone" / "colmap"
         frames_dir = scene_dir / "iphone" / "frames"
-        paths: list[Path] = [
-            colmap_dir / "cameras.txt",
-            colmap_dir / "images.txt",
-            scene_dir / "iphone" / "pose_intrinsic_imu.json",
-            scene_dir / "precomputed.h5",
-        ]
-        paths += [frames_dir / f"{i:06d}.jpg" for i in frame_indices]
+        rgb_mode = str(
+            getattr(
+                adapter,
+                "rgb_read_mode",
+                os.getenv("SCANNETPP_RGB_READ_MODE", "auto"),
+            )
+            or "auto"
+        ).strip().lower()
+        if rgb_mode in {"cache256", "decoded_cache", "rgb_cache"}:
+            rgb_mode = "cache"
+        frame_index_path = scene_dir / "iphone" / "frame_index.pkl"
+        if self._has_cached_or_source(frame_index_path):
+            paths: list[Path] = [frame_index_path]
+        else:
+            paths = [
+                colmap_dir / "cameras.txt",
+                colmap_dir / "images.txt",
+                scene_dir / "iphone" / "pose_intrinsic_imu.json",
+            ]
+        if rgb_mode == "cache" and getattr(adapter, "target_hw", None) is not None:
+            from datasets.adapters.scannetpp import rgb_cache_frame_path
+
+            target_hw = tuple(int(v) for v in adapter.target_hw)
+            cache_paths = [
+                rgb_cache_frame_path(scene_dir, target_hw, i)
+                for i in frame_indices
+            ]
+            missing_cache_paths = [
+                path for path in cache_paths if not self._has_cached_or_source(path)
+            ]
+            if missing_cache_paths:
+                examples = ", ".join(
+                    str(path.relative_to(scene_dir)) for path in missing_cache_paths[:5]
+                )
+                more = "" if len(missing_cache_paths) <= 5 else f", ... (+{len(missing_cache_paths) - 5} more)"
+                raise FileNotFoundError(
+                    "ScanNet++ RGB cache mode requires predecoded frame cache; "
+                    f"refusing to stage full iphone/rgb.mkv for sample "
+                    f"sequence={sequence_name!r} target_hw={target_hw}. "
+                    f"Missing cache frames: {examples}{more}. "
+                    "Pre-generate the ScanNet++ RGB frame cache or use "
+                    "SCANNETPP_RGB_READ_MODE=video/frames/auto."
+                )
+            paths += cache_paths
+        elif rgb_mode == "cache":
+            raise ValueError(
+                "ScanNet++ RGB cache mode requires adapter.target_hw so the "
+                "frame cache directory can be resolved; refusing to stage "
+                f"full iphone/rgb.mkv for sample sequence={sequence_name!r}."
+            )
+        elif rgb_mode == "video":
+            paths.append(scene_dir / "iphone" / "rgb.mkv")
+        else:
+            paths += [frames_dir / f"{i:06d}.jpg" for i in frame_indices]
         # depth.bin fetched via Range requests — not in manifest
-        # precomputed.h5 read directly from COS mount via h5py chunked access
+        # precomputed.h5 stays on the original mount and is read via COS Range.
         return self._dedupe_keep_order(paths)
 
     def _prepare_scannetpp_depth_stage(
@@ -365,26 +528,72 @@ class SampleLocalStager:
         frame_indices: list[int],
     ) -> None:
         """Fetch only needed depth frames via COS Range requests and write a minimal depth.bin."""
-        import pickle, lz4.block, struct
+        import pickle, struct
         from concurrent.futures import ThreadPoolExecutor
 
         rel_key = self._to_cos_key(original_scene_dir)
         depth_key = f"{rel_key}/iphone/depth.bin"
-        index_key = f"{rel_key}/iphone/depth_chunk_index.pkl"
 
-        # download chunk index (~100KB)
-        resp = self._get_client().get_object(Bucket=self.config.bucket, Key=index_key)
-        chunk_offsets: list[tuple[int, int]] = pickle.loads(resp["Body"].get_raw_stream().read())
+        # Cache chunk index locally; it is small but used for every ScanNet++ sample.
+        for attempt in range(2):
+            index_cache_path = self._ensure_cached(
+                original_scene_dir / "iphone" / "depth_chunk_index.pkl"
+            )
+            try:
+                chunk_offsets: list[tuple[int, int]] = pickle.loads(index_cache_path.read_bytes())
+                break
+            except (FileNotFoundError, EOFError, pickle.UnpicklingError):
+                try:
+                    index_cache_path.unlink()
+                except OSError:
+                    pass
+                if attempt == 0:
+                    continue
+                raise
 
         needed = sorted(set(frame_indices))
 
         def fetch_chunk(fi: int) -> tuple[int, bytes]:
             offset, chunk_size = chunk_offsets[fi]
-            range_header = f"bytes={offset}-{offset + chunk_size - 1}"
-            r = self._get_client().get_object(Bucket=self.config.bucket, Key=depth_key, Range=range_header)
-            return fi, r["Body"].get_raw_stream().read()
+            chunk_cache_path = (
+                self.cache_data_root
+                / Path(f"{depth_key}.chunks")
+                / f"{fi:08d}.bin"
+            )
+            if chunk_cache_path.is_file():
+                self._touch_cache_entry(chunk_cache_path)
+                try:
+                    return fi, chunk_cache_path.read_bytes()
+                except FileNotFoundError:
+                    pass
 
-        with ThreadPoolExecutor(max_workers=min(16, len(needed))) as ex:
+            lock_key = Path(f"{depth_key}.chunks") / f"{fi:08d}.lock"
+            with self._path_lock(lock_key):
+                if chunk_cache_path.is_file():
+                    self._touch_cache_entry(chunk_cache_path)
+                    try:
+                        return fi, chunk_cache_path.read_bytes()
+                    except FileNotFoundError:
+                        pass
+
+                chunk_cache_path.parent.mkdir(parents=True, exist_ok=True)
+                tmp_path = chunk_cache_path.with_name(
+                    f".{chunk_cache_path.name}.part.{os.getpid()}.{threading.get_ident()}"
+                )
+                try:
+                    range_header = f"bytes={offset}-{offset + chunk_size - 1}"
+                    r = self._get_object(depth_key, range_header=range_header)
+                    raw = r["Body"].get_raw_stream().read()
+                    with open(tmp_path, "wb") as f:
+                        f.write(raw)
+                    os.replace(tmp_path, chunk_cache_path)
+                finally:
+                    tmp_path.unlink(missing_ok=True)
+                self._touch_cache_entry(chunk_cache_path, force=True)
+                self._maybe_evict_cache()
+                return fi, raw
+
+        with ThreadPoolExecutor(max_workers=min(self.config.sdk_workers, len(needed))) as ex:
             chunks = dict(ex.map(lambda fi: fetch_chunk(fi), needed))
 
         # write a minimal depth.bin with only the needed frames (re-indexed 0..N-1)
@@ -454,6 +663,31 @@ class SampleLocalStager:
         # requested frames without downloading the whole sequence cache.
         return self._dedupe_keep_order(paths)
 
+    def _manifest_tartanair(
+        self,
+        adapter: Any,
+        sequence_name: str,
+        frame_indices: list[int],
+    ) -> list[Path]:
+        seq_dir = adapter.seq_to_dir[sequence_name]
+        image_dir = seq_dir / f"image_{adapter.camera}"
+        depth_dir = seq_dir / f"depth_{adapter.camera}"
+        paths: list[Path] = [seq_dir / f"pose_{adapter.camera}.txt"]
+        for idx in frame_indices:
+            paths.append(image_dir / f"{idx:06d}_{adapter.camera}.png")
+            paths.append(depth_dir / f"{idx:06d}_{adapter.camera}_depth.npy")
+
+        precompute_root = getattr(adapter, "precompute_root", None)
+        if precompute_root is not None:
+            precompute_dir = Path(precompute_root) / sequence_name
+            for precomputed_path in (
+                precompute_dir / "precomputed.h5",
+                precompute_dir / "precomputed.npz",
+            ):
+                if self._has_cached_or_source(precomputed_path):
+                    paths.append(precomputed_path)
+        return self._dedupe_keep_order(paths)
+
     @staticmethod
     def _dedupe_keep_order(paths: list[Path]) -> list[Path]:
         out: list[Path] = []
@@ -472,17 +706,84 @@ class SampleLocalStager:
             rel_path = path.resolve().relative_to(self.mount_root)
         return str(rel_path).replace(os.sep, "/")
 
-    def _materialize_manifest(self, manifest: list[Path], temp_dir: Path) -> None:
+    def _has_cached_or_source(self, path: Path) -> bool:
+        rel_key = Path(self._to_cos_key(path))
+        if (self.cache_data_root / rel_key).is_file():
+            return True
+        try:
+            return Path(path).is_file()
+        except OSError:
+            return False
+
+    def _materialize_manifest(self, manifest: list[Path], temp_dir: Path) -> dict[str, float | int]:
+        stats: dict[str, float | int] = {
+            "cold_files": 0,
+            "file_max_s": 0.0,
+            "file_sum_s": 0.0,
+        }
+        stats_lock = threading.Lock()
+
         def stage_one(src_path: Path) -> None:
             rel_key = Path(self._to_cos_key(src_path))
             dst = temp_dir / rel_key
             dst.parent.mkdir(parents=True, exist_ok=True)
+            cache_path = self.cache_data_root / rel_key
+            cold = not cache_path.is_file()
+            t0 = time.perf_counter()
             self._link_cached_file(src_path, dst)
+            elapsed = time.perf_counter() - t0
+            with stats_lock:
+                stats["file_sum_s"] = float(stats["file_sum_s"]) + elapsed
+                stats["file_max_s"] = max(float(stats["file_max_s"]), elapsed)
+                if cold:
+                    stats["cold_files"] = int(stats["cold_files"]) + 1
 
         with ThreadPoolExecutor(max_workers=self.config.sdk_workers) as executor:
             futures = [executor.submit(stage_one, path) for path in manifest]
             for future in as_completed(futures):
                 future.result()
+        return stats
+
+    def _materialize_manifest_cache_only(
+        self,
+        manifest: list[Path],
+    ) -> dict[str, float | int]:
+        stats: dict[str, float | int] = {
+            "cold_files": 0,
+            "file_max_s": 0.0,
+            "file_sum_s": 0.0,
+        }
+        stats_lock = threading.Lock()
+
+        def stage_one(src_path: Path) -> None:
+            rel_key = Path(self._to_cos_key(src_path))
+            cache_path = self.cache_data_root / rel_key
+            cold = not cache_path.is_file()
+            t0 = time.perf_counter()
+            self._ensure_cached(src_path)
+            elapsed = time.perf_counter() - t0
+            with stats_lock:
+                stats["file_sum_s"] = float(stats["file_sum_s"]) + elapsed
+                stats["file_max_s"] = max(float(stats["file_max_s"]), elapsed)
+                if cold:
+                    stats["cold_files"] = int(stats["cold_files"]) + 1
+
+        with ThreadPoolExecutor(max_workers=self.config.sdk_workers) as executor:
+            futures = [executor.submit(stage_one, path) for path in manifest]
+            for future in as_completed(futures):
+                future.result()
+        return stats
+
+    def _use_direct_cache_rebase(self, adapter: Any) -> bool:
+        enabled = os.environ.get(
+            "D4RT_SAMPLE_STAGE_DIRECT_CACHE_REBASE", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        if not enabled:
+            return False
+        dataset_name = str(getattr(adapter, "dataset_name", "")).strip()
+        # ScanNet++ still needs a per-sample temporary depth.bin with remapped
+        # chunk indices. Other staged datasets only read immutable raw files.
+        return dataset_name in {"dynamic_replica", "co3dv2", "blendedmvs", "kubric", "pointodyssey", "tartanair"}
 
     def _maybe_prefetch_scene(self, adapter: Any, sequence_name: str) -> None:
         dataset_name = str(getattr(adapter, "dataset_name", "")).strip()
@@ -558,27 +859,64 @@ class SampleLocalStager:
         src_path = Path(src_path)
         rel_key = Path(self._to_cos_key(src_path))
         cache_path = self.cache_data_root / rel_key
+        total_t0 = time.perf_counter()
         if cache_path.is_file():
             self._touch_cache_entry(cache_path)
             return cache_path
 
         cache_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_wait_s = 0.0
+        download_s = 0.0
+        downloaded = False
+        lock_t0 = time.perf_counter()
         with self._path_lock(rel_key):
+            lock_wait_s = time.perf_counter() - lock_t0
             if cache_path.is_file():
                 self._touch_cache_entry(cache_path)
+                total_s = time.perf_counter() - total_t0
+                slow_s = float(os.environ.get("D4RT_SAMPLE_STAGE_SLOW_ENSURE_S", "8.0"))
+                if total_s >= slow_s:
+                    try:
+                        size = cache_path.stat().st_size
+                    except OSError:
+                        size = 0
+                    print(
+                        f"[SampleStageEnsureSlow] key={rel_key.as_posix()} "
+                        f"total={total_s:.3f}s lock_wait={lock_wait_s:.3f}s "
+                        f"download=0.000s downloaded=0 size={size} "
+                        f"timeout={self.config.request_timeout_s:.1f}s "
+                        f"retries={self.config.request_retries}",
+                        flush=True,
+                    )
                 return cache_path
+            download_t0 = time.perf_counter()
             self._download_to_cache(src_path, cache_path, rel_key)
+            download_s = time.perf_counter() - download_t0
+            downloaded = True
         self._touch_cache_entry(cache_path, force=True)
         self._maybe_evict_cache()
+        total_s = time.perf_counter() - total_t0
+        slow_s = float(os.environ.get("D4RT_SAMPLE_STAGE_SLOW_ENSURE_S", "8.0"))
+        if total_s >= slow_s:
+            try:
+                size = cache_path.stat().st_size
+            except OSError:
+                size = 0
+            print(
+                f"[SampleStageEnsureSlow] key={rel_key.as_posix()} "
+                f"total={total_s:.3f}s lock_wait={lock_wait_s:.3f}s "
+                f"download={download_s:.3f}s downloaded={int(downloaded)} "
+                f"size={size} timeout={self.config.request_timeout_s:.1f}s "
+                f"retries={self.config.request_retries}",
+                flush=True,
+            )
         return cache_path
 
     def _download_to_cache(self, src_path: Path, cache_path: Path, rel_key: Path) -> None:
         key = rel_key.as_posix()
         tmp_path = cache_path.with_name(f".{cache_path.name}.part.{os.getpid()}.{threading.get_ident()}")
-        response = self._get_client().get_object(
-            Bucket=self.config.bucket,
-            Key=key,
-        )
+        t0 = time.perf_counter()
+        response = self._get_object(key)
         stream = response["Body"].get_raw_stream()
         try:
             with open(tmp_path, "wb") as f:
@@ -587,10 +925,27 @@ class SampleLocalStager:
                     if not chunk:
                         break
                     f.write(chunk)
-            os.replace(tmp_path, cache_path)
+            with self._cache_usage_lock():
+                os.replace(tmp_path, cache_path)
+                accounted_bytes = self._read_cache_usage_unlocked()
+                if accounted_bytes is not None:
+                    self._write_cache_usage_unlocked(
+                        accounted_bytes + cache_path.stat().st_size
+                    )
         finally:
             if tmp_path.exists():
                 tmp_path.unlink(missing_ok=True)
+            elapsed = time.perf_counter() - t0
+            slow_s = float(os.environ.get("D4RT_SAMPLE_STAGE_SLOW_DOWNLOAD_S", "5.0"))
+            if elapsed >= slow_s:
+                size = cache_path.stat().st_size if cache_path.exists() else 0
+                print(
+                    f"[SampleStageDownloadSlow] key={key} "
+                    f"time={elapsed:.3f}s size={size} "
+                    f"timeout={self.config.request_timeout_s:.1f}s "
+                    f"retries={self.config.request_retries}",
+                    flush=True,
+                )
 
     def _touch_cache_entry(self, cache_path: Path, force: bool = False) -> None:
         interval = self.config.cache_touch_interval_s
@@ -608,10 +963,73 @@ class SampleLocalStager:
         except OSError:
             pass
 
+    def evict_cache_once(
+        self,
+        emit_log: bool = True,
+        *,
+        force_low_watermark: bool = False,
+    ) -> dict[str, float | int] | None:
+        """Run one cache eviction pass.
+
+        Normally eviction only runs above the hard cap.  ``force_low_watermark``
+        is for startup pre-cleaning: it trims to the low watermark even when the
+        cache is merely close to the cap, so training does not pay that cost in
+        the first few hundred batches.
+        """
+        max_bytes = self.config.cache_max_bytes
+        if max_bytes <= 0:
+            return None
+
+        eviction_lock = self.lock_root / "eviction.lock"
+        try:
+            if time.time() - eviction_lock.stat().st_mtime < self.config.cache_scan_interval_s:
+                return None
+        except OSError:
+            pass
+
+        with open(eviction_lock, "a+b") as lock_f:
+            try:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                return None
+            try:
+                started = time.perf_counter()
+                try:
+                    if time.time() - eviction_lock.stat().st_mtime < self.config.cache_scan_interval_s:
+                        return None
+                except OSError:
+                    pass
+                stats = self._evict_cache_locked(
+                    force_low_watermark=force_low_watermark
+                )
+                os.utime(eviction_lock, None)
+                elapsed = time.perf_counter() - started
+                slow_s = float(os.environ.get("D4RT_SAMPLE_STAGE_SLOW_EVICT_S", "2.0"))
+                if emit_log and elapsed >= slow_s:
+                    print(
+                        f"[SampleStageEvictSlow] elapsed={elapsed:.3f}s "
+                        f"force_low_watermark={int(force_low_watermark)} "
+                        f"max_bytes={self.config.cache_max_bytes} "
+                        f"low_watermark={self.config.cache_low_watermark_ratio:.3f} "
+                        f"files={stats['files']} "
+                        f"total_before={stats['total_before']} "
+                        f"total_after={stats['total_after']} "
+                        f"deleted_files={stats['deleted_files']} "
+                        f"deleted_bytes={stats['deleted_bytes']} "
+                        f"scan={stats['scan_s']:.3f}s "
+                        f"delete={stats['delete_s']:.3f}s",
+                        flush=True,
+                    )
+                return stats
+            finally:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+
     @contextlib.contextmanager
     def _path_lock(self, rel_key: Path) -> Iterator[None]:
         digest = hashlib.sha1(rel_key.as_posix().encode("utf-8")).hexdigest()
-        lock_path = self.lock_root / f"{digest}.lock"
+        lock_dir = self.lock_root / digest[:2] / digest[2:4]
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / f"{digest}.lock"
         with open(lock_path, "a+b") as lock_f:
             fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
             try:
@@ -619,7 +1037,77 @@ class SampleLocalStager:
             finally:
                 fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
 
+    @contextlib.contextmanager
+    def _cache_usage_lock(self) -> Iterator[None]:
+        self.cache_usage_lock_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(self.cache_usage_lock_path, "a+b") as lock_f:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+
+    def _read_cache_usage_unlocked(self) -> int | None:
+        try:
+            raw = self.cache_usage_path.read_text(encoding="utf-8").strip().split()
+        except OSError:
+            return None
+        if not raw:
+            return None
+        try:
+            value = int(raw[0])
+        except (TypeError, ValueError):
+            return None
+        return value if value >= 0 else None
+
+    def _write_cache_usage_unlocked(self, total_bytes: int) -> None:
+        tmp_path = self.cache_usage_path.with_name(
+            f".{self.cache_usage_path.name}.part.{os.getpid()}.{threading.get_ident()}"
+        )
+        try:
+            tmp_path.write_text(
+                f"{max(0, int(total_bytes))} {time.time():.6f}\n",
+                encoding="utf-8",
+            )
+            os.replace(tmp_path, self.cache_usage_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
+    def _adjust_cache_usage(self, delta_bytes: int) -> None:
+        if delta_bytes == 0:
+            return
+        with self._cache_usage_lock():
+            current = self._read_cache_usage_unlocked()
+            if current is None:
+                # Existing caches from older runs are calibrated by the janitor's
+                # next full scan. Avoid creating a misleading partial counter.
+                return
+            self._write_cache_usage_unlocked(max(0, current + int(delta_bytes)))
+
+    def _usage_full_rescan_due_unlocked(self) -> bool:
+        try:
+            interval_s = float(
+                os.environ.get("D4RT_SAMPLE_STAGE_USAGE_FULL_RESCAN_INTERVAL_S", "600")
+            )
+        except ValueError:
+            interval_s = 600.0
+        if interval_s <= 0:
+            return True
+        try:
+            return time.time() - self.cache_usage_scan_stamp_path.stat().st_mtime >= interval_s
+        except OSError:
+            return True
+
+    def _mark_usage_full_rescan_unlocked(self) -> None:
+        try:
+            self.cache_usage_scan_stamp_path.parent.mkdir(parents=True, exist_ok=True)
+            self.cache_usage_scan_stamp_path.touch()
+        except OSError:
+            pass
+
     def _maybe_evict_cache(self) -> None:
+        if self.config.eviction_mode != "background":
+            return
         max_bytes = self.config.cache_max_bytes
         if max_bytes <= 0:
             return
@@ -627,50 +1115,197 @@ class SampleLocalStager:
         now = time.time()
         if now - self._last_cache_scan_s < self.config.cache_scan_interval_s:
             return
+        self._last_cache_scan_s = now
 
         eviction_lock = self.lock_root / "eviction.lock"
-        with open(eviction_lock, "a+b") as lock_f:
-            try:
-                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
+        try:
+            if now - eviction_lock.stat().st_mtime < self.config.cache_scan_interval_s:
                 return
-            try:
-                self._last_cache_scan_s = now
-                self._evict_cache_locked()
-            finally:
-                fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+        except OSError:
+            pass
 
-    def _evict_cache_locked(self) -> None:
-        entries: list[tuple[float, int, Path]] = []
-        total_bytes = 0
-        for path in self.cache_data_root.rglob("*"):
-            if not path.is_file():
-                continue
-            if path.name.startswith(".") or ".part." in path.name:
-                continue
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            total_bytes += stat.st_size
-            entries.append((stat.st_mtime, stat.st_size, path))
-
-        if total_bytes <= self.config.cache_max_bytes:
+        thread = self._eviction_thread
+        if thread is not None and thread.is_alive():
             return
 
-        target_bytes = int(self.config.cache_max_bytes * self.config.cache_low_watermark_ratio)
+        def evict_in_background() -> None:
+            self.evict_cache_once(emit_log=True)
+
+        self._eviction_thread = threading.Thread(
+            target=evict_in_background,
+            name="SampleStageEvict",
+            daemon=True,
+        )
+        self._eviction_thread.start()
+
+    def _evict_cache_locked(
+        self,
+        *,
+        force_low_watermark: bool = False,
+    ) -> dict[str, float | int]:
+        with self._cache_usage_lock():
+            accounted_bytes = self._read_cache_usage_unlocked()
+            full_rescan_due = self._usage_full_rescan_due_unlocked()
+            if (
+                not force_low_watermark
+                and
+                accounted_bytes is not None
+                and accounted_bytes <= self.config.cache_max_bytes
+                and not full_rescan_due
+            ):
+                return {
+                    "files": -1,
+                    "total_before": accounted_bytes,
+                    "total_after": accounted_bytes,
+                    "deleted_files": 0,
+                    "deleted_bytes": 0,
+                    "scan_s": 0.0,
+                    "delete_s": 0.0,
+                }
+            return self._evict_cache_scan_locked(
+                force_low_watermark=force_low_watermark
+            )
+
+    def _evict_cache_scan_locked(
+        self,
+        *,
+        force_low_watermark: bool = False,
+    ) -> dict[str, float | int]:
+        entries: list[tuple[float, int, str]] = []
+        total_bytes = 0
+        scan_t0 = time.perf_counter()
+        cache_root_str = os.fspath(self.cache_data_root)
+        pinned_paths = self._load_pinned_manifest_paths()
+        pinned_dirs = tuple(
+            path for path in pinned_paths if path.endswith(os.sep)
+        )
+        pinned_exact = (
+            pinned_paths - set(pinned_dirs) if pinned_dirs else pinned_paths
+        )
+        for dirpath, _, filenames in os.walk(cache_root_str):
+            for name in filenames:
+                if name.startswith(".") or ".part." in name:
+                    continue
+                path_str = os.path.join(dirpath, name)
+                try:
+                    stat = os.stat(path_str, follow_symlinks=False)
+                except OSError:
+                    continue
+                total_bytes += stat.st_size
+                abs_path = os.path.abspath(path_str)
+                if abs_path in pinned_exact or (
+                    pinned_dirs and abs_path.startswith(pinned_dirs)
+                ):
+                    continue
+                if name == "frame_index.pkl" and self._is_persistent_sidecar_str(
+                    path_str, cache_root_str
+                ):
+                    continue
+                entries.append((stat.st_mtime, stat.st_size, path_str))
+        scan_s = time.perf_counter() - scan_t0
+
+        stats: dict[str, float | int] = {
+            "files": len(entries),
+            "total_before": total_bytes,
+            "total_after": total_bytes,
+            "deleted_files": 0,
+            "deleted_bytes": 0,
+            "scan_s": scan_s,
+            "delete_s": 0.0,
+        }
+
+        target_bytes = int(
+            self.config.cache_max_bytes * self.config.cache_low_watermark_ratio
+        )
+        if total_bytes <= self.config.cache_max_bytes and (
+            not force_low_watermark or total_bytes <= target_bytes
+        ):
+            self._write_cache_usage_unlocked(total_bytes)
+            self._mark_usage_full_rescan_unlocked()
+            return stats
+
         entries.sort(key=lambda item: item[0])
-        for _, size, path in entries:
+        delete_t0 = time.perf_counter()
+        for _, size, path_str in entries:
             if total_bytes <= target_bytes:
                 break
+            path = Path(path_str)
             self._invalidate_scene_marker_for_path(path)
             try:
-                path.unlink()
+                os.unlink(path_str)
             except FileNotFoundError:
                 continue
             except OSError:
                 continue
             total_bytes -= size
+            stats["deleted_files"] = int(stats["deleted_files"]) + 1
+            stats["deleted_bytes"] = int(stats["deleted_bytes"]) + size
+        stats["total_after"] = total_bytes
+        stats["delete_s"] = time.perf_counter() - delete_t0
+        self._write_cache_usage_unlocked(total_bytes)
+        self._mark_usage_full_rescan_unlocked()
+        return stats
+
+    def _load_pinned_manifest_paths(self) -> set[str]:
+        root = self._pinned_manifest_root
+        if root is None:
+            return set()
+        try:
+            generation_dirs = sorted(
+                (p for p in root.glob("g*") if p.is_dir()),
+                key=lambda p: p.name,
+                reverse=True,
+            )
+        except OSError:
+            return set()
+        pinned: set[str] = set()
+        for gen_dir in generation_dirs[:2]:
+            try:
+                manifests = sorted(gen_dir.glob("block_*.manifest"))
+            except OSError:
+                continue
+            for manifest in manifests:
+                try:
+                    for raw in manifest.read_text(encoding="utf-8").splitlines():
+                        line = raw.strip()
+                        if line:
+                            is_dir = line.endswith("/")
+                            abs_line = os.path.abspath(line)
+                            if is_dir:
+                                abs_line = abs_line.rstrip(os.sep) + os.sep
+                            pinned.add(abs_line)
+                except OSError:
+                    continue
+        return pinned
+
+    def _is_persistent_sidecar_str(self, cache_path: str, cache_root: str) -> bool:
+        """Fast string variant for hot eviction scans."""
+        try:
+            rel_path = os.path.relpath(cache_path, cache_root)
+        except ValueError:
+            return False
+        rel_parts = rel_path.split(os.sep)
+        return (
+            len(rel_parts) >= 6
+            and rel_parts[0] == "hdu_datasets"
+            and rel_parts[1] == "scannetpp"
+            and rel_parts[2] == "data"
+            and rel_parts[-2:] == ["iphone", "frame_index.pkl"]
+        )
+
+    def _is_persistent_sidecar(self, cache_path: Path) -> bool:
+        """Keep generated metadata sidecars that avoid expensive COS reads."""
+        try:
+            rel_parts = cache_path.relative_to(self.cache_data_root).parts
+        except ValueError:
+            return False
+        return (
+            len(rel_parts) >= 6
+            and rel_parts[0] == "hdu_datasets"
+            and rel_parts[1] == "scannetpp"
+            and rel_parts[2] == "data"
+            and rel_parts[-2:] == ("iphone", "frame_index.pkl")
+        )
 
     def _invalidate_scene_marker_for_path(self, cache_path: Path) -> None:
         try:
@@ -816,8 +1451,28 @@ class SampleLocalStager:
             old_scene_cache = adapter._scene_cache.get(sequence_name)
             if old_scene_cache is not None:
                 new_scene_data = dict(old_scene_cache)
-                new_scene_data["scene_dir"] = staged_dataset_root / old_scene_cache["scene_dir"].relative_to(old_data_root)
-                new_scene_data["_precomputed_dir"] = new_scene_data["scene_dir"]
+                old_precomputed_dir = old_scene_cache.get(
+                    "_precomputed_dir", old_scene_cache["scene_dir"]
+                )
+                local_precomputed_dir = self._local_precomputed_dir(
+                    old_precomputed_dir,
+                    old_data_root,
+                    staged_dataset_root,
+                )
+                new_scene_data["scene_dir"] = (
+                    staged_dataset_root
+                    / old_scene_cache["scene_dir"].relative_to(old_data_root)
+                )
+                local_h5 = local_precomputed_dir / adapter.precomputed_name
+                local_h5 = local_h5.with_suffix(".h5")
+                local_index = adapter._precomputed_h5_chunk_index_path(
+                    local_precomputed_dir
+                )
+                if local_h5.is_file() and local_index.is_file():
+                    new_scene_data["_precomputed_dir"] = local_precomputed_dir
+                    new_scene_data["_precomputed_index_dir"] = local_precomputed_dir
+                else:
+                    new_scene_data["_precomputed_dir"] = old_precomputed_dir
                 # _staged_depth_map set by _prepare_scannetpp_depth_stage in stage_sample
                 staged_depth_map = getattr(adapter, "_staged_depth_map_tmp", None)
                 if staged_depth_map is not None:
@@ -927,7 +1582,45 @@ class SampleLocalStager:
                 adapter._name_to_record[sequence_name] = old_record
             return
 
+        if dataset_name == "tartanair":
+            old_root = adapter.root
+            old_precompute_root = adapter.precompute_root
+            old_seq_dir = adapter.seq_to_dir[sequence_name]
+            new_seq_dir = staged_dataset_root / old_seq_dir.relative_to(old_root)
+            adapter.root = staged_dataset_root
+            adapter.seq_to_dir[sequence_name] = new_seq_dir
+            if old_precompute_root is not None:
+                try:
+                    adapter.precompute_root = (
+                        staged_dataset_root / old_precompute_root.relative_to(old_root)
+                    )
+                except ValueError:
+                    adapter.precompute_root = old_precompute_root
+            try:
+                yield
+            finally:
+                adapter.root = old_root
+                adapter.precompute_root = old_precompute_root
+                adapter.seq_to_dir[sequence_name] = old_seq_dir
+            return
+
         yield
+
+    def _local_precomputed_dir(
+        self,
+        old_precomputed_dir: Path,
+        old_data_root: Path,
+        staged_dataset_root: Path,
+    ) -> Path:
+        try:
+            cache_dir = self.cache_data_root / Path(self._to_cos_key(old_precomputed_dir))
+            local_h5 = cache_dir / "precomputed.h5"
+            local_index = cache_dir / "precomputed.h5_chunk_index.pkl"
+            if local_h5.is_file() and local_index.is_file():
+                return cache_dir
+        except Exception:
+            pass
+        return staged_dataset_root / old_precomputed_dir.relative_to(old_data_root)
 
     @staticmethod
     def _pointodyssey_stage_anno_h5(record: Any) -> bool:

@@ -26,6 +26,37 @@ from datasets.mixture import MixtureDataset
 from datasets.planned_dataset import PlannedMixtureDataset
 
 
+def _resolve_keep_cropped_images(config: dict) -> bool:
+    explicit = config.get("keep_cropped_images", None)
+    if explicit is not None:
+        return bool(explicit)
+
+    precompute_patches = bool(config.get("precompute_patches", True))
+    precompute_from_highres = bool(config.get("precompute_from_highres", False))
+    return_highres = config.get("return_highres_video", None)
+
+    if precompute_patches and precompute_from_highres:
+        return True
+    if return_highres is not None:
+        return bool(return_highres)
+    return not precompute_patches
+
+
+def _resolve_max_track_points(config: dict):
+    explicit = config.get("max_track_points", None)
+    if explicit is not None:
+        value = int(explicit)
+        return value if value > 0 else None
+    raw = os.getenv("D4RT_MAX_TRACK_POINTS", "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 def create_training_dataset(
     config: dict,
     split: str = 'train',
@@ -120,12 +151,20 @@ def _create_single_dataset(config: dict, split: str, rank: int = 0, world_size: 
         num_queries=config.get('num_queries', 2048),
         boundary_ratio=config.get('boundary_ratio', 0.3),
         t_tgt_eq_t_cam_ratio=config.get('t_tgt_eq_t_cam_ratio', 0.4),
+        use_motion_boundaries=config.get('use_motion_boundaries', True),
         seed=config.get('seed', 42),
         sampling_mode=config.get('sampling_mode', 'stride'),
         epoch_size=config.get('epoch_size', 10000),
         precompute_patches=config.get('precompute_patches', True),
         precompute_from_highres=config.get('precompute_from_highres', False),
+        return_highres_video=config.get('return_highres_video', None),
         allow_track_fallback=config.get('allow_track_fallback', False),
+        store_video_uint8=config.get('store_video_uint8', False),
+        store_auxiliary_tensors=config.get('store_auxiliary_tensors', True),
+        keep_cropped_images=_resolve_keep_cropped_images(config),
+        color_aug_after_resize=config.get('color_aug_after_resize', False),
+        motion_boundary_on_resized=config.get('motion_boundary_on_resized', True),
+        max_track_points=_resolve_max_track_points(config),
         reshuffle_each_epoch=config.get('reshuffle_each_epoch', split == 'train'),
     )
 
@@ -169,6 +208,7 @@ def _create_scene_dataset(config: dict, split: str, rank: int = 0, world_size: i
         num_queries=config.get('num_queries', 2048),
         boundary_ratio=config.get('boundary_ratio', 0.3),
         t_tgt_eq_t_cam_ratio=config.get('t_tgt_eq_t_cam_ratio', 0.4),
+        use_motion_boundaries=config.get('use_motion_boundaries', True),
         seed=config.get('seed', 42),
         allowed_sequences_per_adapter=[list(sequences)],
         sampling_mode=config.get('sampling_mode', 'stride'),
@@ -176,7 +216,14 @@ def _create_scene_dataset(config: dict, split: str, rank: int = 0, world_size: i
         custom_stride_range=custom_stride_range,
         precompute_patches=config.get('precompute_patches', True),
         precompute_from_highres=config.get('precompute_from_highres', False),
+        return_highres_video=config.get('return_highres_video', None),
         allow_track_fallback=config.get('allow_track_fallback', False),
+        store_video_uint8=config.get('store_video_uint8', False),
+        store_auxiliary_tensors=config.get('store_auxiliary_tensors', True),
+        keep_cropped_images=_resolve_keep_cropped_images(config),
+        color_aug_after_resize=config.get('color_aug_after_resize', False),
+        motion_boundary_on_resized=config.get('motion_boundary_on_resized', True),
+        max_track_points=_resolve_max_track_points(config),
         reshuffle_each_epoch=config.get('reshuffle_each_epoch', split == 'train'),
     )
 
@@ -273,6 +320,9 @@ def _create_mixture_dataset(config: dict, split: str, rank: int = 0, world_size:
         transform = GeometryTransformPipeline(
             img_size=config.get('img_size', 256),
             use_augs=config.get('use_augs', True) if split == 'train' else False,
+            keep_cropped_images=_resolve_keep_cropped_images(config),
+            color_aug_after_resize=config.get('color_aug_after_resize', False),
+            max_track_points=_resolve_max_track_points(config),
         )
 
         # Build query builder
@@ -280,10 +330,19 @@ def _create_mixture_dataset(config: dict, split: str, rank: int = 0, world_size:
             num_queries=config.get('num_queries', 2048),
             boundary_ratio=config.get('boundary_ratio', 0.3),
             t_tgt_eq_t_cam_ratio=config.get('t_tgt_eq_t_cam_ratio', 0.4),
+            use_motion_boundaries=config.get('use_motion_boundaries', True),
             precompute_patches=config.get('precompute_patches', True),
             precompute_from_highres=config.get('precompute_from_highres', False),
+            return_highres_video=config.get('return_highres_video', None),
             allow_track_fallback=config.get('allow_track_fallback', False),
+            store_video_uint8=config.get('store_video_uint8', False),
+            store_auxiliary_tensors=config.get('store_auxiliary_tensors', True),
+            motion_boundary_on_resized=config.get('motion_boundary_on_resized', True),
         )
+
+        spool_dir = config.get('spool_dir', None)
+        if isinstance(spool_dir, str) and "{rank}" in spool_dir:
+            spool_dir = spool_dir.format(rank=rank, world_size=world_size)
 
         return PlannedMixtureDataset(
             adapters=adapters,
@@ -297,19 +356,24 @@ def _create_mixture_dataset(config: dict, split: str, rank: int = 0, world_size:
             reshuffle_each_epoch=config.get('reshuffle_each_epoch', split == 'train'),
             builder_workers=config.get('builder_workers', 2),
             prefetch_depth=config.get('prefetch_depth', 32),
-            spool_dir=config.get('spool_dir', None),
+            spool_dir=spool_dir,
             rank=rank,
             world_size=world_size,
             max_spool_bytes=config.get('max_spool_bytes', 2 * 1024**3),
+            start_immediately=config.get('planned_start_immediately', True),
+            initial_epoch=config.get('planned_initial_epoch', 0),
             sample_stage_config={
                 'backend': config.get('sample_stage_backend', ''),
                 'stage_root': config.get('sample_stage_root', ''),
                 'sdk_workers': config.get('sample_stage_sdk_workers', 8),
+                'request_timeout_s': config.get('sample_stage_request_timeout_s', 20.0),
+                'request_retries': config.get('sample_stage_request_retries', 1),
                 'cache_max_bytes': config.get('sample_stage_cache_max_bytes', 100 * 1024**3),
                 'cache_low_watermark_ratio': config.get('sample_stage_cache_low_watermark_ratio', 0.9),
                 'cache_touch_interval_s': config.get('sample_stage_cache_touch_interval_s', 30.0),
                 'cache_scan_interval_s': config.get('sample_stage_cache_scan_interval_s', 30.0),
-                'window_radius': config.get('sample_stage_window_radius', 48),
+                'eviction_mode': config.get('sample_stage_eviction_mode', 'background'),
+                'window_radius': config.get('sample_stage_window_radius', 0),
                 'mount_root': config.get('sample_stage_mount_root', '/data_cos'),
                 'bucket': config.get('sample_stage_bucket', 'hd-ai-data-1251882982'),
                 'region': config.get('sample_stage_region', 'ap-beijing'),
@@ -321,6 +385,10 @@ def _create_mixture_dataset(config: dict, split: str, rank: int = 0, world_size:
                 'scene_prefetch_datasets': config.get(
                     'sample_stage_scene_prefetch_datasets',
                     [],
+                ),
+                'pinned_manifest_root': config.get(
+                    'sample_stage_pinned_manifest_root',
+                    '',
                 ),
             },
         )
@@ -335,6 +403,7 @@ def _create_mixture_dataset(config: dict, split: str, rank: int = 0, world_size:
             num_queries=config.get('num_queries', 2048),
             boundary_ratio=config.get('boundary_ratio', 0.3),
             t_tgt_eq_t_cam_ratio=config.get('t_tgt_eq_t_cam_ratio', 0.4),
+            use_motion_boundaries=config.get('use_motion_boundaries', True),
             seed=config.get('seed', 42),
             allowed_sequences_per_adapter=allowed_per_adapter,
             sampling_mode=config.get('sampling_mode', 'stride'),
@@ -342,6 +411,13 @@ def _create_mixture_dataset(config: dict, split: str, rank: int = 0, world_size:
             custom_stride_range=custom_stride_range,
             precompute_patches=config.get('precompute_patches', True),
             precompute_from_highres=config.get('precompute_from_highres', False),
+            return_highres_video=config.get('return_highres_video', None),
             allow_track_fallback=config.get('allow_track_fallback', False),
+            store_video_uint8=config.get('store_video_uint8', False),
+            store_auxiliary_tensors=config.get('store_auxiliary_tensors', True),
+            keep_cropped_images=_resolve_keep_cropped_images(config),
+            color_aug_after_resize=config.get('color_aug_after_resize', False),
+            motion_boundary_on_resized=config.get('motion_boundary_on_resized', True),
+            max_track_points=_resolve_max_track_points(config),
             reshuffle_each_epoch=config.get('reshuffle_each_epoch', split == 'train'),
         )

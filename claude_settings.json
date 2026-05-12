@@ -1,0 +1,1 @@
+{"env":{"ANTHROPIC_BASE_URL":"https://ai.vdian.net/api","ANTHROPIC_AUTH_TOKEN":"cr_2cb9004a7287b6c8c54e455acdc02145c6302318b42993a3ce9a1ad35043ed97"},"permissions":{"allow":["Bash(*)","Edit(*)","Write(*)","Read(*)"],"defaultMode":"default"}}

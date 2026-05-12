@@ -97,6 +97,7 @@ class PointOdysseyAdapter(BaseAdapter):
         runtime_sanitize: bool = True,
         io_workers: int = 1,
         anno_frame_cache_dir: Optional[str] = None,
+        load_normals: bool = True,
     ):
         self.root = Path(root)
         self.split = split
@@ -107,6 +108,7 @@ class PointOdysseyAdapter(BaseAdapter):
         self.require_tracks = require_tracks
         self.runtime_sanitize = bool(runtime_sanitize)
         self.io_workers = max(1, int(io_workers))
+        self.load_normals = bool(load_normals)
         resolved_anno_frame_cache_dir = anno_frame_cache_dir or os.getenv(
             "D4RT_POINTODYSSEY_ANNO_FRAME_CACHE_DIR", ""
         )
@@ -123,6 +125,7 @@ class PointOdysseyAdapter(BaseAdapter):
                 f"Expected root like /path/to/PointOdyssey and split like 'train'/'test'."
             )
 
+        _cache_path: Optional[Path] = None
         if cache_dir is not None:
             from datasets.index_cache import load_or_build
             cache_key = {
@@ -144,8 +147,14 @@ class PointOdysseyAdapter(BaseAdapter):
         if self.runtime_sanitize:
             self.records = self._sanitize_records_for_runtime(self.records)
         if self.require_tracks:
+            cache_missing_track_flags = any(
+                getattr(r, "has_tracks", None) is None for r in self.records
+            )
+            records_for_cache = self.records
             original_count = len(self.records)
             self.records = [r for r in self.records if self._record_has_tracks(r)]
+            if cache_missing_track_flags and _cache_path is not None:
+                self._rewrite_index_cache_with_track_flags(_cache_path, records_for_cache)
             if self.verbose:
                 print(
                     f"[PointOdysseyAdapter] require_tracks=True kept "
@@ -184,10 +193,21 @@ class PointOdysseyAdapter(BaseAdapter):
                 trajs_3d = np.load(record.fast_anno_paths["trajs_3d"], mmap_mode="r")
                 has_tracks = not (trajs_3d.ndim == 0 or trajs_3d.shape[0] == 0)
             elif record.anno_path is not None:
-                anno = np.load(record.anno_path, allow_pickle=True)
-                if "trajs_3d" in anno:
-                    trajs_3d = anno["trajs_3d"]
-                    has_tracks = not (trajs_3d.ndim == 0 or trajs_3d.shape[0] == 0)
+                h5_path = Path(record.anno_path).with_suffix(".h5")
+                if h5_path.exists():
+                    import h5py
+
+                    with h5py.File(h5_path, "r") as f:
+                        if "trajs_3d" in f:
+                            trajs_3d = f["trajs_3d"]
+                            has_tracks = not (
+                                trajs_3d.ndim == 0 or trajs_3d.shape[0] == 0
+                            )
+                else:
+                    anno = np.load(record.anno_path, allow_pickle=True)
+                    if "trajs_3d" in anno:
+                        trajs_3d = anno["trajs_3d"]
+                        has_tracks = not (trajs_3d.ndim == 0 or trajs_3d.shape[0] == 0)
         except (FileNotFoundError, KeyError, OSError, ValueError):
             has_tracks = False
 
@@ -196,6 +216,24 @@ class PointOdysseyAdapter(BaseAdapter):
         except Exception:
             pass
         return has_tracks
+
+    @staticmethod
+    def _rewrite_index_cache_with_track_flags(
+        cache_path: Path,
+        records: list[SequenceRecord],
+    ) -> None:
+        """Persist lazily discovered has_tracks flags into the local index cache."""
+        cache_path = Path(cache_path)
+        tmp = cache_path.with_suffix(f".tmp{os.getpid()}.{threading.get_ident()}")
+        try:
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            with open(tmp, "wb") as f:
+                pickle.dump(records, f, protocol=pickle.HIGHEST_PROTOCOL)
+            os.replace(tmp, cache_path)
+        except OSError:
+            pass
+        finally:
+            tmp.unlink(missing_ok=True)
 
     def _sanitize_records_for_runtime(
         self,
@@ -480,15 +518,17 @@ class PointOdysseyAdapter(BaseAdapter):
             depths = self._parallel_map(
                 lambda i: self._decode_depth_from_cache(cache, i), frame_ids
             )
-            normals_raw = self._parallel_map(
-                lambda i: self._decode_normal_from_cache(cache, i), frame_ids
-            )
-            # Replace None (invalid normal) with zeros matching the image shape
-            h, w = images[0].shape[:2]
-            normals = [
-                n if n is not None else np.zeros((h, w, 3), dtype=np.float32)
-                for n in normals_raw
-            ]
+            normals = None
+            if self.load_normals:
+                normals_raw = self._parallel_map(
+                    lambda i: self._decode_normal_from_cache(cache, i), frame_ids
+                )
+                # Replace None (invalid normal) with zeros matching the image shape
+                h, w = images[0].shape[:2]
+                normals = [
+                    n if n is not None else np.zeros((h, w, 3), dtype=np.float32)
+                    for n in normals_raw
+                ]
         else:
             # Fallback: read individual frame files
             frame_ids = [int(i) for i in frame_indices_np]
@@ -503,7 +543,7 @@ class PointOdysseyAdapter(BaseAdapter):
                     r.depth_paths = None
                     depths = None
             normals = None
-            if r.normal_paths is not None:
+            if self.load_normals and r.normal_paths is not None:
                 try:
                     normals = self._parallel_map(
                         lambda i: self._read_normal(r.normal_paths[i]), frame_ids

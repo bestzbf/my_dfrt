@@ -254,3 +254,164 @@ def test_mvssynth_stage_sample_rebases_record_but_keeps_precompute_root():
         assert adapter.root == dataset_root
         assert adapter._get_record(sequence_id) is old_record
         assert adapter.precompute_root == dataset_root
+
+
+class FakeScanNetPPAdapter:
+    dataset_name = "scannetpp"
+
+    def __init__(self, root: Path, scene_id: str, num_frames: int = 48):
+        self.root = root
+        self.data_root = root
+        self.split = "train"
+        self._scene_cache = {}
+        self._depth_chunk_cache = {}
+        self._staged_depth_map_tmp = None
+        self._num_frames = num_frames
+        self._scene_id = scene_id
+
+    def get_num_frames(self, sequence_name: str) -> int:
+        return self._num_frames
+
+    def _get_scene_data(self, scene_name: str):
+        if scene_name in self._scene_cache:
+            return self._scene_cache[scene_name]
+        import numpy as np
+        scene_dir = self.data_root / scene_name
+        full_indices = np.arange(self._num_frames, dtype=np.int32)
+        data = {
+            "scene_dir": scene_dir,
+            "full_indices": full_indices,
+            "frame_stems": [f"{i:06d}" for i in range(self._num_frames)],
+        }
+        self._scene_cache[scene_name] = data
+        return data
+
+
+def _make_fake_scannetpp_scene(root: Path, scene_id: str, num_frames: int = 48) -> None:
+    scene_dir = root / scene_id
+    colmap_dir = scene_dir / "iphone" / "colmap"
+    frames_dir = scene_dir / "iphone" / "frames"
+
+    _write_text(colmap_dir / "cameras.txt", "# camera data")
+    _write_text(colmap_dir / "images.txt", "# images data")
+    _write_text(scene_dir / "iphone" / "pose_intrinsic_imu.json", "{}")
+    _write_text(scene_dir / "precomputed.h5", "fake-h5-data")
+
+    for i in range(num_frames):
+        _write_text(frames_dir / f"{i:06d}.jpg", f"rgb-{i}")
+
+
+def test_scannetpp_manifest_includes_metadata_and_frames():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir)
+        mount_root = base / "mount"
+        dataset_root = mount_root / "hdu_datasets" / "scannetpp" / "data"
+        stage_root = base / "stage"
+        passwd_file = base / "passwd.txt"
+        passwd_file.write_text("id:key", encoding="utf-8")
+
+        scene_id = "a492fe77aa"
+        num_frames = 48
+        _make_fake_scannetpp_scene(dataset_root, scene_id, num_frames=num_frames)
+        adapter = FakeScanNetPPAdapter(dataset_root, scene_id, num_frames=num_frames)
+
+        stager = SampleLocalStager(
+            SampleStageConfig(
+                backend="cos_sdk",
+                stage_root=str(stage_root),
+                mount_root=str(mount_root),
+                passwd_file=str(passwd_file),
+                enabled_datasets=("scannetpp",),
+            )
+        )
+
+        manifest = stager._manifest_scannetpp(adapter, scene_id, list(range(num_frames)))
+        rel_manifest = [path.relative_to(dataset_root / scene_id).as_posix() for path in manifest]
+
+        # Stage only small metadata + JPG frames. Large precomputed.h5 stays on
+        # the original mount for h5py frame slicing.
+        assert "iphone/colmap/cameras.txt" in rel_manifest
+        assert "iphone/colmap/images.txt" in rel_manifest
+        assert "iphone/pose_intrinsic_imu.json" in rel_manifest
+        assert "precomputed.h5" not in rel_manifest
+
+        jpg_files = [p for p in rel_manifest if p.endswith(".jpg")]
+        assert len(jpg_files) == num_frames
+        assert "iphone/frames/000000.jpg" in rel_manifest
+        assert f"iphone/frames/{num_frames-1:06d}.jpg" in rel_manifest
+
+
+def test_scannetpp_stage_sample_downloads_metadata_and_frames():
+    with tempfile.TemporaryDirectory() as tmpdir:
+        base = Path(tmpdir)
+        mount_root = base / "mount"
+        dataset_root = mount_root / "hdu_datasets" / "scannetpp" / "data"
+        stage_root = base / "stage"
+        passwd_file = base / "passwd.txt"
+        passwd_file.write_text("id:key", encoding="utf-8")
+
+        scene_id = "a492fe77aa"
+        num_frames = 48
+        _make_fake_scannetpp_scene(dataset_root, scene_id, num_frames=num_frames)
+        adapter = FakeScanNetPPAdapter(dataset_root, scene_id, num_frames=num_frames)
+
+        stager = SampleLocalStager(
+            SampleStageConfig(
+                backend="cos_sdk",
+                stage_root=str(stage_root),
+                sdk_workers=32,
+                mount_root=str(mount_root),
+                passwd_file=str(passwd_file),
+                enabled_datasets=("scannetpp",),
+            )
+        )
+
+        download_calls: list[str] = []
+        import time
+
+        def fake_download(self, src_path: Path, cache_path: Path, rel_key: Path) -> None:
+            download_calls.append(rel_key.as_posix())
+            cache_path.parent.mkdir(parents=True, exist_ok=True)
+            # Simulate network latency
+            time.sleep(0.01)
+            shutil.copy2(src_path, cache_path)
+
+        stager._download_to_cache = MethodType(fake_download, stager)
+
+        # Mock depth staging to avoid COS SDK calls
+        def fake_prepare_depth(self, adapter, sequence_name, frame_indices, staged_dataset_root):
+            pass
+
+        stager._prepare_scannetpp_depth_stage = MethodType(fake_prepare_depth, stager)
+
+        start_time = time.perf_counter()
+        with stager.stage_sample(
+            adapter=adapter,
+            sequence_name=scene_id,
+            frame_indices=list(range(num_frames)),
+            sample_tag="scannetpp_test",
+        ):
+            scene_data = adapter._scene_cache[scene_id]
+            assert scene_data["scene_dir"] != dataset_root / scene_id
+            assert scene_data["_precomputed_dir"] == dataset_root / scene_id
+        elapsed = time.perf_counter() - start_time
+
+        # Should download 3 metadata files + 48 JPG frames. precomputed.h5 is
+        # intentionally not staged because it can be several GB per scene.
+        expected_files = 3 + num_frames
+        assert len(download_calls) == expected_files, f"Expected {expected_files} downloads, got {len(download_calls)}"
+
+        # Check metadata files were downloaded
+        assert any("cameras.txt" in call for call in download_calls)
+        assert any("images.txt" in call for call in download_calls)
+        assert any("pose_intrinsic_imu.json" in call for call in download_calls)
+        assert not any("precomputed.h5" in call for call in download_calls)
+
+        # Check JPG frames were downloaded
+        jpg_downloads = [call for call in download_calls if call.endswith(".jpg")]
+        assert len(jpg_downloads) == num_frames
+
+        print(f"\nScanNetPP staging test:")
+        print(f"  Files downloaded: {len(download_calls)}")
+        print(f"  Time elapsed: {elapsed:.3f}s")
+        print(f"  Time per file: {elapsed/len(download_calls)*1000:.1f}ms")

@@ -259,6 +259,10 @@ class PatchEmbeddingFast(nn.Module):
                 "Unsupported patch layout. Expected (B, N, C, ps, ps) or (B, N, ps, ps, C). "
                 f"Got shape {tuple(patches.shape)}"
             )
+        if patches.dtype == torch.uint8:
+            patches = patches.float().div_(255.0)
+        elif not patches.is_floating_point():
+            patches = patches.float()
 
         B, N = patches.shape[:2]
         patches_flat = patches.reshape(B, N, -1)

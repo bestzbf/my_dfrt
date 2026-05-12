@@ -51,8 +51,14 @@ def make_sample(args: argparse.Namespace, idx: int) -> QuerySample:
     H = args.highres_h
     W = args.highres_w
 
-    video = torch.empty((T, 3, S, S), dtype=torch.float32)
+    if args.video_dtype == "float32":
+        video = torch.empty((T, 3, S, S), dtype=torch.float32)
+    elif args.video_dtype == "uint8":
+        video = torch.empty((T, 3, S, S), dtype=torch.uint8)
+    else:
+        raise ValueError(args.video_dtype)
     depths = torch.empty((T, 1, S, S), dtype=torch.float32) if args.include_depths else None
+    normals = torch.empty((T, 3, S, S), dtype=torch.float32) if args.include_normals else None
 
     if args.highres_dtype == "none":
         highres_video = None
@@ -63,11 +69,17 @@ def make_sample(args: argparse.Namespace, idx: int) -> QuerySample:
     else:
         raise ValueError(args.highres_dtype)
 
+    local_patches = (
+        torch.empty((Q, 3, args.patch_size, args.patch_size), dtype=torch.float32)
+        if args.include_local_patches
+        else None
+    )
+
     return QuerySample(
         video=video,
         highres_video=highres_video,
         depths=depths,
-        normals=None,
+        normals=normals,
         coords=torch.empty((Q, 2), dtype=torch.float32),
         t_src=torch.empty((Q,), dtype=torch.long),
         t_tgt=torch.empty((Q,), dtype=torch.long),
@@ -75,7 +87,7 @@ def make_sample(args: argparse.Namespace, idx: int) -> QuerySample:
         intrinsics=torch.empty((T, 3, 3), dtype=torch.float32),
         extrinsics=torch.empty((T, 4, 4), dtype=torch.float32),
         targets=_build_empty_targets(Q),
-        local_patches=None,
+        local_patches=local_patches,
         transform_metadata={
             "canonical_space": torch.tensor(0, dtype=torch.long),
             "original_hw": torch.empty((2,), dtype=torch.float32),
@@ -276,10 +288,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-frames", type=int, default=48)
     parser.add_argument("--img-size", type=int, default=256)
     parser.add_argument("--num-queries", type=int, default=2048)
+    parser.add_argument("--video-dtype", choices=["float32", "uint8"], default="float32")
     parser.add_argument("--highres-h", type=int, default=576)
     parser.add_argument("--highres-w", type=int, default=576)
     parser.add_argument("--highres-dtype", choices=["float32", "uint8", "none"], default="uint8")
     parser.add_argument("--include-depths", action="store_true", default=True)
+    parser.add_argument("--no-depths", dest="include_depths", action="store_false")
+    parser.add_argument("--include-normals", action="store_true")
+    parser.add_argument("--include-local-patches", action="store_true")
+    parser.add_argument("--patch-size", type=int, default=9)
     parser.add_argument("--parallel-workers", type=int, default=5)
     parser.add_argument("--queue-depth", type=int, default=2)
     parser.add_argument("--compute-ms", type=float, default=1200.0)
@@ -302,7 +319,9 @@ def main() -> int:
         print(f"[bench] work_dir={work_dir}", flush=True)
         print(
             f"[bench] batch_size={args.batch_size} batches={args.num_batches} "
-            f"highres={args.highres_dtype}:{args.highres_h}x{args.highres_w}",
+            f"video={args.video_dtype} highres={args.highres_dtype}:{args.highres_h}x{args.highres_w} "
+            f"depths={args.include_depths} normals={args.include_normals} "
+            f"local_patches={args.include_local_patches}",
             flush=True,
         )
         t0 = time.perf_counter()

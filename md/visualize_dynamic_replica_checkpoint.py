@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import imageio.v2 as imageio
 import json
 import math
@@ -90,7 +91,32 @@ def parse_args() -> argparse.Namespace:
             "稠密 GT 3D 点云每帧用哪一类点。"
             "'visible' 只画当前帧可见点；"
             "'all_finite' 画当前帧所有有限 3D 点。"
+            "仅在 --gt-source=tracks 时生效。"
         ),
+    )
+    parser.add_argument(
+        "--gt-source",
+        type=str,
+        default="auto",
+        choices=("auto", "tracks", "depth"),
+        help=(
+            "GT 轨迹和稠密点云来源。"
+            "'tracks' 使用 adapter/precomputed 里的 trajs_2d/trajs_3d_world；"
+            "'depth' 从当前 clip 的 depth+pose 现场生成静态 GT；"
+            "'auto' 对 TartanAir/VKITTI 或无 tracks 样本优先用 depth，其它数据集沿用 tracks。"
+        ),
+    )
+    parser.add_argument(
+        "--dense-gt-depth-stride",
+        type=int,
+        default=2,
+        help="--gt-source=depth 时稠密 GT depth 反投影采样步长。2 表示约 128x128 个候选点。",
+    )
+    parser.add_argument(
+        "--depth-gt-max-depth",
+        type=float,
+        default=100.0,
+        help="--gt-source=depth 时过滤 depth > N 米的 GT 点。0 表示不过滤。",
     )
     parser.add_argument(
         "--dense-pred-point-cloud-stride",
@@ -385,6 +411,175 @@ def camera_to_world(points_cam: np.ndarray, extrinsic: np.ndarray) -> np.ndarray
     ones = np.ones((points_cam.shape[0], 1), dtype=np.float32)
     points_h = np.concatenate([points_cam.astype(np.float32), ones], axis=-1)
     return (inv_ext @ points_h.T).T[:, :3]
+
+
+def resolve_reference_frame(result, reference_frame: int) -> int:
+    if reference_frame < 0:
+        return len(result.images) // 2
+    if reference_frame < 0 or reference_frame >= len(result.images):
+        raise ValueError(
+            f"reference_frame={reference_frame} is out of range for clip length {len(result.images)}"
+        )
+    return int(reference_frame)
+
+
+def unproject_pixels_to_camera(points_px: np.ndarray, depth: np.ndarray, intrinsics: np.ndarray) -> np.ndarray:
+    fx = float(intrinsics[0, 0])
+    fy = float(intrinsics[1, 1])
+    cx = float(intrinsics[0, 2])
+    cy = float(intrinsics[1, 2])
+    z = depth.astype(np.float32)
+    x = (points_px[:, 0].astype(np.float32) - cx) * z / max(fx, 1e-6)
+    y = (points_px[:, 1].astype(np.float32) - cy) * z / max(fy, 1e-6)
+    return np.stack([x, y, z], axis=-1).astype(np.float32)
+
+
+def project_world_to_pixels(points_world: np.ndarray, intrinsics: np.ndarray, extrinsic: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    ones = np.ones((points_world.shape[0], 1), dtype=np.float32)
+    points_h = np.concatenate([points_world.astype(np.float32), ones], axis=-1)
+    points_cam = (extrinsic.astype(np.float32) @ points_h.T).T[:, :3]
+    z = points_cam[:, 2].astype(np.float32)
+    safe_z = np.where(z > 1e-6, z, 1.0).astype(np.float32)
+    u = points_cam[:, 0] / safe_z * float(intrinsics[0, 0]) + float(intrinsics[0, 2])
+    v = points_cam[:, 1] / safe_z * float(intrinsics[1, 1]) + float(intrinsics[1, 2])
+    return np.stack([u, v], axis=-1).astype(np.float32), z
+
+
+def result_has_track_gt(result) -> bool:
+    return (
+        bool(result.metadata.get("has_tracks", False))
+        and result.trajs_2d is not None
+        and result.trajs_3d_world is not None
+        and result.visibs is not None
+    )
+
+
+def choose_gt_source(result, requested: str) -> tuple[str, str]:
+    if requested != "auto":
+        return requested, "requested"
+
+    has_depth = result.depths is not None and len(result.depths) > 0
+    has_tracks = result_has_track_gt(result)
+    dataset_name = str(getattr(result, "dataset_name", result.metadata.get("dataset_name", ""))).lower()
+    track_source = str(result.metadata.get("track_source", "")).lower()
+    pseudo_track = (
+        dataset_name in {"tartanair", "vkitti2"}
+        or "pseudo" in track_source
+        or "depth_pose" in track_source
+    )
+
+    if has_depth and (pseudo_track or not has_tracks):
+        reason = "pseudo_static_tracks" if pseudo_track else "tracks_missing"
+        return "depth", reason
+    return "tracks", "tracks_available"
+
+
+def build_depth_gt_result(
+    result,
+    reference_frame: int,
+    num_points: int,
+    seed: int,
+    max_depth: float,
+    depth_consistency_threshold: float = 0.05,
+):
+    if result.depths is None or len(result.depths) == 0:
+        raise RuntimeError("depth GT requested but result has no depth maps")
+
+    depth_ref = np.asarray(result.depths[reference_frame], dtype=np.float32)
+    height, width = depth_ref.shape[:2]
+    valid_ref = np.isfinite(depth_ref) & (depth_ref > 1e-3)
+    if max_depth > 0.0:
+        valid_ref &= depth_ref <= max_depth
+
+    ys, xs = np.where(valid_ref)
+    if len(xs) == 0:
+        raise RuntimeError(f"depth GT has no valid reference pixels at frame {reference_frame}")
+
+    rng = np.random.default_rng(seed)
+    if len(xs) > num_points:
+        selected = rng.choice(len(xs), size=num_points, replace=False)
+        xs = xs[selected]
+        ys = ys[selected]
+
+    points_px_ref = np.stack([xs, ys], axis=-1).astype(np.float32)
+    depths_ref = depth_ref[ys, xs].astype(np.float32)
+    points_cam_ref = unproject_pixels_to_camera(points_px_ref, depths_ref, result.intrinsics[reference_frame])
+    points_world = camera_to_world(points_cam_ref, result.extrinsics[reference_frame])
+
+    total_frames = len(result.images)
+    num_selected = len(points_world)
+    trajs_2d = np.zeros((total_frames, num_selected, 2), dtype=np.float32)
+    trajs_3d_world = np.broadcast_to(points_world[None], (total_frames, num_selected, 3)).copy().astype(np.float32)
+    valids = np.zeros((total_frames, num_selected), dtype=bool)
+    visibs = np.zeros((total_frames, num_selected), dtype=bool)
+
+    crop_w = float(result.crop.crop_w)
+    crop_h = float(result.crop.crop_h)
+    scale_x = max(crop_w - 1.0, 1.0) / max(float(width - 1), 1.0)
+    scale_y = max(crop_h - 1.0, 1.0) / max(float(height - 1), 1.0)
+
+    for frame_id in range(total_frames):
+        depth_t = np.asarray(result.depths[frame_id], dtype=np.float32)
+        intrinsics_t = result.intrinsics[frame_id]
+        extrinsic_t = result.extrinsics[frame_id]
+        uv_t, z_t = project_world_to_pixels(points_world, intrinsics_t, extrinsic_t)
+
+        trajs_2d[frame_id, :, 0] = uv_t[:, 0] * scale_x
+        trajs_2d[frame_id, :, 1] = uv_t[:, 1] * scale_y
+
+        finite_uv = np.isfinite(uv_t).all(axis=-1)
+        in_front = np.isfinite(z_t) & (z_t > 1e-3)
+        if max_depth > 0.0:
+            in_front &= z_t <= max_depth
+        in_bounds = (
+            finite_uv
+            & in_front
+            & (uv_t[:, 0] >= 0.0)
+            & (uv_t[:, 0] < width)
+            & (uv_t[:, 1] >= 0.0)
+            & (uv_t[:, 1] < height)
+        )
+
+        sampled_depth = np.zeros((num_selected,), dtype=np.float32)
+        sampled_valid = np.zeros((num_selected,), dtype=bool)
+        if np.any(in_bounds):
+            idx = np.flatnonzero(in_bounds)
+            px = np.clip(np.round(uv_t[idx, 0]).astype(np.int32), 0, width - 1)
+            py = np.clip(np.round(uv_t[idx, 1]).astype(np.int32), 0, height - 1)
+            sampled = depth_t[py, px].astype(np.float32)
+            sampled_depth[idx] = sampled
+            sampled_valid[idx] = np.isfinite(sampled) & (sampled > 1e-3)
+            if max_depth > 0.0:
+                sampled_valid[idx] &= sampled <= max_depth
+
+        defined = in_bounds & sampled_valid
+        rel_err = np.full((num_selected,), np.inf, dtype=np.float32)
+        if np.any(defined):
+            rel_err[defined] = np.abs(sampled_depth[defined] - z_t[defined]) / np.maximum(z_t[defined], 1e-6)
+
+        valids[frame_id] = defined
+        visibs[frame_id] = defined & (rel_err <= depth_consistency_threshold)
+
+    metadata = dict(result.metadata)
+    metadata.update(
+        {
+            "has_tracks": True,
+            "has_visibility": True,
+            "has_trajs_3d_world": True,
+            "gt_source": "depth",
+            "depth_gt_reference_frame": int(reference_frame),
+            "depth_gt_num_points": int(num_selected),
+            "depth_gt_max_depth": float(max_depth),
+        }
+    )
+    return replace(
+        result,
+        trajs_2d=trajs_2d,
+        trajs_3d_world=trajs_3d_world,
+        valids=valids,
+        visibs=visibs,
+        metadata=metadata,
+    )
 
 
 def normalized_to_pixels(coords_norm: np.ndarray, size: int) -> np.ndarray:
@@ -862,6 +1057,75 @@ def prepare_dense_gt_sequence(
                 "rendered_points": int(len(points_world)),
             }
         )
+    return dense_frames
+
+
+def prepare_dense_gt_depth_sequence(
+    result,
+    max_points: int,
+    seed: int,
+    flip_y: bool,
+    stride: int,
+    max_depth: float,
+) -> list[dict[str, Any]]:
+    if stride <= 0:
+        raise ValueError(f"dense-gt-depth-stride must be positive, got {stride}")
+
+    if result.depths is None or len(result.depths) == 0:
+        return [
+            {
+                "frame_id": i,
+                "points_world": np.empty((0, 3), dtype=np.float32),
+                "colors": np.empty((0, 3), dtype=np.float32),
+                "selected_points": 0,
+                "rendered_points": 0,
+            }
+            for i in range(len(result.images))
+        ]
+
+    rng = np.random.default_rng(seed)
+    dense_frames: list[dict[str, Any]] = []
+
+    for frame_id, depth in enumerate(result.depths):
+        depth_t = np.asarray(depth, dtype=np.float32)
+        height, width = depth_t.shape[:2]
+        xs = np.arange(0, width, stride, dtype=np.int32)
+        ys = np.arange(0, height, stride, dtype=np.int32)
+        grid_x, grid_y = np.meshgrid(xs, ys, indexing="xy")
+        coords_px = np.stack([grid_x, grid_y], axis=-1).reshape(-1, 2)
+        depth_values = depth_t[coords_px[:, 1], coords_px[:, 0]].astype(np.float32)
+
+        valid = np.isfinite(depth_values) & (depth_values > 1e-3)
+        if max_depth > 0.0:
+            valid &= depth_values <= max_depth
+
+        indices = np.flatnonzero(valid)
+        total_selected = int(len(indices))
+        if max_points > 0 and len(indices) > max_points:
+            indices = rng.choice(indices, size=max_points, replace=False)
+            indices = np.sort(indices)
+
+        if len(indices) == 0:
+            points_world = np.empty((0, 3), dtype=np.float32)
+            colors = np.empty((0, 3), dtype=np.float32)
+        else:
+            selected_px = coords_px[indices].astype(np.float32)
+            selected_depth = depth_values[indices].astype(np.float32)
+            points_cam = unproject_pixels_to_camera(selected_px, selected_depth, result.intrinsics[frame_id])
+            points_world = camera_to_world(points_cam, result.extrinsics[frame_id]).astype(np.float32)
+            points_world = maybe_flip_y(points_world, flip_y)
+            colors = result.images[frame_id][selected_px[:, 1].astype(np.int32), selected_px[:, 0].astype(np.int32)].astype(np.float32)
+
+        dense_frames.append(
+            {
+                "frame_id": frame_id,
+                "points_world": points_world,
+                "colors": colors,
+                "selected_points": total_selected,
+                "rendered_points": int(len(points_world)),
+            }
+        )
+
     return dense_frames
 
 
@@ -1417,12 +1681,12 @@ def plot_dense_canonical_static(
     dense_frames: list[dict[str, Any]],
     output_path: Path,
 ) -> dict[str, float]:
-    """canonical 重建静态图：每帧独立重建到参考坐标系，3 个视角，4 帧。"""
+    """canonical 重建静态图：每帧独立重建到参考坐标系，4 个视角，4 帧。"""
     frame_ids = make_frame_ids(len(dense_frames), num_frames=4)
     center, radius = dense_axis_limits(dense_frames, points_key="points_ref")
 
-    VIEWS = [(20, -62), (0, 0), (90, 0)]
-    VIEW_LABELS = ["front (elev=20)", "side (elev=0)", "top (elev=90)"]
+    VIEWS = [(-90, -90), (20, -62), (0, 0), (90, 0)]
+    VIEW_LABELS = ["camera view", "front (elev=20)", "side (elev=0)", "top (elev=90)"]
     nrows = len(VIEWS)
     ncols = len(frame_ids)
 
@@ -1448,7 +1712,7 @@ def plot_dense_canonical_static(
         f"static background fixed, dynamic objects move, camera motion removed",
         fontsize=13,
     )
-    fig.savefig(output_path, dpi=150, bbox_inches="tight")
+    fig.savefig(output_path, dpi=150)
     plt.close(fig)
 
     visible_counts = np.array([f["visible_points"] for f in dense_frames], dtype=np.float32)
@@ -1474,7 +1738,7 @@ def write_dense_canonical_gif(
         pts = frame["points_ref"]
         if len(pts) > 0:
             ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=frame["colors"], s=1.5, alpha=0.9)
-        ax.view_init(elev=20, azim=-62)
+        ax.view_init(elev=-90, azim=-90)
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
@@ -1701,7 +1965,7 @@ def main() -> None:
         start_index=args.start_index,
         count=args.num_samples,
         max_search=args.max_search,
-        allow_no_tracks=args.allow_no_tracks,
+        allow_no_tracks=args.allow_no_tracks or args.gt_source in {"auto", "depth"},
     )
 
     summary: dict[str, Any] = {
@@ -1709,7 +1973,10 @@ def main() -> None:
         "checkpoint": args.checkpoint,
         "model_variant": args.model_variant,
         "patch_provider": args.patch_provider,
+        "gt_source": args.gt_source,
         "dense_gt_point_source": args.dense_gt_point_source,
+        "dense_gt_depth_stride": args.dense_gt_depth_stride,
+        "depth_gt_max_depth": args.depth_gt_max_depth,
         "dense_pred_point_cloud_stride": args.dense_pred_point_cloud_stride,
         "dense_pred_vis_threshold": args.dense_pred_vis_threshold,
         "dense_pred_query_batch_size": args.dense_pred_query_batch_size,
@@ -1721,11 +1988,25 @@ def main() -> None:
     for sample_rank, sample in enumerate(samples):
         result = sample["result"]
         sample_index = int(sample["sample_index"])
+        t_ref = resolve_reference_frame(result, args.reference_frame)
+        gt_source, gt_source_reason = choose_gt_source(result, args.gt_source)
+        if gt_source == "depth":
+            result = build_depth_gt_result(
+                result=result,
+                reference_frame=t_ref,
+                num_points=args.num_points,
+                seed=args.seed + sample_index,
+                max_depth=args.depth_gt_max_depth,
+            )
         sample_dir = out_dir / f"sample_{sample_rank:02d}_idx{sample_index}_{result.sequence_name}"
         sample_dir.mkdir(parents=True, exist_ok=True)
-        print(f"[vis] Processing sample {sample_rank}/{len(samples)}: {result.sequence_name} (idx={sample_index})", flush=True)
+        print(
+            f"[vis] Processing sample {sample_rank}/{len(samples)}: {result.sequence_name} "
+            f"(idx={sample_index}, gt_source={gt_source}:{gt_source_reason})",
+            flush=True,
+        )
 
-        has_tracks = bool(result.metadata.get("has_tracks", False)) and result.trajs_2d is not None
+        has_tracks = result_has_track_gt(result)
 
         if has_tracks:
             try:
@@ -1733,7 +2014,7 @@ def main() -> None:
                     result=result,
                     num_points=args.num_points,
                     seed=args.seed + sample_index,
-                    reference_frame=args.reference_frame,
+                    reference_frame=t_ref,
                 )
             except RuntimeError:
                 has_tracks = False
@@ -1754,7 +2035,6 @@ def main() -> None:
                 seed=args.seed + 17 * sample_index,
             )
         else:
-            t_ref = len(result.images) // 2 if args.reference_frame < 0 else args.reference_frame
             pred = None
             display_ids = None
 
@@ -1811,14 +2091,24 @@ def main() -> None:
         else:
             metrics_2d = {"mean_2d_px_err": math.nan, "median_2d_px_err": math.nan, "p90_2d_px_err": math.nan}
             metrics_3d = {"num_3d_points": 0, "mean_3d_euc_err": math.nan, "median_3d_euc_err": math.nan, "p90_3d_euc_err": math.nan}
-        print(f"[vis]   Step: prepare_dense_gt_sequence ...", flush=True)
-        dense_gt_frames = prepare_dense_gt_sequence(
-            result=result,
-            max_points=args.dense_gt_max_points,
-            seed=args.seed + 101 * sample_index,
-            flip_y=args.flip_y_axis,
-            point_source=args.dense_gt_point_source,
-        )
+        print(f"[vis]   Step: prepare_dense_gt_sequence ({gt_source}) ...", flush=True)
+        if gt_source == "depth":
+            dense_gt_frames = prepare_dense_gt_depth_sequence(
+                result=result,
+                max_points=args.dense_gt_max_points,
+                seed=args.seed + 101 * sample_index,
+                flip_y=args.flip_y_axis,
+                stride=args.dense_gt_depth_stride,
+                max_depth=args.depth_gt_max_depth,
+            )
+        else:
+            dense_gt_frames = prepare_dense_gt_sequence(
+                result=result,
+                max_points=args.dense_gt_max_points,
+                seed=args.seed + 101 * sample_index,
+                flip_y=args.flip_y_axis,
+                point_source=args.dense_gt_point_source,
+            )
         dense_gt_metrics = plot_dense_gt_static(
             result=result,
             dense_frames=dense_gt_frames,
@@ -1949,7 +2239,11 @@ def main() -> None:
             "sequence_name": result.sequence_name,
             "frame_indices": list(map(int, sample["frame_indices"])),
             "reference_frame": int(t_ref),
+            "gt_source": gt_source,
+            "gt_source_reason": gt_source_reason,
             "dense_gt_point_source": args.dense_gt_point_source,
+            "dense_gt_depth_stride": args.dense_gt_depth_stride,
+            "depth_gt_max_depth": args.depth_gt_max_depth,
             "has_tracks": has_tracks,
             "num_query_points": int(len(point_indices)) if has_tracks else 0,
             "num_display_points": int(len(display_ids)) if has_tracks else 0,

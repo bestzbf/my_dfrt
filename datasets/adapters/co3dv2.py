@@ -3,6 +3,8 @@ from __future__ import annotations
 import gzip
 import hashlib
 import json
+import os
+import threading
 from collections import OrderedDict
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +14,11 @@ import numpy as np
 from PIL import Image
 
 from .base import BaseAdapter, UnifiedClip, load_precomputed_fast
+
+try:
+    import cv2
+except Exception:  # pragma: no cover - optional fast path
+    cv2 = None
 
 
 _MIN_TEMPORAL_TRACK_RATIO = 0.05
@@ -229,7 +236,13 @@ def _load_depth(path: Path, scale_adjustment: float, depth_scene_scale: float = 
     Returns:
         depth: (H, W) float32 array.  Zero indicates invalid / missing depth.
     """
-    raw_uint16 = np.array(Image.open(path), dtype=np.uint16)
+    raw_uint16 = None
+    if cv2 is not None:
+        raw = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if raw is not None:
+            raw_uint16 = np.asarray(raw, dtype=np.uint16)
+    if raw_uint16 is None:
+        raw_uint16 = np.array(Image.open(path), dtype=np.uint16)
     depth = raw_uint16.view(np.float16).astype(np.float32) * float(scale_adjustment)
     depth[~np.isfinite(depth)] = 0.0
     return depth
@@ -429,17 +442,32 @@ def _load_depth_mask(path: Path) -> np.ndarray:
     Returns:
         mask: (H, W) bool array.  True = valid depth.
     """
+    if cv2 is not None:
+        mask = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if mask is not None:
+            return np.asarray(mask).astype(bool, copy=False)
     return np.array(Image.open(path), dtype=bool)
 
 
 def _load_rgb(path: Path) -> np.ndarray:
     """Load an RGB image as uint8 (H, W, 3)."""
+    if cv2 is not None:
+        image = cv2.imread(str(path), cv2.IMREAD_COLOR)
+        if image is not None:
+            return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     return np.asarray(Image.open(path).convert("RGB"))
 
 
 def _load_soft_mask(path: Path) -> np.ndarray:
     """Load a soft foreground mask to [0, 1]."""
-    arr = np.asarray(Image.open(path), dtype=np.float32)
+    if cv2 is not None:
+        raw = cv2.imread(str(path), cv2.IMREAD_UNCHANGED)
+        if raw is not None:
+            arr = np.asarray(raw, dtype=np.float32)
+        else:
+            arr = np.asarray(Image.open(path), dtype=np.float32)
+    else:
+        arr = np.asarray(Image.open(path), dtype=np.float32)
     if arr.ndim == 3:
         arr = arr[..., 0]
     return np.clip(arr / 255.0, 0.0, 1.0)
@@ -639,6 +667,7 @@ class Co3Dv2Adapter(BaseAdapter):
         index_workers: int = 8,
         io_workers: int = 2,
         load_normals: bool = True,
+        frame_cache_items: Optional[int] = None,
     ) -> None:
         """
         Parameters
@@ -700,6 +729,11 @@ class Co3Dv2Adapter(BaseAdapter):
         load_normals :
             Load normals from Co3D precomputed files. Disable when normal loss
             is not used; track supervision remains available.
+        frame_cache_items :
+            Per-builder LRU size for decoded RGB/depth/mask frame arrays.
+            Planned sampling often requests overlapping windows from the same
+            sequence; caching removes repeated jpeg/png decode without changing
+            sample semantics.  Can also be set with D4RT_CO3D_FRAME_CACHE_ITEMS.
         """
         self.root = Path(root)
         if not self.root.exists():
@@ -734,6 +768,12 @@ class Co3Dv2Adapter(BaseAdapter):
         self.max_sequences_per_category = _safe_int(max_sequences_per_category)
         self.io_workers = max(1, int(io_workers))
         self.load_normals = bool(load_normals)
+        if frame_cache_items is None:
+            raw_cache_items = os.getenv("D4RT_CO3D_FRAME_CACHE_ITEMS", "").strip()
+            frame_cache_items = int(raw_cache_items) if raw_cache_items else 0
+        self.frame_cache_items = max(0, int(frame_cache_items))
+        self._frame_array_cache: OrderedDict[tuple, np.ndarray] = OrderedDict()
+        self._frame_array_cache_lock = threading.RLock()
         if self.quality_probe_frames < 1:
             raise ValueError("quality_probe_frames must be >= 1")
         if self.max_sequences_per_category is not None and self.max_sequences_per_category < 1:
@@ -810,6 +850,20 @@ class Co3Dv2Adapter(BaseAdapter):
             active_filters = self._describe_active_filters()
             if active_filters:
                 print(f"[Co3Dv2Adapter] active filters: {active_filters}")
+
+    def __getstate__(self) -> dict:
+        state = self.__dict__.copy()
+        # Builder processes receive adapters through multiprocessing pickle when
+        # forkserver/spawn is used.  Locks are not picklable, and decoded frame
+        # arrays should start empty in each child process.
+        state["_frame_array_cache"] = OrderedDict()
+        state["_frame_array_cache_lock"] = None
+        return state
+
+    def __setstate__(self, state: dict) -> None:
+        self.__dict__.update(state)
+        self._frame_array_cache = OrderedDict()
+        self._frame_array_cache_lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # BaseAdapter interface
@@ -916,13 +970,15 @@ class Co3Dv2Adapter(BaseAdapter):
         def _load_one(idx):
             fn   = r.frame_numbers[idx]
             anno = self._get_frame_anno(r.category, r.sequence_name, fn)
-            img  = _load_rgb(self.root / anno["image"]["path"])
-            dep  = _load_depth(self.root / anno["depth"]["path"],
-                               anno["depth"]["scale_adjustment"])
+            img  = self._load_rgb_cached(self.root / anno["image"]["path"])
+            dep  = self._load_depth_cached(
+                self.root / anno["depth"]["path"],
+                anno["depth"]["scale_adjustment"],
+            )
             # Apply depth_mask (cross-view consistent pixels per official Co3D docs)
             dep_mask_path = self.root / anno["depth"]["mask_path"]
             if dep_mask_path.exists():
-                dep[~_load_depth_mask(dep_mask_path)] = 0.0
+                dep[~self._load_depth_mask_cached(dep_mask_path)] = 0.0
             H, W = anno["image"]["size"]
             K = _ndc_to_pinhole(
                 anno["viewpoint"]["focal_length"],
@@ -1119,6 +1175,49 @@ class Co3Dv2Adapter(BaseAdapter):
                     "consistent with camera extrinsics (Co3D scene units)"
                 ),
             },
+        )
+
+    def _cache_array(self, key: tuple, loader, *, copy_on_return: bool) -> np.ndarray:
+        """Return decoded frame data from this adapter process' bounded LRU."""
+        if self.frame_cache_items <= 0:
+            arr = loader()
+            return arr.copy() if copy_on_return else arr
+
+        with self._frame_array_cache_lock:
+            cached = self._frame_array_cache.get(key)
+            if cached is not None:
+                self._frame_array_cache.move_to_end(key)
+                return cached.copy() if copy_on_return else cached
+
+        arr = loader()
+        with self._frame_array_cache_lock:
+            cached = self._frame_array_cache.get(key)
+            if cached is not None:
+                self._frame_array_cache.move_to_end(key)
+                return cached.copy() if copy_on_return else cached
+            self._frame_array_cache[key] = arr
+            while len(self._frame_array_cache) > self.frame_cache_items:
+                self._frame_array_cache.popitem(last=False)
+            return arr.copy() if copy_on_return else arr
+
+    def _load_rgb_cached(self, path: Path) -> np.ndarray:
+        # RGB frames are not mutated downstream; returning the cached array is safe.
+        return self._cache_array(("rgb", str(path)), lambda: _load_rgb(path), copy_on_return=False)
+
+    def _load_depth_cached(self, path: Path, scale_adjustment: float) -> np.ndarray:
+        # Depth is masked in-place per sample, so each caller must get a copy.
+        key = ("depth", str(path), float(scale_adjustment))
+        return self._cache_array(
+            key,
+            lambda: _load_depth(path, scale_adjustment),
+            copy_on_return=True,
+        )
+
+    def _load_depth_mask_cached(self, path: Path) -> np.ndarray:
+        return self._cache_array(
+            ("depth_mask", str(path)),
+            lambda: _load_depth_mask(path),
+            copy_on_return=False,
         )
 
     def sanity_check(self, sequence_name: str) -> dict[str, Any]:

@@ -168,25 +168,30 @@ class SampleBuilder:
                 try:
                     # Get next spec from queue (blocking with short timeout so we
                     # can re-check for shutdown even if the queue is empty).
-                    spec: SampleSpec = self.input_queue.get(timeout=1.0)
+                    task = self.input_queue.get(timeout=1.0)
 
-                    if spec is None:
+                    if task is None:
                         # Shutdown signal
                         if verbose_builder:
                             print(f"[Builder {self.builder_id}] received None, EXITING normally", flush=True)
                         break
 
-                    # --- generation gate ---
-                    if spec.generation < self.current_generation.value:
-                        # Stale spec from a previous epoch; drop it.
-                        continue
+                    specs = task if isinstance(task, list) else [task]
+                    for spec in specs:
+                        if spec is None:
+                            continue
 
-                    # Build sample with retry logic
-                    success = self._build_sample_with_retry(spec)
+                        # --- generation gate ---
+                        if spec.generation < self.current_generation.value:
+                            # Stale spec from a previous epoch; drop it.
+                            continue
 
-                    # Signal completion (use local_index so the coordinator knows
-                    # which spool slot was written).
-                    self.output_queue.put((spec.local_index, success))
+                        # Build sample with retry logic
+                        success = self._build_sample_with_retry(spec)
+
+                        # Signal completion (use local_index so the coordinator knows
+                        # which spool slot was written).
+                        self.output_queue.put((spec.local_index, success))
 
                 except queue.Empty:
                     continue
@@ -621,7 +626,7 @@ def start_builder_process(
 
 def stop_builder_processes(
     processes: list[mp.Process],
-    input_queue: mp.Queue,
+    input_queue: mp.Queue | list[mp.Queue] | None,
     timeout: float = 5.0,
 ) -> None:
     """Stop all builder processes gracefully.
@@ -631,15 +636,21 @@ def stop_builder_processes(
         input_queue: Input queue (for sending shutdown signals)
         timeout: Timeout for joining processes
     """
+    input_queues = (
+        list(input_queue)
+        if isinstance(input_queue, list)
+        else ([input_queue] if input_queue is not None else [])
+    )
+
     # Send shutdown signals. The input queue may be full of prefetched specs;
     # blocking here would hang cleanup before the terminate fallback runs.
-    for _ in processes:
+    for q in input_queues:
         try:
-            input_queue.put_nowait(None)
+            q.put_nowait(None)
         except queue.Full:
-            break
+            continue
         except (BrokenPipeError, EOFError, OSError, ValueError):
-            break
+            continue
 
     # Wait for all processes as a group.  Joining with the full timeout per
     # process makes short probes spend minutes in cleanup when many builders
@@ -684,7 +695,8 @@ def stop_builder_processes(
             p.join(timeout=0.2)
 
     try:
-        input_queue.cancel_join_thread()
-        input_queue.close()
+        for q in input_queues:
+            q.cancel_join_thread()
+            q.close()
     except Exception:
         pass

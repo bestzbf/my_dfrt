@@ -19,6 +19,7 @@ import logging
 import math
 import multiprocessing as mp
 import os
+import hashlib
 import tempfile
 import time
 from pathlib import Path
@@ -167,6 +168,20 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
             0.0,
             float(os.getenv("D4RT_PLANNED_READ_ONLY_SPOOL_TIMEOUT_S", "600") or "600"),
         )
+        self._sequence_affinity = os.getenv(
+            "D4RT_PLANNED_SEQUENCE_AFFINITY", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._block_enqueue = os.getenv(
+            "D4RT_PLANNED_BLOCK_ENQUEUE", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+        self._block_max_samples = max(
+            1,
+            int(os.getenv("D4RT_PLANNED_BLOCK_MAX_SAMPLES", "8") or "8"),
+        )
+        self._block_lookahead = max(
+            1,
+            int(os.getenv("D4RT_PLANNED_BLOCK_LOOKAHEAD", "240") or "240"),
+        )
         self._pipeline_started = False
 
         self.current_epoch = self.initial_epoch
@@ -191,11 +206,13 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
 
         # Mutable pipeline state -- rebuilt every epoch.
         self.input_queue: Optional[mp.Queue] = None
+        self.input_queues: list[mp.Queue] = []
         self.output_queue: Optional[mp.Queue] = None
         self.builder_processes: list[mp.Process] = []
         self._shared_generation: Optional[Any] = None
         self.current_plan: list = []
         self.next_enqueue_index: int = 0
+        self._enqueued_indices: set[int] = set()
 
         # Initial plan + pipeline for epoch 0.
         self.current_plan = self.planner.generate_plan(
@@ -225,7 +242,16 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
             )
         ctx = _get_mp_context()
         self._shared_generation = ctx.Value("i", self._generation)
-        self.input_queue = ctx.Queue(maxsize=self.prefetch_depth * 2)
+        self.input_queue = None
+        self.input_queues = []
+        if self._sequence_affinity:
+            queue_max = max(1, self.prefetch_depth * 2)
+            self.input_queues = [
+                ctx.Queue(maxsize=queue_max)
+                for _ in range(self.builder_workers)
+            ]
+        else:
+            self.input_queue = ctx.Queue(maxsize=self.prefetch_depth * 2)
         self.output_queue = ctx.Queue()
 
         self.builder_processes = []
@@ -236,7 +262,11 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
                 transform=self.transform,
                 query_builder=self.query_builder,
                 spool=self.spool,
-                input_queue=self.input_queue,
+                input_queue=(
+                    self.input_queues[i]
+                    if self._sequence_affinity
+                    else self.input_queue
+                ),
                 output_queue=self.output_queue,
                 clip_len=self.clip_len,
                 current_generation=self._shared_generation,
@@ -256,7 +286,9 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
         """Tear down builder processes and queues.  Safe to call repeatedly."""
         if self.builder_processes:
             stop_builder_processes(
-                self.builder_processes, self.input_queue, timeout=5.0,
+                self.builder_processes,
+                self.input_queues if self._sequence_affinity else self.input_queue,
+                timeout=5.0,
             )
             self.builder_processes = []
         if self.output_queue is not None:
@@ -267,6 +299,7 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
                 pass
         # Let old queues be GC'd; new ones are created in _start_pipeline.
         self.input_queue = None
+        self.input_queues = []
         self.output_queue = None
         self._shared_generation = None
         self._pipeline_started = False
@@ -381,11 +414,66 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
             time.sleep(0.05)
 
     def _enqueue_plan_index(self, index: int) -> None:
+        if self._block_enqueue:
+            self._enqueue_plan_block(index)
+            return
         if self._skip_ready_enqueue and self.spool.is_ready(index, self._generation):
+            self._enqueued_indices.add(int(index))
             return
         self._wait_rolling_warm_ready(index)
+        self._enqueued_indices.add(int(index))
+        self._put_spec(self.current_plan[index])
+
+    def _enqueue_plan_block(self, index: int) -> None:
+        index = int(index)
+        if index in self._enqueued_indices or index >= len(self.current_plan):
+            return
+        if self._skip_ready_enqueue and self.spool.is_ready(index, self._generation):
+            self._enqueued_indices.add(index)
+            return
+
+        seed = self.current_plan[index]
+        self._wait_rolling_warm_ready(index)
+        block = [seed]
+        self._enqueued_indices.add(index)
+
+        limit = min(len(self.current_plan), index + self._block_lookahead)
+        for j in range(index + 1, limit):
+            if len(block) >= self._block_max_samples:
+                break
+            if j in self._enqueued_indices:
+                continue
+            spec = self.current_plan[j]
+            if (
+                int(spec.dataset_idx) != int(seed.dataset_idx)
+                or str(spec.sequence_name) != str(seed.sequence_name)
+            ):
+                continue
+            if self._skip_ready_enqueue and self.spool.is_ready(j, self._generation):
+                self._enqueued_indices.add(j)
+                continue
+            self._wait_rolling_warm_ready(j)
+            block.append(spec)
+            self._enqueued_indices.add(j)
+
+        self._put_spec(block)
+
+    def _put_spec(self, spec: Any) -> None:
+        if self._sequence_affinity:
+            if not self.input_queues:
+                raise RuntimeError("sequence affinity is enabled but input queues are not initialized")
+            affinity_spec = spec[0] if isinstance(spec, list) else spec
+            builder_idx = self._affinity_builder_index(affinity_spec)
+            self.input_queues[builder_idx].put(spec)
+            return
         assert self.input_queue is not None
-        self.input_queue.put(self.current_plan[index])
+        self.input_queue.put(spec)
+
+    def _affinity_builder_index(self, spec: Any) -> int:
+        workers = max(1, int(self.builder_workers))
+        key = f"{int(spec.dataset_idx)}\0{spec.sequence_name}".encode("utf-8", "surrogatepass")
+        digest = hashlib.blake2b(key, digest_size=8).digest()
+        return int.from_bytes(digest, "little") % workers
 
     def _rolling_warm_block_for_index(self, index: int) -> int:
         batch_size = max(1, int(self._rolling_warm_batch_size))
@@ -617,7 +705,7 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
                 local_index=index,
                 generation=self._generation,
             )
-            self.input_queue.put(sub_spec)
+            self._put_spec(sub_spec)
             self._requeue_counts[index] = 0
             print(
                 f"[PlannedDataset] sample g{self._generation:04d}_{index} failed "
@@ -626,7 +714,7 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
                 flush=True,
             )
         elif index < len(self.current_plan):
-            self.input_queue.put(self.current_plan[index])
+            self._put_spec(self.current_plan[index])
 
     def _mark_returned_sample(
         self,
@@ -690,7 +778,7 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
                     alt_idx = random.choice(alt_indices)
                     alt_spec = self.current_plan[alt_idx]
                     sub_spec = dataclasses.replace(alt_spec, local_index=index, generation=self._generation)
-                    self.input_queue.put(sub_spec)
+                    self._put_spec(sub_spec)
                     requeue_count = 0
                     print(
                         f"[PlannedDataset] sample g{self._generation:04d}_{index} failed "
@@ -699,7 +787,7 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
                         flush=True,
                     )
                 elif index < len(self.current_plan):
-                    self.input_queue.put(self.current_plan[index])
+                    self._put_spec(self.current_plan[index])
                     print(f"[PlannedDataset] sample g{self._generation:04d}_{index} failed ({e}), re-enqueued", flush=True)
 
             alive_workers = [p for p in self.builder_processes if p.is_alive()]
@@ -794,6 +882,7 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
         self.spool.set_generation(self._generation)
         self._returned_indices.clear()
         self._requeue_counts.clear()
+        self._enqueued_indices.clear()
         self._rolling_warm_ready_blocks.clear()
         self._rolling_warm_last_block = None
 

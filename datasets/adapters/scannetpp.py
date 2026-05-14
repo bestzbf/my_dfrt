@@ -189,6 +189,20 @@ _FRAME_INDEX_NAME = "frame_index.pkl"
 _RGB_CACHE_DTYPE = np.dtype(np.uint8)
 
 
+def _resolve_load_max_track_points() -> Optional[int]:
+    raw = os.getenv(
+        "D4RT_SCANNETPP_LOAD_MAX_TRACK_POINTS",
+        os.getenv("D4RT_MAX_TRACK_POINTS", ""),
+    ).strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 @dataclass(frozen=True)
 class _ColmapCamera:
     camera_id: int
@@ -555,14 +569,34 @@ def _load_depth_frames_indexed(depth_path: Path, frame_indices: list[int], chunk
             offset, chunk_size = chunk_offsets[fi]
             f.seek(offset)
             chunk = f.read(chunk_size)
-            try:
-                dec = lz4.block.decompress(chunk, uncompressed_size=_DEPTH_H * _DEPTH_W * 2)
-                depth = np.frombuffer(dec, dtype=np.uint16).reshape(_DEPTH_H, _DEPTH_W).astype(np.float32) / 1000.0
-            except Exception:
-                dec = zlib.decompress(chunk, wbits=-zlib.MAX_WBITS)
-                depth = np.frombuffer(dec, dtype=np.float32).reshape(_DEPTH_H, _DEPTH_W)
-            idx_map[fi] = depth.copy()
+            idx_map[fi] = _decode_depth_chunk(chunk)
     return [idx_map[fi] for fi in frame_indices]
+
+
+def _decode_depth_chunk(chunk: bytes) -> np.ndarray:
+    import lz4.block
+
+    try:
+        dec = lz4.block.decompress(chunk, uncompressed_size=_DEPTH_H * _DEPTH_W * 2)
+        depth = (
+            np.frombuffer(dec, dtype=np.uint16)
+            .reshape(_DEPTH_H, _DEPTH_W)
+            .astype(np.float32)
+            / 1000.0
+        )
+    except Exception:
+        dec = zlib.decompress(chunk, wbits=-zlib.MAX_WBITS)
+        depth = np.frombuffer(dec, dtype=np.float32).reshape(_DEPTH_H, _DEPTH_W)
+    return depth.copy()
+
+
+def _load_depth_chunk_files(chunks_dir: Path, frame_indices: list[int]) -> list[np.ndarray]:
+    needed = sorted(set(int(fi) for fi in frame_indices))
+    idx_map: dict[int, np.ndarray] = {}
+    for fi in needed:
+        chunk_path = chunks_dir / f"{fi:08d}.bin"
+        idx_map[fi] = _decode_depth_chunk(chunk_path.read_bytes())
+    return [idx_map[int(fi)] for fi in frame_indices]
 
 
 def _load_depth_frames_cos_range(
@@ -736,6 +770,7 @@ class ScanNetPPAdapter(BaseAdapter):
         precomputed_cos_range_workers: int = 16,
         precomputed_cos_range_retries: int = 2,
         precomputed_cos_range_merge_gap_bytes: int = 1024 * 1024,
+        precomputed_cos_range_max_span_bytes: int = 0,
         precomputed_h5_chunk_cache_dir: Optional[str] = None,
         precomputed_h5_chunk_cache_min_bytes: int = 4096,
         precomputed_h5_chunk_cache_max_bytes: int = 120 * 1024**3,
@@ -777,6 +812,9 @@ class ScanNetPPAdapter(BaseAdapter):
         self.precomputed_cos_range_merge_gap_bytes = max(
             0, int(precomputed_cos_range_merge_gap_bytes)
         )
+        self.precomputed_cos_range_max_span_bytes = max(
+            0, int(precomputed_cos_range_max_span_bytes)
+        )
         self.rgb_read_mode = os.getenv("SCANNETPP_RGB_READ_MODE", "auto").strip().lower() or "auto"
         if self.rgb_read_mode in {"cache256", "decoded_cache", "rgb_cache"}:
             self.rgb_read_mode = "cache"
@@ -807,6 +845,7 @@ class ScanNetPPAdapter(BaseAdapter):
         self.precomputed_h5_chunk_cache_scan_interval_s = max(
             1.0, float(precomputed_h5_chunk_cache_scan_interval_s)
         )
+        self.load_max_track_points = _resolve_load_max_track_points()
         self._last_precomputed_h5_chunk_cache_scan_s = time.time()
         self._cos_tls = threading.local()
         self.index_workers = index_workers
@@ -898,9 +937,14 @@ class ScanNetPPAdapter(BaseAdapter):
         self.precomputed_h5_chunk_cache_scan_interval_s = getattr(
             self, "precomputed_h5_chunk_cache_scan_interval_s", 60.0
         )
+        self.precomputed_cos_range_max_span_bytes = getattr(
+            self, "precomputed_cos_range_max_span_bytes", 0
+        )
         self._last_precomputed_h5_chunk_cache_scan_s = getattr(
             self, "_last_precomputed_h5_chunk_cache_scan_s", time.time()
         )
+        if not hasattr(self, "load_max_track_points"):
+            self.load_max_track_points = _resolve_load_max_track_points()
 
     def _precomputed_npz_path(self, scene_dir: Path) -> Path:
         return scene_dir / self.precomputed_name
@@ -1121,6 +1165,9 @@ class ScanNetPPAdapter(BaseAdapter):
         full_indices = sd["full_indices"][frame_indices].tolist()
         # when staged, full_indices are remapped to staged chunk positions
         staged_map = sd.get("_staged_depth_map")
+        staged_chunks_dir = sd.get("_staged_depth_chunks_dir")
+        if staged_chunks_dir is not None:
+            return _load_depth_chunk_files(Path(staged_chunks_dir), full_indices)
         if staged_map is not None:
             remapped = [staged_map[fi] for fi in full_indices]
             chunks = self._get_depth_chunks(scene_name)
@@ -1147,6 +1194,7 @@ class ScanNetPPAdapter(BaseAdapter):
                     index_path=index_path,
                     frame_indices=frame_indices,
                     skip_keys={"normals"},
+                    sequence_name=scene_name,
                 )
             except Exception as exc:
                 if self.precomputed_read_mode == "cos_range":
@@ -1159,8 +1207,12 @@ class ScanNetPPAdapter(BaseAdapter):
                     )
                     self._cos_range_warned = True
                 cache = load_precomputed_fast(npz_path, frame_indices, skip_keys={"normals"})
+                if cache is not None:
+                    cache = self._cap_precomputed_tracks(cache, scene_name, frame_indices)
         else:
             cache = load_precomputed_fast(npz_path, frame_indices, skip_keys={"normals"})
+            if cache is not None:
+                cache = self._cap_precomputed_tracks(cache, scene_name, frame_indices)
         if cache is None:
             raise FileNotFoundError(npz_path)
         required = ["trajs_2d", "trajs_3d_world", "valids", "visibs", "intrinsics", "extrinsics"]
@@ -1327,6 +1379,7 @@ class ScanNetPPAdapter(BaseAdapter):
         index_path: Path,
         frame_indices: list[int],
         skip_keys: set[str],
+        sequence_name: str,
     ) -> dict[str, Any]:
         index = self._load_h5_chunk_index(index_path)
         required_keys = [
@@ -1345,8 +1398,20 @@ class ScanNetPPAdapter(BaseAdapter):
         cos_key = self._precomputed_cos_key(h5_path)
         tasks: list[dict[str, Any]] = []
         chunks_by_key: dict[str, dict[int, np.ndarray]] = {key: {} for key in keys}
-        entries: dict[str, dict[str, Any]] = {}
+        entries: dict[str, dict[str, Any]] = {
+            key: self._normalize_h5_range_entry(key, index[key])
+            for key in keys
+        }
         held_locks: dict[tuple[str, int, int, int], Any] = {}
+        track_keep_idx: Optional[np.ndarray] = None
+        if "trajs_2d" in entries:
+            shape = tuple(int(v) for v in entries["trajs_2d"]["shape"])
+            if len(shape) >= 2:
+                track_keep_idx = self._select_track_points(
+                    sequence_name=sequence_name,
+                    frame_indices=frame_indices,
+                    num_points=int(shape[1]),
+                )
 
         def store_raw_chunk(
             key: str,
@@ -1356,13 +1421,15 @@ class ScanNetPPAdapter(BaseAdapter):
         ) -> None:
             dtype = np.dtype(entry["dtype"])
             chunk_shape = tuple(int(v) for v in entry["chunk_shape"])
-            arr = np.frombuffer(raw, dtype=dtype).reshape(chunk_shape)[0].copy()
+            arr = np.frombuffer(raw, dtype=dtype).reshape(chunk_shape)[0]
+            if track_keep_idx is not None and key in {"trajs_2d", "trajs_3d_world", "valids", "visibs"}:
+                arr = arr[track_keep_idx]
+            arr = arr.copy()
             chunks_by_key[key][int(frame_idx)] = arr
 
         try:
             for key in keys:
-                entry = self._normalize_h5_range_entry(key, index[key])
-                entries[key] = entry
+                entry = entries[key]
                 self._validate_h5_range_entry(key, entry, sorted_idx)
                 for start, end, chunks in self._merge_h5_range_chunks(entry, sorted_idx):
                     missing_chunks: list[tuple[int, int, int]] = []
@@ -1469,6 +1536,49 @@ class ScanNetPPAdapter(BaseAdapter):
             result[key] = arr_sorted[reorder]
         return result
 
+    def _cap_precomputed_tracks(
+        self,
+        cache: dict[str, Any],
+        sequence_name: str,
+        frame_indices: list[int],
+    ) -> dict[str, Any]:
+        trajs = cache.get("trajs_2d")
+        if trajs is None or getattr(trajs, "ndim", 0) < 2:
+            return cache
+        keep_idx = self._select_track_points(
+            sequence_name=sequence_name,
+            frame_indices=frame_indices,
+            num_points=int(trajs.shape[1]),
+        )
+        if keep_idx is None:
+            return cache
+        out = dict(cache)
+        for key in ("trajs_2d", "trajs_3d_world", "valids", "visibs"):
+            value = out.get(key)
+            if value is not None and getattr(value, "ndim", 0) >= 2:
+                out[key] = value[:, keep_idx]
+        return out
+
+    def _select_track_points(
+        self,
+        *,
+        sequence_name: str,
+        frame_indices: list[int],
+        num_points: int,
+    ) -> Optional[np.ndarray]:
+        max_points = self.load_max_track_points
+        if max_points is None or num_points <= max_points:
+            return None
+        payload = (
+            f"scannetpp|{sequence_name}|{max_points}|"
+            + ",".join(str(int(v)) for v in frame_indices)
+        ).encode("utf-8")
+        seed = int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little")
+        rng = np.random.default_rng(seed)
+        return np.sort(
+            rng.choice(num_points, size=max_points, replace=False).astype(np.int64)
+        )
+
     def _normalize_h5_range_entry(self, key: str, entry: Any) -> dict[str, Any]:
         if isinstance(entry, dict):
             return entry
@@ -1558,12 +1668,25 @@ class ScanNetPPAdapter(BaseAdapter):
         chunks.sort(key=lambda item: item[1])
         spans: list[tuple[int, int, list[tuple[int, int, int]]]] = []
         max_gap = self.precomputed_cos_range_merge_gap_bytes
+        max_span = int(getattr(self, "precomputed_cos_range_max_span_bytes", 0))
         cur_start: Optional[int] = None
         cur_end: Optional[int] = None
         cur_chunks: list[tuple[int, int, int]] = []
         for frame_idx, offset, size in chunks:
             end = offset + size
-            if cur_start is None or cur_end is None or offset > cur_end + max_gap:
+            would_exceed_span = (
+                max_span > 0
+                and cur_start is not None
+                and cur_end is not None
+                and cur_chunks
+                and max(cur_end, end) - cur_start > max_span
+            )
+            if (
+                cur_start is None
+                or cur_end is None
+                or offset > cur_end + max_gap
+                or would_exceed_span
+            ):
                 if cur_start is not None and cur_end is not None:
                     spans.append((cur_start, cur_end, cur_chunks))
                 cur_start = offset
@@ -1930,6 +2053,7 @@ class ScanNetPPAdapter(BaseAdapter):
 
         frame_paths = [f"{sd['scene_dir']}/iphone/rgb.mkv@t={sd['timestamps'][i]:.6f}s" for i in frame_indices]
         has_tracks = trajs_3d_world is not None
+        track_points_loaded = int(trajs_2d.shape[1]) if trajs_2d is not None else None
         metadata = {
             "dataset_name": self.dataset_name,
             "sequence_name": sequence_name,
@@ -1944,6 +2068,7 @@ class ScanNetPPAdapter(BaseAdapter):
             "has_tracks": has_tracks,
             "has_visibility": visibs is not None,
             "has_trajs_3d_world": trajs_3d_world is not None,
+            "track_points_loaded": track_points_loaded,
             "_load_timing": timing,
         }
         return UnifiedClip(

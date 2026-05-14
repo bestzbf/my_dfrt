@@ -13,6 +13,7 @@ Example:
 from __future__ import annotations
 
 import argparse
+import os
 import random
 import shutil
 import sys
@@ -74,6 +75,30 @@ def _build_adapter(config: dict[str, Any], dataset_name: str, root: str | None, 
             raise
         ds_cfg = {"name": dataset_name, "root": root, "adapter_kwargs": {}}
     adapter_kwargs = dict(ds_cfg.get("adapter_kwargs", {}))
+    if dataset_name == "dynamic_replica":
+        if "DYNAMIC_REPLICA_SKIP_DEPTH_WHEN_TRACKS" in os.environ:
+            adapter_kwargs["skip_depth_when_tracks"] = os.environ[
+                "DYNAMIC_REPLICA_SKIP_DEPTH_WHEN_TRACKS"
+            ].strip().lower() in {"1", "true", "yes", "on"}
+        if "D4RT_DYNAMIC_REPLICA_IO_WORKERS" in os.environ:
+            adapter_kwargs["io_workers"] = int(os.environ["D4RT_DYNAMIC_REPLICA_IO_WORKERS"])
+    if dataset_name == "scannetpp":
+        env_map = {
+            "SCANNETPP_H5_CHUNK_CACHE_DIR": "precomputed_h5_chunk_cache_dir",
+            "SCANNETPP_H5_CHUNK_CACHE_MIN_BYTES": "precomputed_h5_chunk_cache_min_bytes",
+            "SCANNETPP_PRECOMPUTED_COS_TIMEOUT_S": "precomputed_cos_timeout_s",
+            "SCANNETPP_PRECOMPUTED_COS_RANGE_RETRIES": "precomputed_cos_range_retries",
+            "SCANNETPP_PRECOMPUTED_COS_RANGE_WORKERS": "precomputed_cos_range_workers",
+            "SCANNETPP_PRECOMPUTED_COS_RANGE_MERGE_GAP_BYTES": "precomputed_cos_range_merge_gap_bytes",
+            "SCANNETPP_PRECOMPUTED_COS_RANGE_MAX_SPAN_BYTES": "precomputed_cos_range_max_span_bytes",
+        }
+        for env_name, key in env_map.items():
+            raw = os.environ.get(env_name, "").strip()
+            if raw:
+                adapter_kwargs[key] = raw if key.endswith("_dir") else int(float(raw))
+        raw = os.environ.get("SCANNETPP_H5_CHUNK_CACHE_MAX_GB", "").strip()
+        if raw:
+            adapter_kwargs["precomputed_h5_chunk_cache_max_bytes"] = int(float(raw) * 1024**3)
     cache_dir = config.get("index_cache_dir")
     index_workers = config.get("index_workers")
     kwargs: dict[str, Any] = {
@@ -150,14 +175,22 @@ def main() -> None:
         transform = GeometryTransformPipeline(
             img_size=config.get("img_size", 256),
             use_augs=config.get("use_augs", True),
+            keep_cropped_images=config.get("keep_cropped_images", True),
+            color_aug_after_resize=config.get("color_aug_after_resize", False),
+            max_track_points=config.get("max_track_points"),
         )
         query_builder = D4RTQueryBuilder(
             num_queries=args.num_queries or config.get("num_queries", 2048),
             boundary_ratio=config.get("boundary_ratio", 0.3),
             t_tgt_eq_t_cam_ratio=config.get("t_tgt_eq_t_cam_ratio", 0.4),
+            use_motion_boundaries=config.get("use_motion_boundaries", True),
             precompute_patches=config.get("precompute_patches", False),
             precompute_from_highres=config.get("precompute_from_highres", False),
+            return_highres_video=config.get("return_highres_video"),
             allow_track_fallback=config.get("allow_track_fallback", True),
+            store_video_uint8=config.get("store_video_uint8", False),
+            store_auxiliary_tensors=config.get("store_auxiliary_tensors", True),
+            motion_boundary_on_resized=config.get("motion_boundary_on_resized", True),
         )
 
     manifest = stager._build_manifest(adapter, args.seq, frames) if stager.supports(adapter) else []

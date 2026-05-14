@@ -40,6 +40,20 @@ _TrajectoryCacheValue = tuple[np.ndarray, np.ndarray, np.ndarray, Optional[np.nd
 _TRAJECTORY_CACHE: "OrderedDict[tuple[int, int, int, int], _TrajectoryCacheValue]" = OrderedDict()
 
 
+def _resolve_load_max_track_points() -> Optional[int]:
+    raw = os.getenv(
+        "D4RT_DYNAMIC_REPLICA_LOAD_MAX_TRACK_POINTS",
+        os.getenv("D4RT_MAX_TRACK_POINTS", ""),
+    ).strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        return None
+    return value if value > 0 else None
+
+
 # ---------------------------------------------------------------------------
 # Camera conversion helpers (identical to Co3Dv2, shared PyTorch3D format)
 # ---------------------------------------------------------------------------
@@ -613,6 +627,7 @@ class DynamicReplicaAdapter(BaseAdapter):
         self._cache_suffix = self._build_cache_suffix()
         self._depth_calibration_cache: dict[str, tuple[float, float]] = {}
         self.rgb_cache_items = _DEFAULT_RGB_CACHE_SIZE
+        self.load_max_track_points = _resolve_load_max_track_points()
         self._rgb_cache: "OrderedDict[tuple, np.ndarray]" = OrderedDict()
         self._rgb_cache_lock = threading.RLock()
         self._depth_calibration_cache_dir = (
@@ -653,7 +668,8 @@ class DynamicReplicaAdapter(BaseAdapter):
                 f"rgb_from_trajectory={self.rgb_from_trajectory} "
                 f"skip_depth_when_tracks={self.skip_depth_when_tracks} "
                 f"prefer_trajectory_npz={self.prefer_trajectory_npz} "
-                f"io_workers={self.io_workers}"
+                f"io_workers={self.io_workers} "
+                f"load_max_track_points={self.load_max_track_points}"
             )
 
     def __getstate__(self) -> dict[str, Any]:
@@ -670,6 +686,8 @@ class DynamicReplicaAdapter(BaseAdapter):
         self._rgb_cache_lock = threading.RLock()
         if not hasattr(self, "rgb_cache_items"):
             self.rgb_cache_items = _DEFAULT_RGB_CACHE_SIZE
+        if not hasattr(self, "load_max_track_points"):
+            self.load_max_track_points = _resolve_load_max_track_points()
 
     # ------------------------------------------------------------------
     # BaseAdapter interface
@@ -863,6 +881,8 @@ class DynamicReplicaAdapter(BaseAdapter):
             traj_3d_list: list[np.ndarray] = []
             traj_2d_list: list[np.ndarray] = []
             vis_list: list[np.ndarray] = []
+            track_keep_idx: Optional[np.ndarray] = None
+            track_points_original: Optional[int] = None
 
             for p, cached in zip(traj_paths_clip, traj_cache_clip):
                 if cached is None:
@@ -874,6 +894,17 @@ class DynamicReplicaAdapter(BaseAdapter):
                     timing["traj_load_s"] += time.perf_counter() - t0
                 else:
                     traj_3d, traj_2d, traj_vis, _ = cached
+                if track_points_original is None:
+                    track_points_original = int(traj_3d.shape[0])
+                    track_keep_idx = self._select_track_points(
+                        sequence_name=sequence_name,
+                        frame_numbers=frame_numbers_clip,
+                        num_points=track_points_original,
+                    )
+                if track_keep_idx is not None:
+                    traj_3d = traj_3d[track_keep_idx]
+                    traj_2d = traj_2d[track_keep_idx]
+                    traj_vis = traj_vis[track_keep_idx]
                 traj_3d_list.append(traj_3d)        # (N, 3)
                 traj_2d_list.append(traj_2d[:, :2]) # (N, 2) – drop 3rd col
                 vis_list.append(traj_vis)           # (N,)
@@ -955,6 +986,14 @@ class DynamicReplicaAdapter(BaseAdapter):
                 "has_tracks": has_tracks,
                 "has_visibility": has_tracks,
                 "has_trajs_3d_world": has_tracks,
+                "track_points_original": (
+                    int(track_points_original)
+                    if has_tracks and "track_points_original" in locals() and track_points_original is not None
+                    else None
+                ),
+                "track_points_loaded": (
+                    int(trajs_2d.shape[1]) if trajs_2d is not None else None
+                ),
                 "normal_convention": None,
                 "normal_supervision_compatible": False,
                 "pose_convention": "w2c",
@@ -997,6 +1036,26 @@ class DynamicReplicaAdapter(BaseAdapter):
             while len(self._rgb_cache) > self.rgb_cache_items:
                 self._rgb_cache.popitem(last=False)
             return arr.copy()
+
+    def _select_track_points(
+        self,
+        *,
+        sequence_name: str,
+        frame_numbers: list[int],
+        num_points: int,
+    ) -> Optional[np.ndarray]:
+        max_points = self.load_max_track_points
+        if max_points is None or num_points <= max_points:
+            return None
+        payload = (
+            f"dynamic_replica|{sequence_name}|{max_points}|"
+            + ",".join(str(int(v)) for v in frame_numbers)
+        ).encode("utf-8")
+        seed = int.from_bytes(hashlib.blake2b(payload, digest_size=8).digest(), "little")
+        rng = np.random.default_rng(seed)
+        return np.sort(
+            rng.choice(num_points, size=max_points, replace=False).astype(np.int64)
+        )
 
     def sanity_check(self, sequence_name: str) -> dict[str, Any]:
         """Run consistency checks on a sequence.

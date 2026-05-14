@@ -518,21 +518,35 @@ class SampleLocalStager:
             full_indices_arr = _join_frames(adapter.data_root / sequence_name)["full_indices"]
         needed_full_indices = sorted(set(int(full_indices_arr[i]) for i in frame_indices))
         cos_scene_dir = adapter.data_root / sequence_name
-        self._stage_scannetpp_depth(cos_scene_dir, staged_dataset_root / sequence_name, needed_full_indices)
-        adapter._staged_depth_map_tmp = {fi: pos for pos, fi in enumerate(needed_full_indices)}
+        depth_stage = self._stage_scannetpp_depth(
+            cos_scene_dir,
+            staged_dataset_root / sequence_name,
+            needed_full_indices,
+        )
+        if depth_stage.get("mode") == "chunks":
+            adapter._staged_depth_chunks_tmp = depth_stage["chunk_dir"]
+            adapter.__dict__.pop("_staged_depth_map_tmp", None)
+        else:
+            adapter._staged_depth_map_tmp = {
+                fi: pos for pos, fi in enumerate(needed_full_indices)
+            }
+            adapter.__dict__.pop("_staged_depth_chunks_tmp", None)
 
     def _stage_scannetpp_depth(
         self,
         original_scene_dir: Path,
         staged_scene_dir: Path,
         frame_indices: list[int],
-    ) -> None:
+    ) -> dict[str, Any]:
         """Fetch only needed depth frames via COS Range requests and write a minimal depth.bin."""
         import pickle, struct
         from concurrent.futures import ThreadPoolExecutor
 
         rel_key = self._to_cos_key(original_scene_dir)
         depth_key = f"{rel_key}/iphone/depth.bin"
+        direct_chunks = os.environ.get(
+            "D4RT_SCANNETPP_STAGE_DEPTH_CHUNKS_DIRECT", "0"
+        ).strip().lower() in {"1", "true", "yes", "on"}
 
         # Cache chunk index locally; it is small but used for every ScanNet++ sample.
         for attempt in range(2):
@@ -553,7 +567,7 @@ class SampleLocalStager:
 
         needed = sorted(set(frame_indices))
 
-        def fetch_chunk(fi: int) -> tuple[int, bytes]:
+        def fetch_chunk(fi: int) -> tuple[int, bytes | None]:
             offset, chunk_size = chunk_offsets[fi]
             chunk_cache_path = (
                 self.cache_data_root
@@ -562,6 +576,8 @@ class SampleLocalStager:
             )
             if chunk_cache_path.is_file():
                 self._touch_cache_entry(chunk_cache_path)
+                if direct_chunks:
+                    return fi, None
                 try:
                     return fi, chunk_cache_path.read_bytes()
                 except FileNotFoundError:
@@ -571,6 +587,8 @@ class SampleLocalStager:
             with self._path_lock(lock_key):
                 if chunk_cache_path.is_file():
                     self._touch_cache_entry(chunk_cache_path)
+                    if direct_chunks:
+                        return fi, None
                     try:
                         return fi, chunk_cache_path.read_bytes()
                     except FileNotFoundError:
@@ -591,10 +609,16 @@ class SampleLocalStager:
                     tmp_path.unlink(missing_ok=True)
                 self._touch_cache_entry(chunk_cache_path, force=True)
                 self._maybe_evict_cache()
-                return fi, raw
+                return fi, None if direct_chunks else raw
 
         with ThreadPoolExecutor(max_workers=min(self.config.sdk_workers, len(needed))) as ex:
             chunks = dict(ex.map(lambda fi: fetch_chunk(fi), needed))
+
+        if direct_chunks:
+            return {
+                "mode": "chunks",
+                "chunk_dir": self.cache_data_root / Path(f"{depth_key}.chunks"),
+            }
 
         # write a minimal depth.bin with only the needed frames (re-indexed 0..N-1)
         dst_depth = staged_scene_dir / "iphone" / "depth.bin"
@@ -602,8 +626,15 @@ class SampleLocalStager:
         with open(dst_depth, "wb") as f:
             for fi in needed:
                 chunk = chunks[fi]
+                if chunk is None:
+                    chunk = (
+                        self.cache_data_root
+                        / Path(f"{depth_key}.chunks")
+                        / f"{fi:08d}.bin"
+                    ).read_bytes()
                 f.write(struct.pack("<I", len(chunk)))
                 f.write(chunk)
+        return {"mode": "minimal"}
 
     def _manifest_blendedmvs(
         self,
@@ -1475,7 +1506,10 @@ class SampleLocalStager:
                     new_scene_data["_precomputed_dir"] = old_precomputed_dir
                 # _staged_depth_map set by _prepare_scannetpp_depth_stage in stage_sample
                 staged_depth_map = getattr(adapter, "_staged_depth_map_tmp", None)
-                if staged_depth_map is not None:
+                staged_depth_chunks = getattr(adapter, "_staged_depth_chunks_tmp", None)
+                if staged_depth_chunks is not None:
+                    new_scene_data["_staged_depth_chunks_dir"] = Path(staged_depth_chunks)
+                elif staged_depth_map is not None:
                     new_scene_data["_staged_depth_map"] = staged_depth_map
                 adapter._scene_cache[sequence_name] = new_scene_data
                 adapter._depth_chunk_cache.pop(sequence_name, None)
@@ -1490,6 +1524,7 @@ class SampleLocalStager:
                     adapter._scene_cache.pop(sequence_name, None)
                 adapter._depth_chunk_cache.pop(sequence_name, None)
                 adapter.__dict__.pop("_staged_depth_map_tmp", None)
+                adapter.__dict__.pop("_staged_depth_chunks_tmp", None)
             return
 
         if dataset_name == "scannet":

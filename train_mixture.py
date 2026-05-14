@@ -185,6 +185,78 @@ class BatchPrefetchIterator:
         self._thread.join(timeout=2.0)
 
 
+class TrainPhaseWatchdog:
+    """Emit a slow-path heartbeat when a rank stays in one train phase too long."""
+
+    def __init__(self, rank: int):
+        self.threshold_s = float(os.getenv("D4RT_TRAIN_WATCHDOG_S", "0") or "0")
+        self.interval_s = max(
+            1.0,
+            float(os.getenv("D4RT_TRAIN_WATCHDOG_INTERVAL_S", "60") or "60"),
+        )
+        self.enabled = self.threshold_s > 0
+        self.rank = int(rank)
+        self._lock = threading.Lock()
+        self._stop = threading.Event()
+        self._epoch = None
+        self._batch = None
+        self._phase = "init"
+        self._extra = ""
+        self._updated = time.monotonic()
+        self._last_report = 0.0
+        self._thread = None
+        if self.enabled:
+            self._thread = threading.Thread(
+                target=self._run,
+                name="D4RTTrainWatchdog",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def update(self, epoch=None, batch=None, phase: str = "", extra: str = "") -> None:
+        if not self.enabled:
+            return
+        with self._lock:
+            if epoch is not None:
+                self._epoch = int(epoch)
+            if batch is not None:
+                self._batch = int(batch)
+            if phase:
+                self._phase = str(phase)
+            self._extra = str(extra)
+            self._updated = time.monotonic()
+            self._last_report = 0.0
+
+    def stop(self) -> None:
+        if not self.enabled:
+            return
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=1.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.interval_s):
+            now = time.monotonic()
+            with self._lock:
+                elapsed = now - self._updated
+                if elapsed < self.threshold_s:
+                    continue
+                if self._last_report and now - self._last_report < self.interval_s:
+                    continue
+                self._last_report = now
+                epoch = self._epoch
+                batch = self._batch
+                phase = self._phase
+                extra = self._extra
+            suffix = f" {extra}" if extra else ""
+            print(
+                f"[TrainWatchdog rank{self.rank}] "
+                f"epoch={epoch} batch={batch} phase={phase} "
+                f"elapsed={elapsed:.1f}s threshold={self.threshold_s:.1f}s{suffix}",
+                flush=True,
+            )
+
+
 def summarize_spool_ready(dataset, focus_index: int | None = None) -> dict:
     """Return a cheap ready-file summary for planned-mode diagnostics."""
     spool = getattr(dataset, "spool", None)
@@ -971,6 +1043,7 @@ def main():
     data_wait_detail_max_samples = int(os.getenv("D4RT_DATA_WAIT_DETAIL_MAX_SAMPLES", "8"))
     # Auto-print slow data diagnostics when data time exceeds this threshold
     slow_data_threshold_s = float(os.getenv("D4RT_SLOW_DATA_THRESHOLD_S", "3.0"))
+    train_watchdog = TrainPhaseWatchdog(local_rank)
     for epoch in range(start_epoch, args.epochs):
         if distributed and isinstance(train_sampler, DistributedSampler):
             train_sampler.set_epoch(epoch)
@@ -985,6 +1058,7 @@ def main():
                 depth=args.batch_prefetch_depth,
             )
         t_data_start = time.perf_counter()
+        train_watchdog.update(epoch, 0, "data_wait")
         for batch_idx, batch in enumerate(train_iter):
             t_data_end = time.perf_counter()
             t_data = t_data_end - t_data_start
@@ -995,6 +1069,12 @@ def main():
             )
             next_planned_index_for_batch = infer_next_planned_index(batch)
 
+            train_watchdog.update(
+                epoch,
+                batch_idx,
+                "move_batch_to_device",
+                extra=f"data_ms={t_data * 1000:.0f}",
+            )
             batch = move_batch_to_device(batch, device)
             warned_patch_provider_fallback = maybe_fallback_patch_provider(
                 model, batch, args.patch_provider, local_rank, warned_patch_provider_fallback
@@ -1031,6 +1111,7 @@ def main():
             with ctx:
                 with torch.autocast(device_type='cuda', dtype=torch.bfloat16, enabled=amp_enabled):
                     t_model_start = time.perf_counter()
+                    train_watchdog.update(epoch, batch_idx, "model_forward")
                     outputs = model(batch['video'], batch['coords'], batch['t_src'], batch['t_tgt'], batch['t_cam'],
                                     aspect_ratio=batch.get('aspect_ratio'),
                                     local_patches=batch.get('local_patches'),
@@ -1045,17 +1126,20 @@ def main():
                     # dataset. This is correct for both single- and multi-dataset batches.
                     t_loss_start = time.perf_counter()
                     normalize_groups = batch['dataset_id'] * args.num_frames + batch['t_cam']
+                    train_watchdog.update(epoch, batch_idx, "loss")
                     loss_dict = loss_fn(outputs, batch['targets'], normalize_groups=normalize_groups)
                     loss = loss_dict['loss'] / args.grad_accum
                     torch.cuda.synchronize()
                     t_loss = time.perf_counter() - t_loss_start
 
                 t_bwd_start = time.perf_counter()
+                train_watchdog.update(epoch, batch_idx, "backward")
                 loss.backward()
                 torch.cuda.synchronize()
                 t_bwd = time.perf_counter() - t_bwd_start
 
             t_opt_start = time.perf_counter()
+            train_watchdog.update(epoch, batch_idx, "optimizer")
             if is_last_accum:
                 torch.nn.utils.clip_grad_norm_(model.parameters(), args.grad_clip)
                 optimizer.step()
@@ -1186,6 +1270,7 @@ def main():
                         f.write(json.dumps(log_entry) + '\n')
 
             t_data_start = time.perf_counter()
+            train_watchdog.update(epoch, batch_idx + 1, "data_wait")
         if isinstance(train_iter, BatchPrefetchIterator):
             train_iter.close()
 
@@ -1195,6 +1280,7 @@ def main():
 
         # Validation
         if val_loader is not None and (epoch + 1) % args.val_interval == 0:
+            train_watchdog.update(epoch, len(train_loader), "validation")
             model.eval()
             val_metrics = {'loss': 0, 'loss_3d': 0, 'loss_3d_nocon': 0, 'loss_raw_3d': 0, 'loss_2d': 0, 'loss_vis': 0,
                           'loss_disp': 0, 'loss_conf': 0, 'loss_normal': 0,
@@ -1264,6 +1350,7 @@ def main():
 
         # Save checkpoint
         if (epoch + 1) % args.save_interval == 0 and local_rank == 0:
+            train_watchdog.update(epoch, len(train_loader), "save_checkpoint")
             is_milestone = (epoch + 1) % 1000 == 0
             if is_milestone:
                 checkpoint_path = output_dir / f"checkpoint_epoch_{epoch+1}.pth"
@@ -1285,6 +1372,7 @@ def main():
             }, checkpoint_path)
             print(f"Saved checkpoint to {checkpoint_path}")
 
+    train_watchdog.stop()
     if distributed:
         dist.destroy_process_group()
 

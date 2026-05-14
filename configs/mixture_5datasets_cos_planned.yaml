@@ -11,13 +11,18 @@ datasets:
     root: /data3/Kubric
     weight: 0.20
   - name: dynamic_replica
-    root: /data_cos/hdu_datasets/Dynamic_Replica
+    # NFS-mounted copy tested faster for DynamicReplica than COS staging.
+    # Do not move ScanNet++/PointOdyssey/BlendedMVS to /data5 by default; their
+    # NFS small-file reads were slower in the 6-rank probe.
+    root: /data5/d4rt_dataset/Dynamic_Replica
     weight: 0.20
     val_split: valid
     adapter_kwargs:
       # Track-supervised DynamicReplica samples already get RGB + 2D/3D tracks
       # from trajectory .pth files. Skipping depth avoids 48 extra COS objects
-      # per 48-frame sample, but disables DynamicReplica depth-edge sampling.
+      # per 48-frame sample. This also disables the depth-map validity check in
+      # _sample_with_tracks for DynamicReplica; measured mask3d impact was tiny,
+      # while local /data5 load cost roughly doubled on slow 48-frame clips.
       skip_depth_when_tracks: true
       # Prefer uploaded compact trajectory npz files. They omit duplicated RGB,
       # so RGB is read from image PNG while trajectory traffic is much smaller
@@ -52,9 +57,11 @@ datasets:
       strict: false
       scenes_record: /data_cos/hdu_datasets/scannetpp/scenes_record.json
       target_hw: [256, 256]
-      precomputed_cos_timeout_s: 8
+      precomputed_cos_timeout_s: 12
       precomputed_cos_range_retries: 1
-      precomputed_cos_range_workers: 8
+      precomputed_cos_range_workers: 16
+      precomputed_cos_range_merge_gap_bytes: 67108864
+      precomputed_cos_range_max_span_bytes: 2097152
 
 epoch_size: 500000
 clip_len: 48
@@ -107,8 +114,8 @@ max_spool_bytes: 32212254720
 sample_stage_backend: cos_sdk
 sample_stage_root: /data1/zbf/d4rt_sample_stage
 sample_stage_sdk_workers: 2
-# DynamicReplica/Co3D read many small COS objects per sample. Bound per-object
-# tail latency; a requeued sample is cheaper than blocking a builder for 20s+.
+# CO3D/ScanNet++ read many small COS objects per sample. Bound per-object tail
+# latency; a requeued sample is cheaper than blocking a builder for 20s+.
 sample_stage_request_timeout_s: 5
 sample_stage_request_retries: 1
 sample_stage_cache_max_bytes: 399431958528
@@ -120,7 +127,6 @@ sample_stage_window_radius: 0
 sample_stage_datasets:
   - pointodyssey
   - kubric
-  - dynamic_replica
   - co3dv2
   - blendedmvs
   - scannetpp

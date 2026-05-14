@@ -245,6 +245,7 @@ class ScanNetAdapter(BaseAdapter):
         precompute_root: Optional[str] = None,
         verbose: bool = True,
         cache_dir: Optional[str] = None,
+        recompute_legacy_visibility: bool = True,
     ) -> None:
         """
         Parameters
@@ -276,6 +277,7 @@ class ScanNetAdapter(BaseAdapter):
         self.depth_scale = depth_scale
         self.default_pose_convention = default_pose_convention
         self.verbose = verbose
+        self.recompute_legacy_visibility = bool(recompute_legacy_visibility)
 
         # Locate scene directories
         scans_sub = self.root / "scans"
@@ -417,12 +419,34 @@ class ScanNetAdapter(BaseAdapter):
         visibs_out = cache["visibs"].astype(bool)
         has_tracks_out = True
         normals_source = None
+        legacy_visibility_recomputed = False
         if "normals" in cache:
             normals_out = [
                 _resize_normals(normal, (color_h, color_w))
                 for normal in cache["normals"]
             ]
             normals_source = "precomputed"
+
+        # Older ScanNet precomputed caches do not record track semantics
+        # metadata. Their cached visibs can disagree with the current
+        # depth/pose-projection rule, so refresh the projected 2D tracks and
+        # defined/visible masks for the loaded clip on the fly.
+        if self.recompute_legacy_visibility and "track_semantics_version" not in cache:
+            from datasets.computer.depth_to_tracks import recompute_track_projection_masks
+
+            track_depth_max = float(np.asarray(cache.get("track_depth_max", 100.0)).reshape(-1)[0])
+            refreshed = recompute_track_projection_masks(
+                depths=depths,
+                intrinsics=intrinsics,
+                extrinsics=extrinsics,
+                trajs_3d_world=trajs_3d_out,
+                depth_consistency_thresh=0.05,
+                depth_max=track_depth_max,
+            )
+            trajs_2d_out = refreshed["trajs_2d"].astype(np.float32)
+            valids_out = refreshed["valids"].astype(bool)
+            visibs_out = refreshed["visibs"].astype(bool)
+            legacy_visibility_recomputed = True
 
         has_normals_out = normals_out is not None
 
@@ -458,6 +482,12 @@ class ScanNetAdapter(BaseAdapter):
                 "depth_scale": self.depth_scale,
                 "has_axis_alignment": r.has_axis_alignment,
                 "valid_pose_mask": valid_pose.tolist(),
+                "track_semantics_version": (
+                    int(np.asarray(cache["track_semantics_version"]).reshape(-1)[0])
+                    if "track_semantics_version" in cache
+                    else None
+                ),
+                "legacy_visibility_recomputed": legacy_visibility_recomputed,
             },
         )
 
@@ -478,7 +508,16 @@ class ScanNetAdapter(BaseAdapter):
             "visibs",
             "intrinsics",
         ]
-        optional = ["normals", "extrinsics"]
+        optional = [
+            "normals",
+            "extrinsics",
+            "track_semantics_version",
+            "ref_frame",
+            "ref_frames",
+            "num_ref_segments",
+            "track_depth_max",
+            "source_depth_sampling_mode",
+        ]
         selected_keys = required + optional
 
         if h5_path.exists():

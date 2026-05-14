@@ -272,6 +272,9 @@ def _load_config(
             merge_gap = os.getenv("SCANNETPP_PRECOMPUTED_COS_RANGE_MERGE_GAP_BYTES", "").strip()
             if merge_gap:
                 kwargs["precomputed_cos_range_merge_gap_bytes"] = int(merge_gap)
+            max_span = os.getenv("SCANNETPP_PRECOMPUTED_COS_RANGE_MAX_SPAN_BYTES", "").strip()
+            if max_span:
+                kwargs["precomputed_cos_range_max_span_bytes"] = int(max_span)
     return config
 
 
@@ -402,16 +405,18 @@ def _prefix_for_spec(
             )
         else:
             rel = Path(stager._to_cos_key(scene_dir / "frames"))
+            local_dir = stager.cache_data_root / rel
             patterns = _frame_bucket_patterns(frame_indices or [], "jpg")
             if patterns:
-                for pattern in patterns:
+                for pattern, expected_indices in patterns:
                     syncs.append(
                         PrefixSync(
                             dataset,
                             sequence,
                             rel.as_posix() + "/",
-                            stager.cache_data_root / rel,
+                            local_dir,
                             pattern,
+                            tuple(local_dir / f"{idx:06d}.jpg" for idx in expected_indices),
                         )
                     )
             else:
@@ -437,10 +442,22 @@ def _prefix_for_spec(
     return syncs
 
 
-def _frame_bucket_patterns(frame_indices: list[int], suffix: str) -> list[str]:
-    buckets = sorted({max(0, int(idx)) // 100 for idx in frame_indices})
+def _frame_bucket_patterns(
+    frame_indices: list[int],
+    suffix: str,
+) -> list[tuple[str, tuple[int, ...]]]:
+    bucket_indices: dict[int, set[int]] = defaultdict(set)
+    for idx in frame_indices:
+        idx_int = max(0, int(idx))
+        bucket_indices[idx_int // 100].add(idx_int)
     suffix = suffix.lstrip(".")
-    return [f"^.*{bucket:04d}[0-9][0-9]\\.{suffix}$" for bucket in buckets]
+    return [
+        (
+            f"^.*{bucket:04d}[0-9][0-9]\\.{suffix}$",
+            tuple(sorted(indices)),
+        )
+        for bucket, indices in sorted(bucket_indices.items())
+    ]
 
 
 def _exact_name_pattern_chunks(
@@ -450,14 +467,14 @@ def _exact_name_pattern_chunks(
 ) -> list[list[str]]:
     chunks: list[list[str]] = []
     current: list[str] = []
-    current_chars = len("^.*(?:)$")
+    current_chars = len("^.*()$")
     for name in sorted(set(names)):
         escaped = re.escape(name)
         added = len(escaped) + (1 if current else 0)
         if current and current_chars + added > max_chars:
             chunks.append(current)
             current = []
-            current_chars = len("^.*(?:)$")
+            current_chars = len("^.*()$")
         current.append(name)
         current_chars += added
     if current:
@@ -466,8 +483,12 @@ def _exact_name_pattern_chunks(
 
 
 def _exact_name_include_pattern(names: list[str]) -> str:
-    escaped = "|".join(re.escape(name) for name in names)
-    return f"^.*(?:{escaped})$"
+    escaped = [re.escape(name) for name in sorted(set(names))]
+    if not escaped:
+        return r"$.^"
+    if len(escaped) == 1:
+        return f"^.*{escaped[0]}$"
+    return f"^.*({'|'.join(escaped)})$"
 
 
 def _prefix_syncs_for_exact_paths(
@@ -498,6 +519,71 @@ def _prefix_syncs_for_exact_paths(
                 )
             )
     return syncs
+
+
+def _expected_path_ready(path: Path) -> bool:
+    try:
+        return path.is_file() and path.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _missing_expected_paths(paths: tuple[Path, ...], *, limit: int = 20) -> list[Path]:
+    missing: list[Path] = []
+    for path in paths:
+        if not _expected_path_ready(path):
+            missing.append(path)
+            if len(missing) >= limit:
+                break
+    return missing
+
+
+def _sync_marker_name(sync: PrefixSync) -> str:
+    marker_name = ".d4rt_coscli_sync_complete"
+    if sync.include_pattern:
+        import hashlib
+
+        digest = hashlib.sha1(sync.include_pattern.encode("utf-8")).hexdigest()[:12]
+        marker_name = f".d4rt_coscli_sync_complete.{digest}"
+    return marker_name
+
+
+def _prefix_sync_key(sync: PrefixSync) -> tuple[str, str, str, str, str]:
+    return (
+        sync.dataset,
+        sync.sequence,
+        sync.cos_prefix,
+        sync.local_dir.as_posix(),
+        sync.include_pattern,
+    )
+
+
+def _add_prefix_sync(
+    unique_prefixes: dict[tuple[str, str, str, str, str], PrefixSync],
+    sync: PrefixSync,
+) -> None:
+    key = _prefix_sync_key(sync)
+    prev = unique_prefixes.get(key)
+    if prev is None:
+        unique_prefixes[key] = sync
+        return
+    if not sync.expected_paths:
+        return
+    if not prev.expected_paths:
+        unique_prefixes[key] = sync
+        return
+    merged: dict[str, Path] = {path.as_posix(): path for path in prev.expected_paths}
+    for path in sync.expected_paths:
+        merged.setdefault(path.as_posix(), path)
+    if len(merged) != len(prev.expected_paths):
+        unique_prefixes[key] = PrefixSync(
+            dataset=prev.dataset,
+            sequence=prev.sequence,
+            cos_prefix=prev.cos_prefix,
+            local_dir=prev.local_dir,
+            include_pattern=prev.include_pattern,
+            expected_paths=tuple(merged.values()),
+        )
 
 
 def _init_rank_datasets(
@@ -675,16 +761,7 @@ def _collect_block(
                     scannetpp_rgb_mode=scannetpp_rgb_mode,
                 )
                 for sync in syncs:
-                    unique_prefixes.setdefault(
-                        (
-                            sync.dataset,
-                            sync.sequence,
-                            sync.cos_prefix,
-                            sync.local_dir.as_posix(),
-                            sync.include_pattern,
-                        ),
-                        sync,
-                    )
+                    _add_prefix_sync(unique_prefixes, sync)
                     source = stager.mount_root / sync.cos_prefix.rstrip("/")
                     unique_paths.setdefault(f"prefix:{sync.cos_prefix}", source)
             if manifest_mode == "exact":
@@ -791,16 +868,7 @@ def _collect_block(
             paths=list(by_key.values()),
         )
         for sync in syncs:
-            unique_prefixes.setdefault(
-                (
-                    sync.dataset,
-                    sync.sequence,
-                    sync.cos_prefix,
-                    sync.local_dir.as_posix(),
-                    sync.include_pattern,
-                ),
-                sync,
-            )
+            _add_prefix_sync(unique_prefixes, sync)
     for (dataset_name, sequence_name), (adapter, frame_set) in planned_sdk_exact_frames.items():
         manifest = stager._build_manifest(
             adapter,
@@ -840,15 +908,10 @@ def _sync_one(
 ) -> dict[str, Any]:
     if skip_existing:
         if sync.expected_paths:
-            if all(path.is_file() for path in sync.expected_paths):
+            if not _missing_expected_paths(sync.expected_paths, limit=1):
                 return {"ok": True, "skipped": True, "elapsed_s": 0.0, "sync": sync}
         else:
-            marker_name = ".d4rt_coscli_sync_complete"
-            if sync.include_pattern:
-                import hashlib
-
-                digest = hashlib.sha1(sync.include_pattern.encode("utf-8")).hexdigest()[:12]
-                marker_name = f".d4rt_coscli_sync_complete.{digest}"
+            marker_name = _sync_marker_name(sync)
             complete_marker = sync.local_dir / marker_name
             if sync.local_dir.is_dir() and complete_marker.is_file():
                 return {"ok": True, "skipped": True, "elapsed_s": 0.0, "sync": sync}
@@ -892,31 +955,39 @@ def _sync_one(
         check=False,
     )
     elapsed = time.perf_counter() - t0
-    if proc.returncode == 0 and sync.cos_prefix.endswith("/"):
+    missing_expected: list[Path] = []
+    if proc.returncode == 0 and sync.expected_paths:
+        missing_expected = _missing_expected_paths(sync.expected_paths)
+    ok = proc.returncode == 0 and not missing_expected
+    if ok and sync.cos_prefix.endswith("/"):
         try:
-            marker_name = ".d4rt_coscli_sync_complete"
-            if sync.include_pattern:
-                import hashlib
-
-                digest = hashlib.sha1(sync.include_pattern.encode("utf-8")).hexdigest()[:12]
-                marker_name = f".d4rt_coscli_sync_complete.{digest}"
+            marker_name = _sync_marker_name(sync)
             (sync.local_dir / marker_name).write_text(
                 (
                     f"prefix={sync.cos_prefix}\n"
                     f"include={sync.include_pattern}\n"
+                    f"expected={len(sync.expected_paths)}\n"
                     f"time={time.time():.6f}\n"
                 ),
                 encoding="utf-8",
             )
         except OSError:
             pass
+    output_tail = "\n".join(proc.stdout.splitlines()[-8:])
+    if missing_expected:
+        output_tail = (
+            output_tail
+            + "\nmissing_expected="
+            + ",".join(path.name for path in missing_expected[:20])
+        ).strip()
     return {
-        "ok": proc.returncode == 0,
+        "ok": ok,
         "skipped": False,
         "elapsed_s": elapsed,
         "returncode": proc.returncode,
         "sync": sync,
-        "output_tail": "\n".join(proc.stdout.splitlines()[-8:]),
+        "missing_expected": len(missing_expected),
+        "output_tail": output_tail,
     }
 
 

@@ -1312,6 +1312,9 @@ class SampleLocalStager:
         pinned_exact = (
             pinned_paths - set(pinned_dirs) if pinned_dirs else pinned_paths
         )
+        _scan_batch = int(os.environ.get("D4RT_EVICT_SCAN_BATCH_SIZE", "2000"))
+        _scan_sleep = float(os.environ.get("D4RT_EVICT_SCAN_BATCH_SLEEP_S", "0.01"))
+        _scan_count = 0
         for dirpath, _, filenames in os.walk(cache_root_str):
             for name in filenames:
                 if name.startswith(".") or ".part." in name:
@@ -1332,6 +1335,9 @@ class SampleLocalStager:
                 ):
                     continue
                 entries.append((stat.st_mtime, stat.st_size, path_str))
+                _scan_count += 1
+                if _scan_sleep > 0 and _scan_count % _scan_batch == 0:
+                    time.sleep(_scan_sleep)
         scan_s = time.perf_counter() - scan_t0
 
         stats: dict[str, float | int] = {

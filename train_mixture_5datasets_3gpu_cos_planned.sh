@@ -35,12 +35,12 @@ if [[ -z "${KUBRIC_ROOT:-}" ]]; then
 fi
 DYNAMIC_REPLICA_ROOT="${DYNAMIC_REPLICA_ROOT:-/data5/d4rt_dataset/Dynamic_Replica}"
 # CO3DV2_ROOT="${CO3DV2_ROOT:-/data2/d4rt/datasets/Co3Dv2}"
-CO3DV2_ROOT="${CO3DV2_ROOT:-/data_cos/hdu_datasets/Co3Dv2}"
+CO3DV2_ROOT="${CO3DV2_ROOT:-/data4/d4rt_dataset/Co3Dv2}"
 BLENDEDMVS_ROOT="${BLENDEDMVS_ROOT:-/data2/d4rt/datasets/BlendedMVS}"
 MVSSYNTH_ROOT="${MVSSYNTH_ROOT:-/data2/d4rt/datasets/MVS-Synth/GTAV_1080}"
-SCANNETPP_ROOT="${SCANNETPP_ROOT:-/data_cos/hdu_datasets/scannetpp/data}"
-SCANNETPP_SPLITS_DIR="${SCANNETPP_SPLITS_DIR:-/data_cos/hdu_datasets/scannetpp/splits}"
-SCANNETPP_SCENES_RECORD="${SCANNETPP_SCENES_RECORD:-/data_cos/hdu_datasets/scannetpp/scenes_record.json}"
+SCANNETPP_ROOT="${SCANNETPP_ROOT:-/data5/d4rt_dataset/scannetpp/data}"
+SCANNETPP_SPLITS_DIR="${SCANNETPP_SPLITS_DIR:-/data5/d4rt_dataset/scannetpp/splits}"
+SCANNETPP_SCENES_RECORD="${SCANNETPP_SCENES_RECORD:-/data5/d4rt_dataset/scannetpp/scenes_record.json}"
 CO3DV2_DENYLIST="${CO3DV2_DENYLIST:-/data/zbf/openclaw/d4rt/configs/co3dv2_denylist_degenerate_clips_20260422.txt}"
 CO3DV2_FRAME_CACHE_ITEMS="${CO3DV2_FRAME_CACHE_ITEMS:-384}"
 CO3DV2_IO_WORKERS="${CO3DV2_IO_WORKERS:-4}"
@@ -79,6 +79,7 @@ SAMPLE_STAGE_WINDOW_RADIUS="${SAMPLE_STAGE_WINDOW_RADIUS:-0}"
 SAMPLE_STAGE_DATASETS="${SAMPLE_STAGE_DATASETS:-pointodyssey,kubric,co3dv2,scannetpp}"
 SAMPLE_STAGE_SCENE_PREFETCH_DATASETS="${SAMPLE_STAGE_SCENE_PREFETCH_DATASETS:-}"
 SAMPLE_STAGE_MOUNT_ROOT="${SAMPLE_STAGE_MOUNT_ROOT:-/data_cos}"
+SAMPLE_STAGE_EXTRA_MOUNT_ROOTS="${SAMPLE_STAGE_EXTRA_MOUNT_ROOTS:-/data4,/data5}"
 SAMPLE_STAGE_BUCKET="${SAMPLE_STAGE_BUCKET:-hd-ai-data-1251882982}"
 SAMPLE_STAGE_REGION="${SAMPLE_STAGE_REGION:-ap-beijing}"
 SAMPLE_STAGE_PASSWD_FILE="${SAMPLE_STAGE_PASSWD_FILE:-/etc/passwd-s3fs-data_cos}"
@@ -131,7 +132,7 @@ OUTPUT_DIR="${OUTPUT_DIR:-outputs/mixture_6datasets_cos_planned_from200}"
 DEFAULT_PRETRAIN=""
 PRETRAIN="${PRETRAIN-$DEFAULT_PRETRAIN}"
 # DEFAULT_RESUME=""
-DEFAULT_RESUME="/data/zbf/openclaw/d4rt/.claude/worktrees/cos-acceleration/outputs/mixture_6datasets_cos_planned_from200/checkpoint_latest_440.pth"
+DEFAULT_RESUME="/data/zbf/openclaw/d4rt/.claude/worktrees/cos-acceleration/outputs/mixture_6datasets_cos_planned_from200/checkpoint_latest_457.pth"
 RESUME="${RESUME-$DEFAULT_RESUME}"
 VAL_INTERVAL="${VAL_INTERVAL:-2}"
 VAL_SAMPLES="${VAL_SAMPLES:-1000}"
@@ -406,6 +407,9 @@ echo "[mixture_5datasets_cos_planned] SCANNETPP_SPLITS_DIR=$SCANNETPP_SPLITS_DIR
 echo "[mixture_5datasets_cos_planned] SCANNETPP_SCENES_RECORD=$SCANNETPP_SCENES_RECORD"
 if [[ "$CO3DV2_ROOT" == /data_cos/* && ",$SAMPLE_STAGE_DATASETS," != *",co3dv2,"* ]]; then
   echo "[mixture_5datasets_cos_planned] WARNING: Co3Dv2 is on /data_cos but is not enabled in SAMPLE_STAGE_DATASETS; it will read through the mounted filesystem."
+fi
+if [[ "$CO3DV2_ROOT" != /data_cos/* && "$CO3DV2_ROOT" != /data2/* && ",$SAMPLE_STAGE_DATASETS," == *",co3dv2,"* ]]; then
+  echo "[mixture_5datasets_cos_planned] Co3Dv2 on NFS ($CO3DV2_ROOT) with staging enabled via SAMPLE_STAGE_EXTRA_MOUNT_ROOTS=$SAMPLE_STAGE_EXTRA_MOUNT_ROOTS"
 fi
 echo "[mixture_5datasets_cos_planned] BLENDEDMVS_DEPTH_CACHE_DIR=$BLENDEDMVS_DEPTH_CACHE_DIR"
 echo "[mixture_5datasets_cos_planned] INDEX_CACHE_DIR=$INDEX_CACHE_DIR"
@@ -688,7 +692,7 @@ if [[ "$WARM_CACHE_ONLY" == "1" ]]; then
 fi
 
 TEMP_CONFIG="$(mktemp "${TMPDIR:-/tmp}/mixture_5datasets_cos_planned.XXXXXX.yaml")"
-"$PYTHON_BIN" - "$CONFIG" "$TEMP_CONFIG" "$POINTODYSSEY_ROOT" "$POINTODYSSEY_FAST_ROOT" "$KUBRIC_ROOT" "$DYNAMIC_REPLICA_ROOT" "$CO3DV2_ROOT" "$BLENDEDMVS_ROOT" "$MVSSYNTH_ROOT" "$SCANNETPP_ROOT" "$SCANNETPP_SPLITS_DIR" "$SCANNETPP_SCENES_RECORD" "$INDEX_CACHE_DIR" "$CO3DV2_DENYLIST" "$BUILDER_WORKERS" "$PREFETCH_DEPTH" "$MAX_SPOOL_BYTES_GB" "$SAMPLE_STAGE_BACKEND" "$SAMPLE_STAGE_ROOT" "$SAMPLE_STAGE_SDK_WORKERS" "$SAMPLE_STAGE_REQUEST_TIMEOUT_S" "$SAMPLE_STAGE_REQUEST_RETRIES" "$SAMPLE_STAGE_DATASETS" "$SAMPLE_STAGE_SCENE_PREFETCH_DATASETS" "$SAMPLE_STAGE_MOUNT_ROOT" "$SAMPLE_STAGE_BUCKET" "$SAMPLE_STAGE_REGION" "$SAMPLE_STAGE_PASSWD_FILE" "$SAMPLE_STAGE_CACHE_MAX_GB" "$SAMPLE_STAGE_CACHE_LOW_WATERMARK_RATIO" "$SAMPLE_STAGE_CACHE_TOUCH_INTERVAL_S" "$SAMPLE_STAGE_CACHE_SCAN_INTERVAL_S" "$SAMPLE_STAGE_EVICTION_MODE" "$SAMPLE_STAGE_WINDOW_RADIUS" "$PRECOMPUTE_PATCHES" "$PRECOMPUTE_FROM_HIGHRES" "$STORE_VIDEO_UINT8" "$STORE_AUXILIARY_TENSORS" "$SCANNETPP_H5_CHUNK_CACHE_DIR" "$SCANNETPP_H5_CHUNK_CACHE_MIN_BYTES" "$SCANNETPP_H5_CHUNK_CACHE_MAX_GB" "$SCANNETPP_H5_CHUNK_CACHE_LOW_WATERMARK_RATIO" "$SCANNETPP_H5_CHUNK_CACHE_SCAN_INTERVAL_S" "$SCANNETPP_PRECOMPUTED_COS_TIMEOUT_S" "$SCANNETPP_PRECOMPUTED_COS_RANGE_RETRIES" "$SCANNETPP_PRECOMPUTED_COS_RANGE_WORKERS" "$SCANNETPP_PRECOMPUTED_COS_RANGE_MERGE_GAP_BYTES" "$SCANNETPP_PRECOMPUTED_COS_RANGE_MAX_SPAN_BYTES" "$LOAD_NORMALS" "$USE_MOTION_BOUNDARIES" "$COLOR_AUG_AFTER_RESIZE" "$MOTION_BOUNDARY_ON_RESIZED" "$KEEP_CROPPED_IMAGES" "$DYNAMIC_REPLICA_SKIP_DEPTH_WHEN_TRACKS" <<'PY'
+"$PYTHON_BIN" - "$CONFIG" "$TEMP_CONFIG" "$POINTODYSSEY_ROOT" "$POINTODYSSEY_FAST_ROOT" "$KUBRIC_ROOT" "$DYNAMIC_REPLICA_ROOT" "$CO3DV2_ROOT" "$BLENDEDMVS_ROOT" "$MVSSYNTH_ROOT" "$SCANNETPP_ROOT" "$SCANNETPP_SPLITS_DIR" "$SCANNETPP_SCENES_RECORD" "$INDEX_CACHE_DIR" "$CO3DV2_DENYLIST" "$BUILDER_WORKERS" "$PREFETCH_DEPTH" "$MAX_SPOOL_BYTES_GB" "$SAMPLE_STAGE_BACKEND" "$SAMPLE_STAGE_ROOT" "$SAMPLE_STAGE_SDK_WORKERS" "$SAMPLE_STAGE_REQUEST_TIMEOUT_S" "$SAMPLE_STAGE_REQUEST_RETRIES" "$SAMPLE_STAGE_DATASETS" "$SAMPLE_STAGE_SCENE_PREFETCH_DATASETS" "$SAMPLE_STAGE_MOUNT_ROOT" "$SAMPLE_STAGE_EXTRA_MOUNT_ROOTS" "$SAMPLE_STAGE_BUCKET" "$SAMPLE_STAGE_REGION" "$SAMPLE_STAGE_PASSWD_FILE" "$SAMPLE_STAGE_CACHE_MAX_GB" "$SAMPLE_STAGE_CACHE_LOW_WATERMARK_RATIO" "$SAMPLE_STAGE_CACHE_TOUCH_INTERVAL_S" "$SAMPLE_STAGE_CACHE_SCAN_INTERVAL_S" "$SAMPLE_STAGE_EVICTION_MODE" "$SAMPLE_STAGE_WINDOW_RADIUS" "$PRECOMPUTE_PATCHES" "$PRECOMPUTE_FROM_HIGHRES" "$STORE_VIDEO_UINT8" "$STORE_AUXILIARY_TENSORS" "$SCANNETPP_H5_CHUNK_CACHE_DIR" "$SCANNETPP_H5_CHUNK_CACHE_MIN_BYTES" "$SCANNETPP_H5_CHUNK_CACHE_MAX_GB" "$SCANNETPP_H5_CHUNK_CACHE_LOW_WATERMARK_RATIO" "$SCANNETPP_H5_CHUNK_CACHE_SCAN_INTERVAL_S" "$SCANNETPP_PRECOMPUTED_COS_TIMEOUT_S" "$SCANNETPP_PRECOMPUTED_COS_RANGE_RETRIES" "$SCANNETPP_PRECOMPUTED_COS_RANGE_WORKERS" "$SCANNETPP_PRECOMPUTED_COS_RANGE_MERGE_GAP_BYTES" "$SCANNETPP_PRECOMPUTED_COS_RANGE_MAX_SPAN_BYTES" "$LOAD_NORMALS" "$USE_MOTION_BOUNDARIES" "$COLOR_AUG_AFTER_RESIZE" "$MOTION_BOUNDARY_ON_RESIZED" "$KEEP_CROPPED_IMAGES" "$DYNAMIC_REPLICA_SKIP_DEPTH_WHEN_TRACKS" <<'PY'
 from pathlib import Path
 import os
 import sys
@@ -720,35 +724,36 @@ sample_stage_request_retries = int(sys.argv[22])
 sample_stage_datasets = sys.argv[23].strip()
 sample_stage_scene_prefetch_datasets = sys.argv[24].strip()
 sample_stage_mount_root = sys.argv[25].strip()
-sample_stage_bucket = sys.argv[26].strip()
-sample_stage_region = sys.argv[27].strip()
-sample_stage_passwd_file = sys.argv[28].strip()
-sample_stage_cache_max_bytes = int(float(sys.argv[29]) * 1024**3)
-sample_stage_cache_low_watermark_ratio = float(sys.argv[30])
-sample_stage_cache_touch_interval_s = float(sys.argv[31])
-sample_stage_cache_scan_interval_s = float(sys.argv[32])
-sample_stage_eviction_mode = sys.argv[33].strip()
-sample_stage_window_radius = int(sys.argv[34])
-precompute_patches_arg = sys.argv[35]
-precompute_from_highres_arg = sys.argv[36]
-store_video_uint8_arg = sys.argv[37]
-store_auxiliary_tensors_arg = sys.argv[38]
-scannetpp_h5_chunk_cache_dir = sys.argv[39].strip()
-scannetpp_h5_chunk_cache_min_bytes = int(sys.argv[40])
-scannetpp_h5_chunk_cache_max_bytes = int(float(sys.argv[41]) * 1024**3)
-scannetpp_h5_chunk_cache_low_watermark_ratio = float(sys.argv[42])
-scannetpp_h5_chunk_cache_scan_interval_s = float(sys.argv[43])
-scannetpp_precomputed_cos_timeout_s = int(float(sys.argv[44]))
-scannetpp_precomputed_cos_range_retries = int(sys.argv[45])
-scannetpp_precomputed_cos_range_workers = int(sys.argv[46])
-scannetpp_precomputed_cos_range_merge_gap_bytes = int(sys.argv[47])
-scannetpp_precomputed_cos_range_max_span_bytes = int(sys.argv[48])
-load_normals_arg = sys.argv[49]
-use_motion_boundaries_arg = sys.argv[50]
-color_aug_after_resize_arg = sys.argv[51]
-motion_boundary_on_resized_arg = sys.argv[52]
-keep_cropped_images_arg = sys.argv[53].strip()
-dynamic_replica_skip_depth_when_tracks_arg = sys.argv[54]
+sample_stage_extra_mount_roots = sys.argv[26].strip()
+sample_stage_bucket = sys.argv[27].strip()
+sample_stage_region = sys.argv[28].strip()
+sample_stage_passwd_file = sys.argv[29].strip()
+sample_stage_cache_max_bytes = int(float(sys.argv[30]) * 1024**3)
+sample_stage_cache_low_watermark_ratio = float(sys.argv[31])
+sample_stage_cache_touch_interval_s = float(sys.argv[32])
+sample_stage_cache_scan_interval_s = float(sys.argv[33])
+sample_stage_eviction_mode = sys.argv[34].strip()
+sample_stage_window_radius = int(sys.argv[35])
+precompute_patches_arg = sys.argv[36]
+precompute_from_highres_arg = sys.argv[37]
+store_video_uint8_arg = sys.argv[38]
+store_auxiliary_tensors_arg = sys.argv[39]
+scannetpp_h5_chunk_cache_dir = sys.argv[40].strip()
+scannetpp_h5_chunk_cache_min_bytes = int(sys.argv[41])
+scannetpp_h5_chunk_cache_max_bytes = int(float(sys.argv[42]) * 1024**3)
+scannetpp_h5_chunk_cache_low_watermark_ratio = float(sys.argv[43])
+scannetpp_h5_chunk_cache_scan_interval_s = float(sys.argv[44])
+scannetpp_precomputed_cos_timeout_s = int(float(sys.argv[45]))
+scannetpp_precomputed_cos_range_retries = int(sys.argv[46])
+scannetpp_precomputed_cos_range_workers = int(sys.argv[47])
+scannetpp_precomputed_cos_range_merge_gap_bytes = int(sys.argv[48])
+scannetpp_precomputed_cos_range_max_span_bytes = int(sys.argv[49])
+load_normals_arg = sys.argv[50]
+use_motion_boundaries_arg = sys.argv[51]
+color_aug_after_resize_arg = sys.argv[52]
+motion_boundary_on_resized_arg = sys.argv[53]
+keep_cropped_images_arg = sys.argv[54].strip()
+dynamic_replica_skip_depth_when_tracks_arg = sys.argv[55]
 
 
 def parse_bool(value: str) -> bool:
@@ -921,6 +926,11 @@ if sample_stage_backend:
         if item.strip()
     ]
     config["sample_stage_mount_root"] = sample_stage_mount_root
+    config["sample_stage_extra_mount_roots"] = [
+        item.strip()
+        for item in sample_stage_extra_mount_roots.split(",")
+        if item.strip()
+    ]
     config["sample_stage_bucket"] = sample_stage_bucket
     config["sample_stage_region"] = sample_stage_region
     config["sample_stage_passwd_file"] = sample_stage_passwd_file

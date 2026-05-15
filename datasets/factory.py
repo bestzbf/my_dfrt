@@ -375,6 +375,7 @@ def _create_mixture_dataset(config: dict, split: str, rank: int = 0, world_size:
                 'eviction_mode': config.get('sample_stage_eviction_mode', 'background'),
                 'window_radius': config.get('sample_stage_window_radius', 0),
                 'mount_root': config.get('sample_stage_mount_root', '/data_cos'),
+                'extra_mount_roots': config.get('sample_stage_extra_mount_roots', []),
                 'bucket': config.get('sample_stage_bucket', 'hd-ai-data-1251882982'),
                 'region': config.get('sample_stage_region', 'ap-beijing'),
                 'passwd_file': config.get('sample_stage_passwd_file', '/etc/passwd-s3fs-data_cos'),

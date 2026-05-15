@@ -42,27 +42,29 @@ datasets:
       precomputed_cos_range_retries: 1
       precomputed_cos_range_workers: 4
   - name: scannet
-    root: /data3/dataset/scannet
+    root: /data4/d4rt_dataset/scannet
     weight: 0.10
     adapter_kwargs:
-      precompute_root: /data3/dataset/scannet
+      precompute_root: /data4/d4rt_dataset/scannet
   - name: tartanair
-    root: /data_cos/hdu_datasets/tartanairv1
+    root: /data5/d4rt_dataset/tartanairv1
     weight: 0.10
     adapter_kwargs:
       camera: left
-      precompute_root: /data_cos/hdu_datasets/tartanairv1
+      precompute_root: /data5/d4rt_dataset/tartanairv1
       # Existing TartanAir precomputed.npz files are partial sequence caches
       # (for example 82 cached frames for 630 raw frames).  Loading them causes
       # out-of-bounds fallbacks and expensive 0.1-1.7GB COS downloads; keep
       # TartanAir on RGB/depth static supervision until full caches are rebuilt.
       load_precomputed: false
   - name: vkitti2
-    root: /data3/dataset/VirtualKitti
+    root: /data5/d4rt_dataset/VirtualKitti
     weight: 0.10
     adapter_kwargs:
       camera: Camera_0
-      precompute_root: /data3/dataset/VirtualKitti
+      precompute_root: /data5/d4rt_dataset/VirtualKitti
+      load_normals: false
+      load_flow: false
   - name: mvssynth
     root: /data2/d4rt/datasets/MVS-Synth/GTAV_1080
     weight: 0.10
@@ -120,9 +122,12 @@ sample_stage_datasets:
   - dynamic_replica
   - co3dv2
   - scannetpp
+  - scannet
   - tartanair
+  - vkitti2
 sample_stage_scene_prefetch_datasets: []
 sample_stage_mount_root: /data_cos
+sample_stage_extra_mount_roots: [/data4, /data5]
 sample_stage_bucket: hd-ai-data-1251882982
 sample_stage_region: ap-beijing
 sample_stage_passwd_file: /etc/passwd-s3fs-data_cos

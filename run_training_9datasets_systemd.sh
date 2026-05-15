@@ -4,26 +4,25 @@ set -euo pipefail
 usage() {
   cat <<'EOF'
 Usage:
-  ./run_training_systemd.sh  --unit d4rt
+  ./run_training_9datasets_systemd.sh --unit d4rt-9datasets
 
 Options:
-  --unit NAME             systemd unit name. Default: d4rt-training-<timestamp>
+  --unit NAME             systemd unit name. Default: d4rt-9datasets-<timestamp>
   --log-dir DIR           log directory. Default: <worktree>/logs
   -h, --help              show this help.
 
-  # 查看训练状态                                                                                                                                                                                                                        
-  systemctl status d4rt-training-<timestamp>                                                                                                                                                                                            
-                                                                                                                                                                                                                                        
-  # 停止训练                                                                                                                                                                                                                            
-  systemctl stop d4rt
-                                                                                                                                                                                                                                        
-  # 查看日志      
-  journalctl -u d4rt-training-<timestamp> -f
-
-
 Examples:
-  ./run_training_systemd.sh
-  ./run_training_systemd.sh --unit my-training-run
+  ./run_training_9datasets_systemd.sh
+  ./run_training_9datasets_systemd.sh --unit d4rt-9datasets
+
+Check status:
+  systemctl status --no-pager d4rt-9datasets
+
+View logs:
+  journalctl -u d4rt-9datasets -f
+
+Stop:
+  systemctl stop d4rt-9datasets
 EOF
 }
 
@@ -64,7 +63,7 @@ done
 command -v systemd-run >/dev/null 2>&1 || die "systemd-run not found in PATH"
 
 work_dir="/data/zbf/openclaw/d4rt/.claude/worktrees/cos-acceleration"
-script_path="${work_dir}/train_mixture_5datasets_3gpu_cos_planned.sh"
+script_path="${work_dir}/train_mixture_9datasets_3gpu_cos_planned.sh"
 
 [[ -f "$script_path" ]] || die "training script does not exist: $script_path"
 
@@ -74,20 +73,13 @@ fi
 
 timestamp="$(date +%Y%m%d_%H%M%S)"
 if [[ -z "$unit" ]]; then
-  unit="d4rt-training-${timestamp}"
+  unit="d4rt-9datasets-${timestamp}"
 fi
 unit="$(shell_safe_name "$unit")"
 
-main_log="${log_dir}/training_${timestamp}.log"
-# cuda_visible_devices="${CUDA_VISIBLE_DEVICES:-1,2,3,4,5,6}"
+main_log="${log_dir}/training_9datasets_${timestamp}.log"
 
-# Pin the data-loading settings that were validated for the 6-rank, batch-40
-# planned pipeline.  The training script still has the same defaults, but
-# systemd runs are long-lived enough that inheriting stale shell overrides
-# (for example BUILDER_WORKERS=24 / sdk_workers=8 / low_watermark=0.99) can
-# silently put the job back onto a slower configuration.
 training_env=(
-  # "CUDA_VISIBLE_DEVICES=$cuda_visible_devices"
   "NPROC_PER_NODE=6"
   "BATCH_SIZE=40"
   "BUILDER_WORKERS=18"
@@ -103,7 +95,14 @@ training_env=(
   "SCANNETPP_ROOT=/data5/d4rt_dataset/scannetpp/data"
   "SCANNETPP_SPLITS_DIR=/data5/d4rt_dataset/scannetpp/splits"
   "SCANNETPP_SCENES_RECORD=/data5/d4rt_dataset/scannetpp/scenes_record.json"
-  "SAMPLE_STAGE_DATASETS=pointodyssey,kubric,co3dv2,scannetpp,dynamic_replica"
+  "SCANNET_ROOT=/data4/d4rt_dataset/scannet"
+  "TARTANAIR_ROOT=/data5/d4rt_dataset/tartanairv1"
+  "VKITTI2_ROOT=/data5/d4rt_dataset/VirtualKitti"
+  "INDEX_CACHE_DIR=/data/zbf/openclaw/d4rt/.index_cache_9datasets_local"
+  "OUTPUT_DIR=outputs/mixture_9datasets_cos_planned_from457"
+  "BALANCE_DATASET_WEIGHTS=1"
+  "WARM_EXTRA_INDEX_CACHE=1"
+  "SAMPLE_STAGE_DATASETS=pointodyssey,kubric,dynamic_replica,co3dv2,scannetpp,scannet,tartanair,vkitti2"
   "SAMPLE_STAGE_EXTRA_MOUNT_ROOTS=/data4,/data5"
   "SAMPLE_STAGE_SDK_WORKERS=8"
   "SAMPLE_STAGE_REQUEST_TIMEOUT_S=5"
@@ -181,7 +180,7 @@ fi
 
 systemd-run \
   --unit="$unit" \
-  --description="D4RT training ${timestamp}" \
+  --description="D4RT 9-dataset training ${timestamp}" \
   --working-directory="$work_dir" \
   --setenv=HOME=/root \
   --setenv=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
@@ -189,7 +188,7 @@ systemd-run \
   "${training_env[@]/#/--setenv=}" \
   --collect \
   /bin/bash -c '
-    exec bash train_mixture_5datasets_3gpu_cos_planned.sh >> "$TRAINING_LOG" 2>&1
+    exec bash train_mixture_9datasets_3gpu_cos_planned.sh >> "$TRAINING_LOG" 2>&1
   '
 
 echo

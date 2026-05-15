@@ -25,21 +25,22 @@ if [[ -z "${KUBRIC_ROOT:-}" ]]; then
     KUBRIC_ROOT="/data_cos/hdu_datasets/Kubric"
   fi
 fi
-DYNAMIC_REPLICA_ROOT="${DYNAMIC_REPLICA_ROOT:-/data_cos/hdu_datasets/Dynamic_Replica}"
-CO3DV2_ROOT="${CO3DV2_ROOT:-/data_cos/hdu_datasets/Co3Dv2}"
+DYNAMIC_REPLICA_ROOT="${DYNAMIC_REPLICA_ROOT:-/data5/d4rt_dataset/Dynamic_Replica}"
+CO3DV2_ROOT="${CO3DV2_ROOT:-/data4/d4rt_dataset/Co3Dv2}"
 BLENDEDMVS_ROOT="${BLENDEDMVS_ROOT:-/data2/d4rt/datasets/BlendedMVS}"
-SCANNETPP_ROOT="${SCANNETPP_ROOT:-/data_cos/hdu_datasets/scannetpp/data}"
-SCANNETPP_SPLITS_DIR="${SCANNETPP_SPLITS_DIR:-/data_cos/hdu_datasets/scannetpp/splits}"
-SCANNETPP_SCENES_RECORD="${SCANNETPP_SCENES_RECORD:-/data_cos/hdu_datasets/scannetpp/scenes_record.json}"
-SCANNET_ROOT="${SCANNET_ROOT:-/data3/dataset/scannet}"
-TARTANAIR_ROOT="${TARTANAIR_ROOT:-/data_cos/hdu_datasets/tartanairv1}"
-VKITTI2_ROOT="${VKITTI2_ROOT:-/data3/dataset/VirtualKitti}"
+SCANNETPP_ROOT="${SCANNETPP_ROOT:-/data5/d4rt_dataset/scannetpp/data}"
+SCANNETPP_SPLITS_DIR="${SCANNETPP_SPLITS_DIR:-/data5/d4rt_dataset/scannetpp/splits}"
+SCANNETPP_SCENES_RECORD="${SCANNETPP_SCENES_RECORD:-/data5/d4rt_dataset/scannetpp/scenes_record.json}"
+SCANNET_ROOT="${SCANNET_ROOT:-/data4/d4rt_dataset/scannet}"
+TARTANAIR_ROOT="${TARTANAIR_ROOT:-/data5/d4rt_dataset/tartanairv1}"
+VKITTI2_ROOT="${VKITTI2_ROOT:-/data5/d4rt_dataset/VirtualKitti}"
 MVSSYNTH_ROOT="${MVSSYNTH_ROOT:-/data2/d4rt/datasets/MVS-Synth/GTAV_1080}"
 CO3DV2_DENYLIST="${CO3DV2_DENYLIST:-/data/zbf/openclaw/d4rt/configs/co3dv2_denylist_degenerate_clips_20260422.txt}"
 
 INDEX_CACHE_DIR="${INDEX_CACHE_DIR:-/data/zbf/openclaw/d4rt/.index_cache_10datasets_local}"
 OUTPUT_DIR="${OUTPUT_DIR:-outputs/mixture_10datasets_cos_planned_from422}"
-SAMPLE_STAGE_DATASETS="${SAMPLE_STAGE_DATASETS:-pointodyssey,kubric,dynamic_replica,co3dv2,scannetpp}"
+SAMPLE_STAGE_DATASETS="${SAMPLE_STAGE_DATASETS:-pointodyssey,kubric,dynamic_replica,co3dv2,scannetpp,scannet,tartanair,vkitti2}"
+SAMPLE_STAGE_EXTRA_MOUNT_ROOTS="${SAMPLE_STAGE_EXTRA_MOUNT_ROOTS:-/data4,/data5}"
 
 mkdir -p "$TMPDIR" "$INDEX_CACHE_DIR"
 if [[ ! -f "$PYTHON_BIN" ]]; then
@@ -135,6 +136,11 @@ for name in ("scannet", "tartanair", "vkitti2", "mvssynth"):
         kwargs = datasets[name].setdefault("adapter_kwargs", {})
         kwargs["precompute_root"] = datasets[name]["root"]
 
+if "vkitti2" in datasets:
+    kwargs = datasets["vkitti2"].setdefault("adapter_kwargs", {})
+    kwargs["load_normals"] = False
+    kwargs["load_flow"] = False
+
 cfg["index_cache_dir"] = index_cache_dir
 Path(dst).write_text(yaml.safe_dump(cfg, sort_keys=False))
 PY
@@ -143,6 +149,7 @@ export CONFIG="$TEMP_CONFIG"
 export INDEX_CACHE_DIR
 export OUTPUT_DIR
 export SAMPLE_STAGE_DATASETS
+export SAMPLE_STAGE_EXTRA_MOUNT_ROOTS
 export POINTODYSSEY_ROOT
 export POINTODYSSEY_LOCAL_ROOT
 export POINTODYSSEY_FAST_ROOT

@@ -47,6 +47,7 @@ class SampleStageConfig:
     eviction_mode: str = "background"
     window_radius: int = 0
     mount_root: str = "/data_cos"
+    extra_mount_roots: tuple[str, ...] = ()
     bucket: str = "hd-ai-data-1251882982"
     region: str = "ap-beijing"
     passwd_file: str = "/etc/passwd-s3fs-data_cos"
@@ -114,6 +115,11 @@ class SampleStageConfig:
             eviction_mode=eviction_mode,
             window_radius=max(0, int(raw.get("window_radius", 0))),
             mount_root=str(raw.get("mount_root", "/data_cos")).strip(),
+            extra_mount_roots=tuple(
+                str(item).strip()
+                for item in (raw.get("extra_mount_roots") or ())
+                if str(item).strip()
+            ),
             bucket=str(raw.get("bucket", "hd-ai-data-1251882982")).strip(),
             region=str(raw.get("region", "ap-beijing")).strip(),
             passwd_file=str(raw.get("passwd_file", "/etc/passwd-s3fs-data_cos")).strip(),
@@ -131,6 +137,9 @@ class SampleLocalStager:
             raise ValueError(f"Unsupported sample stage backend: {config.backend!r}")
         self.config = config
         self.mount_root = Path(config.mount_root)
+        self.all_mount_roots: list[Path] = [self.mount_root] + [
+            Path(p) for p in config.extra_mount_roots
+        ]
         self.stage_root = Path(config.stage_root)
         self.stage_root.mkdir(parents=True, exist_ok=True)
         self.cache_root = self.stage_root / "shared_raw_cache"
@@ -199,8 +208,12 @@ class SampleLocalStager:
         root = getattr(adapter, "root", None)
         if root is None:
             return False
-        mount = str(self.mount_root).rstrip("/") + "/"
-        return str(root).startswith(mount) or str(root) == str(self.mount_root)
+        root_str = str(root)
+        for mr in self.all_mount_roots:
+            mount = str(mr).rstrip("/") + "/"
+            if root_str.startswith(mount) or root_str == str(mr):
+                return True
+        return False
 
     @contextlib.contextmanager
     def stage_sample(
@@ -318,6 +331,8 @@ class SampleLocalStager:
             return self._manifest_scannet(adapter, sequence_name, manifest_frame_indices)
         if dataset_name == "tartanair":
             return self._manifest_tartanair(adapter, sequence_name, manifest_frame_indices)
+        if dataset_name == "vkitti2":
+            return self._manifest_vkitti2(adapter, sequence_name, manifest_frame_indices)
         return []
 
     def _expand_frame_indices(
@@ -599,9 +614,15 @@ class SampleLocalStager:
                     f".{chunk_cache_path.name}.part.{os.getpid()}.{threading.get_ident()}"
                 )
                 try:
-                    range_header = f"bytes={offset}-{offset + chunk_size - 1}"
-                    r = self._get_object(depth_key, range_header=range_header)
-                    raw = r["Body"].get_raw_stream().read()
+                    depth_bin_path = original_scene_dir / "iphone" / "depth.bin"
+                    if depth_bin_path.is_file():
+                        with open(depth_bin_path, "rb") as df:
+                            df.seek(offset)
+                            raw = df.read(chunk_size)
+                    else:
+                        range_header = f"bytes={offset}-{offset + chunk_size - 1}"
+                        r = self._get_object(depth_key, range_header=range_header)
+                        raw = r["Body"].get_raw_stream().read()
                     with open(tmp_path, "wb") as f:
                         f.write(raw)
                     os.replace(tmp_path, chunk_cache_path)
@@ -719,6 +740,33 @@ class SampleLocalStager:
                     paths.append(precomputed_path)
         return self._dedupe_keep_order(paths)
 
+    def _manifest_vkitti2(
+        self,
+        adapter: Any,
+        sequence_name: str,
+        frame_indices: list[int],
+    ) -> list[Path]:
+        seq_dir = adapter.seq_to_dir[sequence_name]
+        frames_dir = seq_dir / "frames"
+        image_dir = adapter._get_actual_dir(frames_dir, "rgb")
+        depth_dir = adapter._get_actual_dir(frames_dir, "depth")
+        flow_dir = adapter._get_actual_dir(frames_dir, "forwardFlow")
+        paths: list[Path] = [
+            seq_dir / "extrinsic.txt",
+            seq_dir / "intrinsic.txt",
+        ]
+        for idx in frame_indices:
+            paths.append(adapter._frame_path(image_dir, "rgb", idx, ".jpg"))
+            paths.append(adapter._frame_path(depth_dir, "depth", idx, ".png"))
+            if bool(getattr(adapter, "load_flow", True)):
+                flow_path = adapter._frame_path(flow_dir, "flow", idx, ".png")
+                if self._has_cached_or_source(flow_path):
+                    paths.append(flow_path)
+        # Keep precomputed.h5 on the original precompute_root. VKITTI H5 files
+        # are sequence-sized (about GB-class), while h5py reads only requested
+        # frame chunks from local /data5 in the current training setup.
+        return self._dedupe_keep_order(paths)
+
     @staticmethod
     def _dedupe_keep_order(paths: list[Path]) -> list[Path]:
         out: list[Path] = []
@@ -731,11 +779,17 @@ class SampleLocalStager:
 
     def _to_cos_key(self, path: Path) -> str:
         path = Path(path)
-        try:
-            rel_path = path.relative_to(self.mount_root)
-        except ValueError:
-            rel_path = path.resolve().relative_to(self.mount_root)
-        return str(rel_path).replace(os.sep, "/")
+        for mr in self.all_mount_roots:
+            try:
+                rel_path = path.relative_to(mr)
+                return str(rel_path).replace(os.sep, "/")
+            except ValueError:
+                try:
+                    rel_path = path.resolve().relative_to(mr)
+                    return str(rel_path).replace(os.sep, "/")
+                except ValueError:
+                    continue
+        raise ValueError(f"Path {path} is not under any mount root: {self.all_mount_roots}")
 
     def _has_cached_or_source(self, path: Path) -> bool:
         rel_key = Path(self._to_cos_key(path))
@@ -814,7 +868,7 @@ class SampleLocalStager:
         dataset_name = str(getattr(adapter, "dataset_name", "")).strip()
         # ScanNet++ still needs a per-sample temporary depth.bin with remapped
         # chunk indices. Other staged datasets only read immutable raw files.
-        return dataset_name in {"dynamic_replica", "co3dv2", "blendedmvs", "kubric", "pointodyssey", "tartanair"}
+        return dataset_name in {"dynamic_replica", "co3dv2", "blendedmvs", "kubric", "pointodyssey", "tartanair", "vkitti2"}
 
     def _maybe_prefetch_scene(self, adapter: Any, sequence_name: str) -> None:
         dataset_name = str(getattr(adapter, "dataset_name", "")).strip()
@@ -899,9 +953,47 @@ class SampleLocalStager:
         lock_wait_s = 0.0
         download_s = 0.0
         downloaded = False
+
+        # Non-blocking lock: poll with short sleeps instead of blocking forever.
+        # This avoids the convoy effect where 17 workers wait 12s+ for one
+        # worker to finish downloading a file from NFS.
         lock_t0 = time.perf_counter()
-        with self._path_lock(rel_key):
-            lock_wait_s = time.perf_counter() - lock_t0
+        poll_interval = 0.05
+        max_poll_s = 30.0
+        acquired = False
+        digest = hashlib.sha1(rel_key.as_posix().encode("utf-8")).hexdigest()
+        lock_dir = self.lock_root / digest[:2] / digest[2:4]
+        lock_dir.mkdir(parents=True, exist_ok=True)
+        lock_path = lock_dir / f"{digest}.lock"
+
+        while True:
+            # Check if file appeared (another worker finished downloading)
+            if cache_path.is_file():
+                lock_wait_s = time.perf_counter() - lock_t0
+                self._touch_cache_entry(cache_path)
+                return cache_path
+
+            # Try non-blocking lock
+            lock_f = open(lock_path, "a+b")
+            try:
+                fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                acquired = True
+                break
+            except BlockingIOError:
+                lock_f.close()
+                elapsed = time.perf_counter() - lock_t0
+                if elapsed > max_poll_s:
+                    # Fallback: blocking acquire
+                    lock_f = open(lock_path, "a+b")
+                    fcntl.flock(lock_f.fileno(), fcntl.LOCK_EX)
+                    acquired = True
+                    break
+                time.sleep(poll_interval)
+                # Exponential backoff up to 0.5s
+                poll_interval = min(poll_interval * 1.5, 0.5)
+
+        lock_wait_s = time.perf_counter() - lock_t0
+        try:
             if cache_path.is_file():
                 self._touch_cache_entry(cache_path)
                 total_s = time.perf_counter() - total_t0
@@ -924,6 +1016,10 @@ class SampleLocalStager:
             self._download_to_cache(src_path, cache_path, rel_key)
             download_s = time.perf_counter() - download_t0
             downloaded = True
+        finally:
+            fcntl.flock(lock_f.fileno(), fcntl.LOCK_UN)
+            lock_f.close()
+
         self._touch_cache_entry(cache_path, force=True)
         self._maybe_evict_cache()
         total_s = time.perf_counter() - total_t0
@@ -947,15 +1043,18 @@ class SampleLocalStager:
         key = rel_key.as_posix()
         tmp_path = cache_path.with_name(f".{cache_path.name}.part.{os.getpid()}.{threading.get_ident()}")
         t0 = time.perf_counter()
-        response = self._get_object(key)
-        stream = response["Body"].get_raw_stream()
         try:
-            with open(tmp_path, "wb") as f:
-                while True:
-                    chunk = stream.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    f.write(chunk)
+            if src_path.is_file():
+                shutil.copy2(src_path, tmp_path)
+            else:
+                response = self._get_object(key)
+                stream = response["Body"].get_raw_stream()
+                with open(tmp_path, "wb") as f:
+                    while True:
+                        chunk = stream.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        f.write(chunk)
             with self._cache_usage_lock():
                 os.replace(tmp_path, cache_path)
                 accounted_bytes = self._read_cache_usage_unlocked()
@@ -1636,6 +1735,19 @@ class SampleLocalStager:
             finally:
                 adapter.root = old_root
                 adapter.precompute_root = old_precompute_root
+                adapter.seq_to_dir[sequence_name] = old_seq_dir
+            return
+
+        if dataset_name == "vkitti2":
+            old_root = adapter.root
+            old_seq_dir = adapter.seq_to_dir[sequence_name]
+            new_seq_dir = staged_dataset_root / old_seq_dir.relative_to(old_root)
+            adapter.root = staged_dataset_root
+            adapter.seq_to_dir[sequence_name] = new_seq_dir
+            try:
+                yield
+            finally:
+                adapter.root = old_root
                 adapter.seq_to_dir[sequence_name] = old_seq_dir
             return
 

@@ -1312,8 +1312,8 @@ class SampleLocalStager:
         pinned_exact = (
             pinned_paths - set(pinned_dirs) if pinned_dirs else pinned_paths
         )
-        _scan_batch = int(os.environ.get("D4RT_EVICT_SCAN_BATCH_SIZE", "2000"))
-        _scan_sleep = float(os.environ.get("D4RT_EVICT_SCAN_BATCH_SLEEP_S", "0.01"))
+        _scan_batch = int(os.environ.get("D4RT_EVICT_SCAN_BATCH_SIZE", "1000"))
+        _scan_sleep = float(os.environ.get("D4RT_EVICT_SCAN_BATCH_SLEEP_S", "0.03"))
         _scan_count = 0
         for dirpath, _, filenames in os.walk(cache_root_str):
             for name in filenames:

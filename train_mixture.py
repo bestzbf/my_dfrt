@@ -1057,6 +1057,15 @@ def main():
                 train_loader,
                 depth=args.batch_prefetch_depth,
             )
+        _startup_sleep_s = float(os.environ.get("D4RT_EPOCH_STARTUP_SLEEP_S", "0"))
+        if _startup_sleep_s > 0:
+            if local_rank == 0:
+                print(
+                    f"[TrainLoop] epoch={epoch} startup sleep {_startup_sleep_s:.0f}s "
+                    f"to allow builder prefetch",
+                    flush=True,
+                )
+            time.sleep(_startup_sleep_s)
         t_data_start = time.perf_counter()
         train_watchdog.update(epoch, 0, "data_wait")
         for batch_idx, batch in enumerate(train_iter):

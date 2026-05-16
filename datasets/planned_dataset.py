@@ -329,15 +329,9 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
             sample = self._wait_with_worker_check(index)
 
         # Slide the prefetch window forward.
-        # Enqueue multiple tasks per consumption to keep builders busy even when
-        # DDP allreduce stalls slow down batch consumption rate.
-        _enqueue_burst = int(os.getenv("D4RT_PLANNED_ENQUEUE_BURST", "4"))
-        if (not self._read_only_spool):
-            for _ in range(_enqueue_burst):
-                if self.next_enqueue_index >= len(self.current_plan):
-                    break
-                self._enqueue_plan_index(self.next_enqueue_index)
-                self.next_enqueue_index += 1
+        if (not self._read_only_spool) and self.next_enqueue_index < len(self.current_plan):
+            self._enqueue_plan_index(self.next_enqueue_index)
+            self.next_enqueue_index += 1
 
         self._write_rolling_warm_progress(index)
         return sample

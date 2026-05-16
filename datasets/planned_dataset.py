@@ -663,6 +663,9 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
                         "cannot be satisfied."
                     )
             first_loop = False
+            if (not self._read_only_spool) and self.next_enqueue_index < len(self.current_plan):
+                self._enqueue_plan_index(self.next_enqueue_index)
+                self.next_enqueue_index += 1
             time.sleep(0.05)
 
     def _pick_relaxed_ready_index(self, requested: int) -> Optional[int]:

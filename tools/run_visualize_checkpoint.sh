@@ -4,23 +4,24 @@ CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
 
 # CHECKPOINT=/data/zbf/openclaw/d4rt/outputs/mixture_5datasets_blendedmvs_large_3gpu_bs5/checkpoint_latest_41.pth \
-# bash run_visualize_checkpoint.sh
+# bash tools/run_visualize_checkpoint.sh
 
 # 统一 checkpoint 可视化包装脚本。
 #
 # 用法：
-#   bash run_visualize_checkpoint.sh pointodyssey
-#   bash run_visualize_checkpoint.sh dynamic_replica
+#   bash tools/run_visualize_checkpoint.sh pointodyssey
+#   bash tools/run_visualize_checkpoint.sh dynamic_replica
 #
 # 也支持环境变量：
-#   DATASET=pointodyssey bash run_visualize_checkpoint.sh
+#   DATASET=pointodyssey bash tools/run_visualize_checkpoint.sh
 #
 # 额外命令行参数会继续透传给 Python 脚本：
-#   bash run_visualize_checkpoint.sh pointodyssey --num-samples 1
+#   bash tools/run_visualize_checkpoint.sh pointodyssey --num-samples 1
 
 
 
@@ -38,7 +39,7 @@ cd "$ROOT_DIR"
 # DENSE_PRED_POINT_CLOUD_STRIDE
 # 改完直接跑：
 
-# bash run_visualize_checkpoint.sh pointodyssey
+# bash tools/run_visualize_checkpoint.sh pointodyssey
 # 如果你是想“以后默认就用某个 checkpoint / 某个输出目录”，就改 .sh 里的默认值。
 # 如果只是这一次想试试，建议用第一种环境变量覆盖，不容易把默认配置改乱。
 
@@ -76,8 +77,8 @@ fi
 DATASET="${DATASET:-pointodyssey}"
 
 if [[ "$DATASET" != "pointodyssey" && "$DATASET" != "dynamic_replica" && "$DATASET" != "kubric" && "$DATASET" != "co3dv2" && "$DATASET" != "mixture" && "$DATASET" != "mixture_5datasets" && "$DATASET" != "mixture_5datasets_blendedmvs" ]]; then
-  echo "Usage: bash run_visualize_checkpoint.sh [pointodyssey|dynamic_replica|kubric|co3dv2|mixture] [extra args...]" >&2
-  echo "   or: CHECKPOINT=/path/to/co3dv2_xxx/ckpt.pth bash run_visualize_checkpoint.sh" >&2
+  echo "Usage: bash tools/run_visualize_checkpoint.sh [pointodyssey|dynamic_replica|kubric|co3dv2|mixture] [extra args...]" >&2
+  echo "   or: CHECKPOINT=/path/to/co3dv2_xxx/ckpt.pth bash tools/run_visualize_checkpoint.sh" >&2
   echo "Unknown DATASET: $DATASET" >&2
   exit 1
 fi

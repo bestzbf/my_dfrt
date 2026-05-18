@@ -2,11 +2,20 @@
 """One-off script: build all adapter index caches defined in a YAML config."""
 import sys
 import time
+from pathlib import Path
+
 import yaml
+
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
 from datasets.registry import create_adapter
 
 def main():
-    config_path = sys.argv[1] if len(sys.argv) > 1 else "configs/mixture_5datasets_blendedmvs_hdu.yaml"
+    config_path = Path(sys.argv[1]) if len(sys.argv) > 1 else REPO_ROOT / "configs/mixture_5datasets_blendedmvs_hdu.yaml"
+    if not config_path.is_absolute() and not config_path.exists():
+        config_path = REPO_ROOT / config_path
     with open(config_path) as f:
         config = yaml.safe_load(f)
 

@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 # 对多个 checkpoint 跑4个数据集的 val 可视化（点云 + 深度图）
-# 用法：bash run_visualize_all_datasets.sh
+# 用法：bash tools/run_visualize_all_datasets.sh
 set -euo pipefail
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
 
 CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-7}"
@@ -39,7 +40,7 @@ for CKPT in "${CHECKPOINTS[@]}"; do
       PYTHON_BIN="$PYTHON_BIN" \
       OUTPUT_DIR="$OUT_BASE" \
       START_INDEX="$_start_index" \
-      bash run_visualize_checkpoint.sh "$DS" || echo "  [WARN] $DS failed, continuing"
+      bash "$SCRIPT_DIR/run_visualize_checkpoint.sh" "$DS" || echo "  [WARN] $DS failed, continuing"
 
     echo "--- [$DS] done ---"
   done
@@ -49,7 +50,7 @@ METRICS_MD="outputs/vis_all/metrics_table.md"
 METRICS_CSV="outputs/vis_all/metrics_table.csv"
 echo ""
 echo "====== Aggregating metrics table ======"
-"$PYTHON_BIN" summarize_visualization_metrics.py \
+"$PYTHON_BIN" "$SCRIPT_DIR/summarize_visualization_metrics.py" \
   --root outputs/vis_all \
   --output-md "$METRICS_MD" \
   --output-csv "$METRICS_CSV" || echo "  [WARN] metrics aggregation failed"

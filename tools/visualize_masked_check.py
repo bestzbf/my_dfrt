@@ -7,8 +7,9 @@ and verify dataset configuration is correct.
 import sys
 from pathlib import Path
 
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
 from PIL import Image
@@ -17,7 +18,7 @@ import yaml
 
 def main():
     # Load config
-    with open('configs/single_blendedmvs.yaml', 'r') as f:
+    with open(REPO_ROOT / 'configs/single_blendedmvs.yaml', 'r') as f:
         config = yaml.safe_load(f)
 
     print("=" * 60)

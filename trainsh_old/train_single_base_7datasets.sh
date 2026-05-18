@@ -167,7 +167,7 @@ if [[ "$AUTO_WARM_INDEX_CACHE" == "1" || "$WARM_CACHE_ONLY" == "1" ]]; then
   INDEX_WORKERS="$WARM_INDEX_WORKERS" \
   WARM_VAL="$WARM_VAL" \
   ONLY_DATASETS="$WARM_ONLY_DATASETS" \
-  bash "$ROOT_DIR/warm_index_cache_5datasets_cos.sh"
+  bash "$ROOT_DIR/tools/warm_index_cache_5datasets_cos.sh"
 fi
 
 [[ "$WARM_CACHE_ONLY" == "1" ]] && { echo "WARM_CACHE_ONLY=1, stopping after warmup"; exit 0; }

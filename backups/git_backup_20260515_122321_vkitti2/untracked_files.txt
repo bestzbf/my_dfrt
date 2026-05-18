@@ -1,6 +1,0 @@
-backups/git_backup_20260515_122321_vkitti2/HEAD.txt
-backups/git_backup_20260515_122321_vkitti2/status.txt
-backups/git_backup_20260515_122321_vkitti2/tracked.diff
-backups/git_backup_20260515_122321_vkitti2/untracked_files.txt
-run_training_9datasets_systemd.sh
-train_mixture_9datasets_3gpu_cos_planned.sh

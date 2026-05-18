@@ -7,7 +7,9 @@ to verify the configuration change will improve training.
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).parent))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 import numpy as np
 from PIL import Image
@@ -16,7 +18,7 @@ from datasets.registry import create_adapter
 import yaml
 
 def main():
-    with open('configs/single_blendedmvs.yaml', 'r') as f:
+    with open(REPO_ROOT / 'configs/single_blendedmvs.yaml', 'r') as f:
         config = yaml.safe_load(f)
 
     print("=" * 70)

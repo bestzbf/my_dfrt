@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
 
 INPUT_PATH="${INPUT_PATH:-${VIDEO:-/data1/d4rt/datasets/Dynamic_Replica/test/01f258-3_obj_source_left/images}}"
@@ -11,8 +12,8 @@ if [[ $# -gt 0 ]]; then
 fi
 
 if [[ -z "$INPUT_PATH" ]]; then
-  echo "Usage: bash run_visualize_video_checkpoint.sh /path/to/video.mp4_or_image_dir [extra args...]" >&2
-  echo "   or: INPUT_PATH=/path/to/video.mp4_or_image_dir bash run_visualize_video_checkpoint.sh" >&2
+  echo "Usage: bash tools/run_visualize_video_checkpoint.sh /path/to/video.mp4_or_image_dir [extra args...]" >&2
+  echo "   or: INPUT_PATH=/path/to/video.mp4_or_image_dir bash tools/run_visualize_video_checkpoint.sh" >&2
   exit 1
 fi
 

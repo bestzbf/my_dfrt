@@ -665,8 +665,8 @@ wait_rolling_warm_initial_ready() {
 }
 
 if [[ "$AUTO_WARM_INDEX_CACHE" == "1" || "$WARM_CACHE_ONLY" == "1" ]]; then
-  if [[ ! -f "$ROOT_DIR/warm_index_cache_5datasets_cos.sh" ]]; then
-    echo "[mixture_5datasets_cos_planned] warm script not found: $ROOT_DIR/warm_index_cache_5datasets_cos.sh" >&2
+  if [[ ! -f "$ROOT_DIR/tools/warm_index_cache_5datasets_cos.sh" ]]; then
+    echo "[mixture_5datasets_cos_planned] warm script not found: $ROOT_DIR/tools/warm_index_cache_5datasets_cos.sh" >&2
     exit 1
   fi
   echo "[mixture_5datasets_cos_planned] warming index cache before torchrun"
@@ -693,7 +693,7 @@ if [[ "$AUTO_WARM_INDEX_CACHE" == "1" || "$WARM_CACHE_ONLY" == "1" ]]; then
   CO3DV2_FRAME_ANNO_CACHE="$CO3DV2_FRAME_ANNO_CACHE" \
   CO3DV2_FRAME_ANNO_CACHE_WORKERS="$CO3DV2_FRAME_ANNO_CACHE_WORKERS" \
   CO3DV2_FRAME_ANNO_CACHE_FORCE="$CO3DV2_FRAME_ANNO_CACHE_FORCE" \
-  bash "$ROOT_DIR/warm_index_cache_5datasets_cos.sh"
+  bash "$ROOT_DIR/tools/warm_index_cache_5datasets_cos.sh"
 fi
 
 if [[ "$WARM_CACHE_ONLY" == "1" ]]; then

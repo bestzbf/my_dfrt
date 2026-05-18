@@ -6,8 +6,9 @@ import sys
 import time
 from pathlib import Path
 
-# Add project root to path
-sys.path.insert(0, str(Path(__file__).parent))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 from datasets.adapters.pointodyssey import PointOdysseyAdapter
 from datasets.adapters.kubric import KubricAdapter

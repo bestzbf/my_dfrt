@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+ROOT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$ROOT_DIR"
 
 PYTHON_BIN="${PYTHON_BIN:-/root/miniconda3/envs/d4rt/bin/python}"
@@ -169,8 +170,8 @@ cleanup() {
 trap cleanup EXIT
 
 if [[ "$AUTO_WARM_INDEX_CACHE" == "1" || "$WARM_CACHE_ONLY" == "1" ]]; then
-  if [[ ! -f "$ROOT_DIR/warm_index_cache_5datasets_cos.sh" ]]; then
-    echo "[dataload_probe] warm script not found: $ROOT_DIR/warm_index_cache_5datasets_cos.sh" >&2
+  if [[ ! -f "$ROOT_DIR/tools/warm_index_cache_5datasets_cos.sh" ]]; then
+    echo "[dataload_probe] warm script not found: $ROOT_DIR/tools/warm_index_cache_5datasets_cos.sh" >&2
     exit 1
   fi
   echo "[dataload_probe] warming index cache before benchmark"
@@ -194,7 +195,7 @@ if [[ "$AUTO_WARM_INDEX_CACHE" == "1" || "$WARM_CACHE_ONLY" == "1" ]]; then
   INDEX_WORKERS="$WARM_INDEX_WORKERS" \
   WARM_VAL="$WARM_VAL" \
   ONLY_DATASETS="$WARM_ONLY_DATASETS" \
-  bash "$ROOT_DIR/warm_index_cache_5datasets_cos.sh"
+  bash "$ROOT_DIR/tools/warm_index_cache_5datasets_cos.sh"
 fi
 
 if [[ "$WARM_CACHE_ONLY" == "1" ]]; then

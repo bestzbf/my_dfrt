@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 One-time script to build TartanAir index cache via coscli (avoids slow COS iterdir).
-Usage: python warm_tartanair_cache.py
+Usage: python tools/warm_tartanair_cache.py
 """
 import subprocess, hashlib, json, pickle, tempfile, os
 from pathlib import Path

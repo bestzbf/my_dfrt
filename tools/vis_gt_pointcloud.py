@@ -2,8 +2,8 @@
 Only visualize GT dense point cloud from a dataset config — no model required.
 
 Usage:
-    python vis_gt_pointcloud.py --config configs/single_dynamic_replica.yaml --output-dir /tmp/gt_vis
-    python vis_gt_pointcloud.py --config configs/single_co3dv2.yaml --output-dir /tmp/gt_vis --split val
+    python tools/vis_gt_pointcloud.py --config configs/single_dynamic_replica.yaml --output-dir /tmp/gt_vis
+    python tools/vis_gt_pointcloud.py --config configs/single_co3dv2.yaml --output-dir /tmp/gt_vis --split val
 """
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import yaml
 
-REPO_ROOT = Path(__file__).resolve().parent
+REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
@@ -146,8 +146,12 @@ def main():
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    print(f"[gt_vis] Loading dataset: {args.config} split={args.split}")
-    with open(args.config) as f:
+    config_path = Path(args.config)
+    if not config_path.is_absolute() and not config_path.exists():
+        config_path = REPO_ROOT / config_path
+
+    print(f"[gt_vis] Loading dataset: {config_path} split={args.split}")
+    with open(config_path) as f:
         config = yaml.safe_load(f)
     dataset = create_training_dataset(config, split=args.split)
     print(f"[gt_vis] Dataset ready, searching for {args.num_samples} samples ...")

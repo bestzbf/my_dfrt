@@ -3,6 +3,8 @@ Visualize augmented video frames + 2D/3D query inputs from a kubric batch.
 Output: /tmp/kubric_vis/
 """
 import os, sys
+from pathlib import Path
+
 import numpy as np
 import torch
 import yaml
@@ -12,7 +14,10 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D  # noqa
 from torch.utils.data import DataLoader, SequentialSampler
 
-sys.path.insert(0, os.path.dirname(__file__))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+os.chdir(REPO_ROOT)
 from datasets.factory import create_training_dataset
 from datasets.collate import d4rt_collate_fn
 

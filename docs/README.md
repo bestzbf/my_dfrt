@@ -247,7 +247,7 @@ Builder 速度: 4 samples/sec per rank (12 workers / 3s)
 
 ### 推荐阅读
 
-1. **原始方案：** `/data/zbf/openclaw/d4rt/cos优化`
+1. **原始方案：** `docs/cos_planned_mode_design.md`
 2. **项目文档：** `/data/zbf/openclaw/d4rt/CLAUDE.md`
 3. **相关代码：**
    - `datasets/mixture.py` - 当前 online mode

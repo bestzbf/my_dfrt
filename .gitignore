@@ -1,6 +1,7 @@
 # Claude Code
 .claude/
 .codex
+claude_settings.json
 
 # Local editor state
 .vscode/
@@ -20,6 +21,8 @@ core.*
 .backup*/
 .sync*/
 *.bak
+backups/
+.cleanup_quarantine_path
 
 # Datasets
 datasets1/
@@ -49,6 +52,10 @@ coscli.log
 # Documentation (project-specific)
 *.md
 !README.md
+!docs/
+!docs/README.md
+!docs/cos_dataset_guide.md
+!docs/cos_planned_mode_design.md
 
 # Models
 # models/

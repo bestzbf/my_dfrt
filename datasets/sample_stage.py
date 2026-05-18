@@ -259,18 +259,18 @@ class SampleLocalStager:
             # reads local cameras.txt/images.txt instead of COS mount
             depth_s = 0.0
             if str(getattr(adapter, "dataset_name", "")) == "scannetpp":
+                source_data_root = self._scannetpp_source_data_root(adapter)
                 if sequence_name not in adapter._scene_cache:
-                    old_data_root = adapter.data_root
                     adapter.data_root = staged_dataset_root
                     try:
                         adapter._get_scene_data(sequence_name)
                     finally:
-                        adapter.data_root = old_data_root
+                        adapter.data_root = source_data_root
                         # restore scene_dir to COS path; drop if path restoration fails
                         sd = adapter._scene_cache.get(sequence_name)
                         if sd is not None:
                             try:
-                                cos_scene_dir = old_data_root / Path(sd["scene_dir"]).relative_to(staged_dataset_root)
+                                cos_scene_dir = source_data_root / Path(sd["scene_dir"]).relative_to(staged_dataset_root)
                                 adapter._scene_cache[sequence_name] = dict(sd, scene_dir=cos_scene_dir)
                             except ValueError:
                                 adapter._scene_cache.pop(sequence_name, None)
@@ -453,8 +453,10 @@ class SampleLocalStager:
         sequence_name: str,
         frame_indices: list[int],
     ) -> list[Path]:
-        # Use data_root directly to avoid _scene_cache staged-path pollution
-        scene_dir = adapter.data_root / sequence_name
+        # data_root is intentionally mutated while a sample is staged.  Timeout
+        # threads may outlive the failed sample, so source manifests must be
+        # derived from the immutable dataset root instead.
+        scene_dir = self._scannetpp_source_data_root(adapter) / sequence_name
         colmap_dir = scene_dir / "iphone" / "colmap"
         frames_dir = scene_dir / "iphone" / "frames"
         rgb_mode = str(
@@ -488,17 +490,10 @@ class SampleLocalStager:
                 path for path in cache_paths if not self._has_cached_or_source(path)
             ]
             if missing_cache_paths:
-                examples = ", ".join(
-                    str(path.relative_to(scene_dir)) for path in missing_cache_paths[:5]
-                )
-                more = "" if len(missing_cache_paths) <= 5 else f", ... (+{len(missing_cache_paths) - 5} more)"
-                raise FileNotFoundError(
-                    "ScanNet++ RGB cache mode requires predecoded frame cache; "
-                    f"refusing to stage full iphone/rgb.mkv for sample "
-                    f"sequence={sequence_name!r} target_hw={target_hw}. "
-                    f"Missing cache frames: {examples}{more}. "
-                    "Pre-generate the ScanNet++ RGB frame cache or use "
-                    "SCANNETPP_RGB_READ_MODE=video/frames/auto."
+                cache_paths = self._ensure_scannetpp_rgb_cache_frames(
+                    scene_dir,
+                    target_hw,
+                    frame_indices,
                 )
             paths += cache_paths
         elif rgb_mode == "cache":
@@ -515,6 +510,106 @@ class SampleLocalStager:
         # precomputed.h5 stays on the original mount and is read via COS Range.
         return self._dedupe_keep_order(paths)
 
+    def _valid_scannetpp_rgb_cache_file(
+        self,
+        path: Path,
+        target_hw: tuple[int, int],
+    ) -> bool:
+        try:
+            return (
+                path.is_file()
+                and path.stat().st_size
+                == int(target_hw[0]) * int(target_hw[1]) * 3
+            )
+        except OSError:
+            return False
+
+    def _ensure_scannetpp_rgb_cache_frames(
+        self,
+        scene_dir: Path,
+        target_hw: tuple[int, int],
+        frame_indices: list[int],
+    ) -> list[Path]:
+        from datasets.adapters.scannetpp import (
+            _read_rgb_jpg,
+            rgb_cache_frame_path,
+            write_rgb_cache_frame,
+        )
+
+        cache_paths = [
+            rgb_cache_frame_path(scene_dir, target_hw, i)
+            for i in frame_indices
+        ]
+        missing: list[tuple[int, Path, Path, Path]] = []
+        for frame_idx, source_cache_path in zip(frame_indices, cache_paths):
+            rel_key = Path(self._to_cos_key(source_cache_path))
+            local_cache_path = self.cache_data_root / rel_key
+            if self._valid_scannetpp_rgb_cache_file(local_cache_path, target_hw):
+                self._touch_cache_entry(local_cache_path)
+                continue
+            if self._valid_scannetpp_rgb_cache_file(source_cache_path, target_hw):
+                local_cache_path = self._ensure_cached(source_cache_path)
+                if self._valid_scannetpp_rgb_cache_file(local_cache_path, target_hw):
+                    continue
+            missing.append((int(frame_idx), source_cache_path, rel_key, local_cache_path))
+
+        if not missing:
+            return cache_paths
+
+        frames_dir = scene_dir / "iphone" / "frames"
+        total_written = 0
+        total_lock = threading.Lock()
+
+        def build_one(item: tuple[int, Path, Path, Path]) -> None:
+            nonlocal total_written
+            frame_idx, source_cache_path, rel_key, local_cache_path = item
+            with self._path_lock(rel_key):
+                if self._valid_scannetpp_rgb_cache_file(local_cache_path, target_hw):
+                    self._touch_cache_entry(local_cache_path)
+                    return
+                if self._valid_scannetpp_rgb_cache_file(source_cache_path, target_hw):
+                    local_cache_path.parent.mkdir(parents=True, exist_ok=True)
+                    tmp_path = local_cache_path.with_name(
+                        f".{local_cache_path.name}.part.{os.getpid()}.{threading.get_ident()}"
+                    )
+                    try:
+                        shutil.copy2(source_cache_path, tmp_path)
+                        os.replace(tmp_path, local_cache_path)
+                    finally:
+                        tmp_path.unlink(missing_ok=True)
+                    bytes_written = local_cache_path.stat().st_size
+                else:
+                    image = _read_rgb_jpg(frames_dir / f"{frame_idx:06d}.jpg")
+                    bytes_written = write_rgb_cache_frame(
+                        local_cache_path,
+                        image,
+                        target_hw,
+                    )
+                self._touch_cache_entry(local_cache_path, force=True)
+            with total_lock:
+                total_written += int(bytes_written)
+
+        workers = max(
+            1,
+            min(
+                int(os.getenv("SCANNETPP_RGB_CACHE_BUILD_WORKERS", "4") or "4"),
+                len(missing),
+            ),
+        )
+        if workers > 1:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = [executor.submit(build_one, item) for item in missing]
+                for future in as_completed(futures):
+                    future.result()
+        else:
+            for item in missing:
+                build_one(item)
+
+        if total_written:
+            self._adjust_cache_usage(total_written)
+            self._maybe_evict_cache()
+        return cache_paths
+
     def _prepare_scannetpp_depth_stage(
         self,
         adapter: Any,
@@ -523,6 +618,7 @@ class SampleLocalStager:
         staged_dataset_root: Path,
     ) -> None:
         """Fetch depth frames via Range requests and prepare staging metadata."""
+        source_scene_dir = self._scannetpp_source_data_root(adapter) / sequence_name
         # Use full_indices from cache if available, else read from COS path directly
         # Never use sd["scene_dir"] here — it may point to a staged path
         sd = adapter._scene_cache.get(sequence_name)
@@ -530,11 +626,10 @@ class SampleLocalStager:
             full_indices_arr = sd["full_indices"]
         else:
             from datasets.adapters.scannetpp import _join_frames
-            full_indices_arr = _join_frames(adapter.data_root / sequence_name)["full_indices"]
+            full_indices_arr = _join_frames(source_scene_dir)["full_indices"]
         needed_full_indices = sorted(set(int(full_indices_arr[i]) for i in frame_indices))
-        cos_scene_dir = adapter.data_root / sequence_name
         depth_stage = self._stage_scannetpp_depth(
-            cos_scene_dir,
+            source_scene_dir,
             staged_dataset_root / sequence_name,
             needed_full_indices,
         )
@@ -866,9 +961,47 @@ class SampleLocalStager:
         if not enabled:
             return False
         dataset_name = str(getattr(adapter, "dataset_name", "")).strip()
-        # ScanNet++ still needs a per-sample temporary depth.bin with remapped
-        # chunk indices. Other staged datasets only read immutable raw files.
-        return dataset_name in {"dynamic_replica", "co3dv2", "blendedmvs", "kubric", "pointodyssey", "tartanair", "vkitti2"}
+        if dataset_name == "scannetpp":
+            # Safe only when depth uses immutable per-frame chunk files.  Without
+            # this mode, staging writes a per-sample minimal depth.bin and must
+            # stay in a temporary directory.
+            return os.environ.get(
+                "D4RT_SCANNETPP_STAGE_DEPTH_CHUNKS_DIRECT", "0"
+            ).strip().lower() in {"1", "true", "yes", "on"}
+        return dataset_name in {
+            "dynamic_replica",
+            "co3dv2",
+            "blendedmvs",
+            "kubric",
+            "pointodyssey",
+            "tartanair",
+            "vkitti2",
+        }
+
+    def _path_under_any_mount(self, path: Path) -> bool:
+        path = Path(path)
+        for mr in self.all_mount_roots:
+            try:
+                path.relative_to(mr)
+                return True
+            except ValueError:
+                try:
+                    path.resolve().relative_to(mr.resolve())
+                    return True
+                except ValueError:
+                    continue
+        return False
+
+    def _scannetpp_source_data_root(self, adapter: Any) -> Path:
+        data_root = getattr(adapter, "data_root", None)
+        if data_root is not None:
+            data_root_path = Path(data_root)
+            if self._path_under_any_mount(data_root_path):
+                return data_root_path
+        root = getattr(adapter, "root", None)
+        if root is not None:
+            return Path(root)
+        return Path(data_root)
 
     def _maybe_prefetch_scene(self, adapter: Any, sequence_name: str) -> None:
         dataset_name = str(getattr(adapter, "dataset_name", "")).strip()
@@ -1292,9 +1425,10 @@ class SampleLocalStager:
                     "scan_s": 0.0,
                     "delete_s": 0.0,
                 }
-            return self._evict_cache_scan_locked(
-                force_low_watermark=force_low_watermark
-            )
+        # Lock released — scan and delete run without holding it.
+        return self._evict_cache_scan_locked(
+            force_low_watermark=force_low_watermark
+        )
 
     def _evict_cache_scan_locked(
         self,
@@ -1312,9 +1446,6 @@ class SampleLocalStager:
         pinned_exact = (
             pinned_paths - set(pinned_dirs) if pinned_dirs else pinned_paths
         )
-        _scan_batch = int(os.environ.get("D4RT_EVICT_SCAN_BATCH_SIZE", "1000"))
-        _scan_sleep = float(os.environ.get("D4RT_EVICT_SCAN_BATCH_SLEEP_S", "0.03"))
-        _scan_count = 0
         for dirpath, _, filenames in os.walk(cache_root_str):
             for name in filenames:
                 if name.startswith(".") or ".part." in name:
@@ -1335,9 +1466,6 @@ class SampleLocalStager:
                 ):
                     continue
                 entries.append((stat.st_mtime, stat.st_size, path_str))
-                _scan_count += 1
-                if _scan_sleep > 0 and _scan_count % _scan_batch == 0:
-                    time.sleep(_scan_sleep)
         scan_s = time.perf_counter() - scan_t0
 
         stats: dict[str, float | int] = {
@@ -1356,8 +1484,9 @@ class SampleLocalStager:
         if total_bytes <= self.config.cache_max_bytes and (
             not force_low_watermark or total_bytes <= target_bytes
         ):
-            self._write_cache_usage_unlocked(total_bytes)
-            self._mark_usage_full_rescan_unlocked()
+            with self._cache_usage_lock():
+                self._write_cache_usage_unlocked(total_bytes)
+                self._mark_usage_full_rescan_unlocked()
             return stats
 
         entries.sort(key=lambda item: item[0])
@@ -1378,8 +1507,9 @@ class SampleLocalStager:
             stats["deleted_bytes"] = int(stats["deleted_bytes"]) + size
         stats["total_after"] = total_bytes
         stats["delete_s"] = time.perf_counter() - delete_t0
-        self._write_cache_usage_unlocked(total_bytes)
-        self._mark_usage_full_rescan_unlocked()
+        with self._cache_usage_lock():
+            self._write_cache_usage_unlocked(total_bytes)
+            self._mark_usage_full_rescan_unlocked()
         return stats
 
     def _load_pinned_manifest_paths(self) -> set[str]:
@@ -1583,9 +1713,17 @@ class SampleLocalStager:
             return
 
         if dataset_name == "scannetpp":
-            old_data_root = adapter.data_root
+            source_data_root = self._scannetpp_source_data_root(adapter)
+            old_data_root = source_data_root
             old_scene_cache = adapter._scene_cache.get(sequence_name)
+            restore_scene_cache = old_scene_cache
             if old_scene_cache is not None:
+                old_scene_cache = self._normalize_scannetpp_scene_cache(
+                    old_scene_cache,
+                    sequence_name,
+                    source_data_root,
+                )
+                restore_scene_cache = old_scene_cache
                 new_scene_data = dict(old_scene_cache)
                 old_precomputed_dir = old_scene_cache.get(
                     "_precomputed_dir", old_scene_cache["scene_dir"]
@@ -1623,8 +1761,8 @@ class SampleLocalStager:
                 yield
             finally:
                 adapter.data_root = old_data_root
-                if old_scene_cache is not None:
-                    adapter._scene_cache[sequence_name] = old_scene_cache
+                if restore_scene_cache is not None:
+                    adapter._scene_cache[sequence_name] = restore_scene_cache
                 else:
                     adapter._scene_cache.pop(sequence_name, None)
                 adapter._depth_chunk_cache.pop(sequence_name, None)
@@ -1774,6 +1912,28 @@ class SampleLocalStager:
         except Exception:
             pass
         return staged_dataset_root / old_precomputed_dir.relative_to(old_data_root)
+
+    def _normalize_scannetpp_scene_cache(
+        self,
+        scene_cache: dict[str, Any],
+        sequence_name: str,
+        source_data_root: Path,
+    ) -> dict[str, Any]:
+        """Drop staged-local paths from a cached ScanNet++ scene record."""
+        normalized = dict(scene_cache)
+        source_scene_dir = source_data_root / sequence_name
+        scene_dir = Path(normalized.get("scene_dir", source_scene_dir))
+        if not self._path_under_any_mount(scene_dir):
+            normalized["scene_dir"] = source_scene_dir
+
+        for key in ("_precomputed_dir", "_precomputed_index_dir"):
+            value = normalized.get(key)
+            if value is not None and not self._path_under_any_mount(Path(value)):
+                normalized[key] = source_scene_dir
+
+        normalized.pop("_staged_depth_map", None)
+        normalized.pop("_staged_depth_chunks_dir", None)
+        return normalized
 
     @staticmethod
     def _pointodyssey_stage_anno_h5(record: Any) -> bool:

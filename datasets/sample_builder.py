@@ -257,10 +257,9 @@ class SampleBuilder:
                             dataset_name = getattr(
                                 adapter, "dataset_name", type(adapter).__name__
                             )
-                            if hasattr(adapter, '_scene_cache'):
-                                adapter._scene_cache.pop(spec.sequence_name, None)
-                            if hasattr(adapter, '_depth_chunk_cache'):
-                                adapter._depth_chunk_cache.pop(spec.sequence_name, None)
+                            self._reset_adapter_after_timeout(
+                                adapter, spec.sequence_name
+                            )
 
                             # Get timing info if available (from partial execution)
                             timing_info = ""
@@ -423,6 +422,45 @@ class SampleBuilder:
                 )
                 logged = True
             time.sleep(0.1)
+
+    def _reset_adapter_after_timeout(self, adapter: BaseAdapter, sequence_name: str) -> None:
+        dataset_name = str(getattr(adapter, "dataset_name", ""))
+        if dataset_name == "scannetpp" and hasattr(adapter, "root"):
+            try:
+                adapter.data_root = Path(adapter.root)
+            except Exception:
+                pass
+
+        if hasattr(adapter, "_scene_cache"):
+            try:
+                adapter._scene_cache.pop(sequence_name, None)
+                if dataset_name == "scannetpp" and hasattr(adapter, "root"):
+                    root = Path(adapter.root)
+                    stale_keys: list[str] = []
+                    for key, scene_data in list(adapter._scene_cache.items()):
+                        if not isinstance(scene_data, dict):
+                            continue
+                        scene_dir = scene_data.get("scene_dir")
+                        if scene_dir is None:
+                            continue
+                        try:
+                            Path(scene_dir).relative_to(root)
+                        except ValueError:
+                            stale_keys.append(key)
+                    for key in stale_keys:
+                        adapter._scene_cache.pop(key, None)
+            except Exception:
+                pass
+
+        if hasattr(adapter, "_depth_chunk_cache"):
+            try:
+                adapter._depth_chunk_cache.pop(sequence_name, None)
+            except Exception:
+                pass
+
+        if dataset_name == "scannetpp":
+            adapter.__dict__.pop("_staged_depth_map_tmp", None)
+            adapter.__dict__.pop("_staged_depth_chunks_tmp", None)
 
     # ------------------------------------------------------------------
     # Core build logic

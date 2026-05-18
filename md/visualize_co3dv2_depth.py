@@ -45,7 +45,14 @@ def parse_args():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--start-index", type=int, default=0)
     p.add_argument("--max-search", type=int, default=500)
+    p.add_argument(
+        "--sample-indices",
+        type=str,
+        default="",
+        help="逗号分隔的显式 validation indices。设置后优先使用这些 index，而不是连续扫描 start-index。",
+    )
     p.add_argument("--gif-fps", type=int, default=8)
+    p.add_argument("--static-only", action="store_true", help="只输出 depth_comparison.png，跳过 depth.gif 以加速批量可视化")
     p.add_argument("--device", default="cuda")
     return p.parse_args()
 
@@ -111,6 +118,18 @@ def load_model(args, device):
     model = model.to(device)
     model.eval()
     return model
+
+
+def parse_sample_indices(raw: str) -> list[int]:
+    raw = raw.strip()
+    if not raw:
+        return []
+    indices: list[int] = []
+    for item in raw.split(","):
+        token = item.strip()
+        if token:
+            indices.append(int(token))
+    return indices
 
 
 def to_video_tensor(result, device):
@@ -380,22 +399,34 @@ def main():
 
     with open(args.config, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+    if config.get("planned_mode", False):
+        config["planned_start_immediately"] = False
     dataset = create_training_dataset(config, split=args.split)
     model = load_model(args, device)
     print(f"[depth] Model loaded on {device} (variant={args.model_variant})", flush=True)
     S = args.resolution  # 256
 
     found = 0
-    idx = args.start_index
-    while found < args.num_samples and idx < args.start_index + args.max_search:
+    explicit_indices = parse_sample_indices(args.sample_indices)
+    if explicit_indices:
+        candidate_indices = explicit_indices
+        print(f"[depth] Finding explicit samples: {candidate_indices}", flush=True)
+    else:
+        candidate_indices = range(args.start_index, args.start_index + args.max_search)
+
+    for idx in candidate_indices:
+        if not explicit_indices and found >= args.num_samples:
+            break
         try:
+            if explicit_indices:
+                dataset.mixture_sampler.reset_locality_state()
             r = random.Random(dataset.seed + idx)
             dataset_idx, seq_name, frame_indices = dataset.mixture_sampler.sample(r)
             adapter = dataset.adapters[dataset_idx]
             clip = adapter.load_clip(seq_name, frame_indices)
             result = dataset.transform(clip, rng=r)
 
-            sample_dir = out_dir / f"sample_{found:02d}_{result.sequence_name.replace('/', '_')}"
+            sample_dir = out_dir / f"sample_{found:02d}_idx{idx}_{result.sequence_name.replace('/', '_')}"
             sample_dir.mkdir(parents=True, exist_ok=True)
 
             enc, frames_bcthw, transform_metadata = encode_video(
@@ -419,24 +450,24 @@ def main():
                 sample_dir / "depth_comparison.png",
                 transform_metadata=transform_metadata,
             )
-            make_depth_gif(
-                result,
-                model,
-                enc,
-                frames_bcthw,
-                args.stride,
-                S,
-                device,
-                sample_dir / "depth.gif",
-                fps=args.gif_fps,
-                transform_metadata=transform_metadata,
-            )
+            if not args.static_only:
+                make_depth_gif(
+                    result,
+                    model,
+                    enc,
+                    frames_bcthw,
+                    args.stride,
+                    S,
+                    device,
+                    sample_dir / "depth.gif",
+                    fps=args.gif_fps,
+                    transform_metadata=transform_metadata,
+                )
 
             print(f"[{found}] {result.sequence_name} -> {sample_dir}")
             found += 1
         except Exception as e:
             print(f"  skip idx={idx}: {e}")
-        idx += 1
 
     print(f"Done. {found} samples -> {out_dir}")
 

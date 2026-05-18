@@ -21,6 +21,7 @@ import multiprocessing as mp
 import os
 import hashlib
 import tempfile
+import threading
 import time
 from pathlib import Path
 from typing import Any, Optional
@@ -183,6 +184,10 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
             int(os.getenv("D4RT_PLANNED_BLOCK_LOOKAHEAD", "240") or "240"),
         )
         self._pipeline_started = False
+        self._enqueue_thread: Optional[threading.Thread] = None
+        self._enqueue_stop = threading.Event()
+        self._consumed_index: int = -1  # last index returned to caller
+        self._consumed_lock = threading.Lock()
 
         self.current_epoch = self.initial_epoch
         self._generation: int = 0
@@ -274,16 +279,23 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
             )
             self.builder_processes.append(proc)
 
-        # Seed the prefetch window.
-        start = min(self._pipeline_start_index, len(self.current_plan))
-        limit = min(start + self.prefetch_depth, len(self.current_plan))
-        for i in range(start, limit):
-            self._enqueue_plan_index(i)
-        self.next_enqueue_index = limit
+        # Reset consumed index and start background enqueue thread.
+        with self._consumed_lock:
+            self._consumed_index = self._pipeline_start_index - 1
+        self.next_enqueue_index = min(self._pipeline_start_index, len(self.current_plan))
+        self._enqueue_stop.clear()
+        self._enqueue_thread = threading.Thread(
+            target=self._enqueue_loop, daemon=True, name=f"enqueue-rank{self.rank}"
+        )
+        self._enqueue_thread.start()
         self._pipeline_started = True
 
     def _stop_pipeline(self) -> None:
         """Tear down builder processes and queues.  Safe to call repeatedly."""
+        self._enqueue_stop.set()
+        if self._enqueue_thread is not None:
+            self._enqueue_thread.join(timeout=3.0)
+            self._enqueue_thread = None
         if self.builder_processes:
             stop_builder_processes(
                 self.builder_processes,
@@ -328,10 +340,9 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
         else:
             sample = self._wait_with_worker_check(index)
 
-        # Slide the prefetch window forward.
-        if (not self._read_only_spool) and self.next_enqueue_index < len(self.current_plan):
-            self._enqueue_plan_index(self.next_enqueue_index)
-            self.next_enqueue_index += 1
+        with self._consumed_lock:
+            if index > self._consumed_index:
+                self._consumed_index = index
 
         self._write_rolling_warm_progress(index)
         return sample
@@ -457,6 +468,17 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
             self._enqueued_indices.add(j)
 
         self._put_spec(block)
+
+    def _enqueue_loop(self) -> None:
+        """Background thread: keep builders fed up to prefetch_depth ahead of consumption."""
+        while not self._enqueue_stop.is_set():
+            with self._consumed_lock:
+                consumed = self._consumed_index
+            target = min(consumed + 1 + self.prefetch_depth, len(self.current_plan))
+            while self.next_enqueue_index < target and not self._enqueue_stop.is_set():
+                self._enqueue_plan_index(self.next_enqueue_index)
+                self.next_enqueue_index += 1
+            self._enqueue_stop.wait(timeout=0.02)
 
     def _put_spec(self, spec: Any) -> None:
         if self._sequence_affinity:
@@ -663,9 +685,6 @@ class PlannedMixtureDataset(torch.utils.data.Dataset):
                         "cannot be satisfied."
                     )
             first_loop = False
-            if (not self._read_only_spool) and self.next_enqueue_index < len(self.current_plan):
-                self._enqueue_plan_index(self.next_enqueue_index)
-                self.next_enqueue_index += 1
             time.sleep(0.05)
 
     def _pick_relaxed_ready_index(self, requested: int) -> Optional[int]:

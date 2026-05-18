@@ -28,6 +28,9 @@ INDEX_WORKERS="${INDEX_WORKERS:-8}"
 WARM_VAL="${WARM_VAL:-0}"
 ONLY_DATASETS="${ONLY_DATASETS:-}"
 D4RT_SUPPRESS_MKL_WARNING="${D4RT_SUPPRESS_MKL_WARNING:-1}"
+CO3DV2_FRAME_ANNO_CACHE="${CO3DV2_FRAME_ANNO_CACHE:-1}"
+CO3DV2_FRAME_ANNO_CACHE_WORKERS="${CO3DV2_FRAME_ANNO_CACHE_WORKERS:-2}"
+CO3DV2_FRAME_ANNO_CACHE_FORCE="${CO3DV2_FRAME_ANNO_CACHE_FORCE:-0}"
 
 mkdir -p "$INDEX_CACHE_DIR"
 
@@ -57,6 +60,8 @@ echo "[warm_index_cache] SCANNETPP_SPLITS_DIR=$SCANNETPP_SPLITS_DIR"
 echo "[warm_index_cache] SCANNETPP_SCENES_RECORD=$SCANNETPP_SCENES_RECORD"
 echo "[warm_index_cache] INDEX_WORKERS=$INDEX_WORKERS"
 echo "[warm_index_cache] WARM_VAL=$WARM_VAL"
+echo "[warm_index_cache] CO3DV2_FRAME_ANNO_CACHE=$CO3DV2_FRAME_ANNO_CACHE"
+echo "[warm_index_cache] CO3DV2_FRAME_ANNO_CACHE_WORKERS=$CO3DV2_FRAME_ANNO_CACHE_WORKERS"
 if [[ -n "$ONLY_DATASETS" ]]; then
   echo "[warm_index_cache] ONLY_DATASETS=$ONLY_DATASETS"
 fi
@@ -442,3 +447,23 @@ if warm_val:
 
 print("[warm_index_cache] done")
 PY
+
+if [[ "$CO3DV2_FRAME_ANNO_CACHE" == "1" ]]; then
+  should_warm_co3dv2=0
+  if [[ -z "$ONLY_DATASETS" ]]; then
+    should_warm_co3dv2=1
+  elif [[ ",$ONLY_DATASETS," == *",co3dv2,"* ]]; then
+    should_warm_co3dv2=1
+  fi
+  if [[ "$should_warm_co3dv2" == "1" ]]; then
+    force_args=()
+    if [[ "$CO3DV2_FRAME_ANNO_CACHE_FORCE" == "1" ]]; then
+      force_args+=(--force)
+    fi
+    /root/miniconda3/envs/d4rt/bin/python "$ROOT_DIR/scripts/build_co3dv2_frame_cache.py" \
+      --root "$CO3DV2_ROOT" \
+      --cache-dir "$INDEX_CACHE_DIR" \
+      --workers "$CO3DV2_FRAME_ANNO_CACHE_WORKERS" \
+      "${force_args[@]}"
+  fi
+fi

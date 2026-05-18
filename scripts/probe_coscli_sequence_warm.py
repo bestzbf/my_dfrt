@@ -294,6 +294,7 @@ def _stager_from_config(config: dict[str, Any]) -> SampleLocalStager:
                 "eviction_mode": "disabled",
                 "window_radius": config.get("sample_stage_window_radius", 0),
                 "mount_root": config.get("sample_stage_mount_root", "/data_cos"),
+                "extra_mount_roots": config.get("sample_stage_extra_mount_roots", ()),
                 "bucket": config.get("sample_stage_bucket", "hd-ai-data-1251882982"),
                 "region": config.get("sample_stage_region", "ap-beijing"),
                 "passwd_file": config.get("sample_stage_passwd_file", "/etc/passwd-s3fs-data_cos"),

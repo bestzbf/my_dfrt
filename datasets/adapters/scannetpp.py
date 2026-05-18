@@ -980,7 +980,7 @@ class ScanNetPPAdapter(BaseAdapter):
         keys: set[str] = set()
         backend = None
         index_path = self._precomputed_h5_chunk_index_path(scene_dir)
-        if self._should_use_precomputed_cos_range(h5_path, index_path):
+        if self._should_use_precomputed_range(h5_path, index_path):
             try:
                 keys = set(self._load_h5_chunk_index(index_path).keys())
                 backend = "h5_range"
@@ -1187,9 +1187,9 @@ class ScanNetPPAdapter(BaseAdapter):
         npz_path = precomputed_dir / self.precomputed_name
         h5_path = npz_path.with_suffix(".h5")
         index_path = self._precomputed_h5_chunk_index_path(precomputed_index_dir)
-        if self._should_use_precomputed_cos_range(h5_path, index_path):
+        if self._should_use_precomputed_range(h5_path, index_path):
             try:
-                cache = self._load_precomputed_cos_range(
+                cache = self._load_precomputed_range(
                     h5_path=h5_path,
                     index_path=index_path,
                     frame_indices=frame_indices,
@@ -1201,7 +1201,7 @@ class ScanNetPPAdapter(BaseAdapter):
                     raise
                 if not self._cos_range_warned:
                     print(
-                        "[ScanNet++Adapter] h5 COS range read failed; falling back "
+                        "[ScanNet++Adapter] h5 range read failed; falling back "
                         f"to h5py/npz ({type(exc).__name__}: {exc})",
                         flush=True,
                     )
@@ -1234,17 +1234,34 @@ class ScanNetPPAdapter(BaseAdapter):
         except Exception:
             return False
 
-    def _should_use_precomputed_cos_range(self, h5_path: Path, index_path: Path) -> bool:
+    def _should_use_precomputed_range(self, h5_path: Path, index_path: Path) -> bool:
         mode = self.precomputed_read_mode
         if mode in {"h5py", "direct", "npz"}:
             return False
-        if mode not in {"auto", "cos_range", "range"}:
+        if mode not in {"auto", "cos_range", "range", "local_range"}:
             return False
-        if mode == "auto" and not self._path_is_under_cos_mount(h5_path):
+        h5_is_cos = self._path_is_under_cos_mount(h5_path)
+        index_is_cos = self._path_is_under_cos_mount(index_path)
+        if mode == "cos_range" and not h5_is_cos:
             return False
-        if self._path_is_under_cos_mount(index_path):
-            return self._cos_object_exists(index_path)
-        return index_path.exists()
+        if mode == "local_range" and h5_is_cos:
+            return False
+        if h5_is_cos:
+            return (
+                self._cos_object_exists(index_path)
+                if index_is_cos
+                else index_path.exists()
+            )
+        if not h5_path.exists():
+            return False
+        return (
+            self._cos_object_exists(index_path)
+            if index_is_cos
+            else index_path.exists()
+        )
+
+    def _should_use_precomputed_cos_range(self, h5_path: Path, index_path: Path) -> bool:
+        return self._should_use_precomputed_range(h5_path, index_path)
 
     def _get_precomputed_cos_client(self) -> Any:
         client = getattr(self._cos_tls, "client", None)
@@ -1281,6 +1298,18 @@ class ScanNetPPAdapter(BaseAdapter):
             if path.startswith(mount):
                 return path[len(mount):]
             raise
+
+    def _precomputed_range_source_key(self, h5_path: Path) -> str:
+        if self._path_is_under_cos_mount(h5_path):
+            return self._precomputed_cos_key(h5_path)
+        try:
+            stat = h5_path.stat()
+            return (
+                f"file:{h5_path.resolve(strict=False).as_posix()}:"
+                f"{int(stat.st_size)}:{int(stat.st_mtime_ns)}"
+            )
+        except OSError:
+            return f"file:{h5_path.absolute().as_posix()}"
 
     def _is_cos_not_found_error(self, exc: BaseException) -> bool:
         for attr in ("get_status_code", "get_error_code"):
@@ -1373,7 +1402,7 @@ class ScanNetPPAdapter(BaseAdapter):
             raise last_exc
         raise IOError(f"Failed to load h5 chunk index: {index_path}")
 
-    def _load_precomputed_cos_range(
+    def _load_precomputed_range(
         self,
         h5_path: Path,
         index_path: Path,
@@ -1395,7 +1424,7 @@ class ScanNetPPAdapter(BaseAdapter):
         if not sorted_idx:
             raise ValueError("frame_indices is empty")
 
-        cos_key = self._precomputed_cos_key(h5_path)
+        source_key = self._precomputed_range_source_key(h5_path)
         tasks: list[dict[str, Any]] = []
         chunks_by_key: dict[str, dict[int, np.ndarray]] = {key: {} for key in keys}
         entries: dict[str, dict[str, Any]] = {
@@ -1435,7 +1464,7 @@ class ScanNetPPAdapter(BaseAdapter):
                     missing_chunks: list[tuple[int, int, int]] = []
                     for frame_idx, offset, size in chunks:
                         raw = self._read_precomputed_h5_chunk_cache(
-                            cos_key=cos_key,
+                            source_key=source_key,
                             key=key,
                             frame_idx=int(frame_idx),
                             offset=int(offset),
@@ -1446,7 +1475,7 @@ class ScanNetPPAdapter(BaseAdapter):
                             continue
 
                         cache_path = self._precomputed_h5_chunk_cache_path(
-                            cos_key=cos_key,
+                            source_key=source_key,
                             key=key,
                             frame_idx=int(frame_idx),
                             offset=int(offset),
@@ -1457,7 +1486,7 @@ class ScanNetPPAdapter(BaseAdapter):
                             lock_ctx.__enter__()
                             try:
                                 raw = self._read_precomputed_h5_chunk_cache(
-                                    cos_key=cos_key,
+                                    source_key=source_key,
                                     key=key,
                                     frame_idx=int(frame_idx),
                                     offset=int(offset),
@@ -1484,7 +1513,12 @@ class ScanNetPPAdapter(BaseAdapter):
                         })
 
             def fetch_task(task: dict[str, Any]) -> dict[str, Any]:
-                data = self._read_cos_range(cos_key, int(task["start"]), int(task["end"]))
+                data = self._read_precomputed_h5_range(
+                    h5_path,
+                    source_key,
+                    int(task["start"]),
+                    int(task["end"]),
+                )
                 return {**task, "data": data}
 
             if tasks:
@@ -1503,11 +1537,11 @@ class ScanNetPPAdapter(BaseAdapter):
                             expected = int(size)
                             if len(raw) != expected:
                                 raise IOError(
-                                    f"Short COS range read for {key} frame {frame_idx}: "
+                                    f"Short h5 range read for {key} frame {frame_idx}: "
                                     f"got {len(raw)} bytes, expected {expected}"
                                 )
                             self._write_precomputed_h5_chunk_cache(
-                                cos_key=cos_key,
+                                source_key=source_key,
                                 key=key,
                                 frame_idx=int(frame_idx),
                                 offset=int(offset),
@@ -1535,6 +1569,22 @@ class ScanNetPPAdapter(BaseAdapter):
             )
             result[key] = arr_sorted[reorder]
         return result
+
+    def _load_precomputed_cos_range(
+        self,
+        h5_path: Path,
+        index_path: Path,
+        frame_indices: list[int],
+        skip_keys: set[str],
+        sequence_name: str,
+    ) -> dict[str, Any]:
+        return self._load_precomputed_range(
+            h5_path=h5_path,
+            index_path=index_path,
+            frame_indices=frame_indices,
+            skip_keys=skip_keys,
+            sequence_name=sequence_name,
+        )
 
     def _cap_precomputed_tracks(
         self,
@@ -1701,7 +1751,7 @@ class ScanNetPPAdapter(BaseAdapter):
 
     def _precomputed_h5_chunk_cache_path(
         self,
-        cos_key: str,
+        source_key: str,
         key: str,
         frame_idx: int,
         offset: int,
@@ -1710,20 +1760,20 @@ class ScanNetPPAdapter(BaseAdapter):
         root = self.precomputed_h5_chunk_cache_dir
         if root is None or int(size) < self.precomputed_h5_chunk_cache_min_bytes:
             return None
-        digest = hashlib.sha1(cos_key.encode("utf-8")).hexdigest()
+        digest = hashlib.sha1(source_key.encode("utf-8")).hexdigest()
         safe_key = key.replace("/", "_")
         name = f"{int(frame_idx):08d}_{int(offset):016x}_{int(size):08x}.bin"
         return root / digest[:2] / digest / safe_key / name
 
     def _read_precomputed_h5_chunk_cache(
         self,
-        cos_key: str,
+        source_key: str,
         key: str,
         frame_idx: int,
         offset: int,
         size: int,
     ) -> Optional[bytes]:
-        path = self._precomputed_h5_chunk_cache_path(cos_key, key, frame_idx, offset, size)
+        path = self._precomputed_h5_chunk_cache_path(source_key, key, frame_idx, offset, size)
         if path is None:
             return None
         try:
@@ -1743,14 +1793,14 @@ class ScanNetPPAdapter(BaseAdapter):
 
     def _write_precomputed_h5_chunk_cache(
         self,
-        cos_key: str,
+        source_key: str,
         key: str,
         frame_idx: int,
         offset: int,
         size: int,
         raw: bytes,
     ) -> None:
-        path = self._precomputed_h5_chunk_cache_path(cos_key, key, frame_idx, offset, size)
+        path = self._precomputed_h5_chunk_cache_path(source_key, key, frame_idx, offset, size)
         if path is None or len(raw) != int(size):
             return
         tmp_path = path.with_name(
@@ -1881,6 +1931,38 @@ class ScanNetPPAdapter(BaseAdapter):
         if last_exc is not None:
             raise last_exc
         raise IOError(f"COS range read failed: {cos_key} {range_header}")
+
+    def _read_precomputed_h5_range(
+        self,
+        h5_path: Path,
+        source_key: str,
+        start: int,
+        end: int,
+    ) -> bytes:
+        if self._path_is_under_cos_mount(h5_path):
+            return self._read_cos_range(source_key, start, end)
+        expected = max(0, int(end) - int(start))
+        last_exc: Optional[BaseException] = None
+        for attempt in range(self.precomputed_cos_range_retries + 1):
+            try:
+                with open(h5_path, "rb") as f:
+                    f.seek(int(start))
+                    raw = f.read(expected)
+                if len(raw) != expected:
+                    raise IOError(
+                        f"Short local h5 range read for {h5_path}: "
+                        f"got {len(raw)} bytes, expected {expected}"
+                    )
+                return raw
+            except (EOFError, OSError) as exc:
+                last_exc = exc
+                if attempt < self.precomputed_cos_range_retries:
+                    time.sleep(min(2.0, 0.25 * (2 ** attempt)))
+                    continue
+                raise
+        if last_exc is not None:
+            raise last_exc
+        raise IOError(f"Local h5 range read failed: {h5_path} bytes={start}-{end - 1}")
 
     def __len__(self) -> int:
         return len(self.sequence_names)

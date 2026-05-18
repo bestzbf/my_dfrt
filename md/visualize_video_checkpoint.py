@@ -26,6 +26,17 @@ from models import create_d4rt
 from utils.visualization import save_point_cloud_ply
 
 
+CAMERA_VIEW_ELEV = -90
+CAMERA_VIEW_AZIM = -90
+
+VARIANT_BY_EMBED_DIM = {
+    768: "base",
+    1024: "large",
+    1280: "huge",
+    1408: "giant",
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -42,6 +53,13 @@ def parse_args() -> argparse.Namespace:
         help="输入路径。可以是视频文件，也可以是按时间排序的图片目录。",
     )
     parser.add_argument("--checkpoint", type=str, required=True, help="checkpoint 路径。支持 'model' 或 'model_state_dict'。")
+    parser.add_argument(
+        "--model-variant",
+        type=str,
+        default="auto",
+        choices=("auto", "base", "large", "huge", "giant"),
+        help="模型尺寸。默认 auto 会从 checkpoint 张量形状自动推断。",
+    )
     parser.add_argument("--output-dir", type=str, required=True, help="输出目录。")
     parser.add_argument(
         "--patch-provider",
@@ -93,8 +111,16 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dense-vis-threshold",
         type=float,
-        default=0.5,
+        default=0.3,
         help="稠密动态点云保留点的 visibility 阈值。",
+    )
+    parser.add_argument(
+        "--dense-confidence-percentile",
+        "--dense-pred-confidence-percentile",
+        dest="dense_confidence_percentile",
+        type=float,
+        default=10.0,
+        help="稠密动态点云在 visibility 过滤后丢弃最低 N%% confidence 的点。0 表示关闭。",
     )
     parser.add_argument(
         "--dense-query-batch-size",
@@ -130,20 +156,57 @@ def select_device(device_arg: str) -> torch.device:
     return torch.device("cpu")
 
 
-def load_model_weights(model: torch.nn.Module, checkpoint_path: str, device: torch.device) -> None:
-    ckpt = torch.load(checkpoint_path, map_location=device)
+def extract_model_state(ckpt: dict[str, Any], checkpoint_path: str) -> dict[str, torch.Tensor]:
     if "model" in ckpt:
-        state = ckpt["model"]
-    elif "model_state_dict" in ckpt:
-        state = ckpt["model_state_dict"]
-    else:
-        raise KeyError(f"Unsupported checkpoint format in {checkpoint_path}")
+        return ckpt["model"]
+    if "model_state_dict" in ckpt:
+        return ckpt["model_state_dict"]
+    raise KeyError(f"Unsupported checkpoint format in {checkpoint_path}")
+
+
+def infer_model_variant_from_state(state: dict[str, torch.Tensor]) -> str:
+    preferred_suffixes = (
+        "encoder.patch_embed.proj.weight",
+        "encoder.norm.weight",
+        "decoder.norm.weight",
+    )
+    for suffix in preferred_suffixes:
+        for key, tensor in state.items():
+            if not key.endswith(suffix) or not hasattr(tensor, "shape") or len(tensor.shape) == 0:
+                continue
+            embed_dim = int(tensor.shape[0])
+            if embed_dim in VARIANT_BY_EMBED_DIM:
+                return VARIANT_BY_EMBED_DIM[embed_dim]
+            raise ValueError(
+                f"Cannot infer model variant: {key} has embed_dim={embed_dim}, "
+                f"expected one of {sorted(VARIANT_BY_EMBED_DIM)}"
+            )
+    raise ValueError("Cannot infer model variant: checkpoint has no recognizable encoder/decoder shape keys")
+
+
+def load_checkpoint_state(checkpoint_path: str) -> dict[str, torch.Tensor]:
+    ckpt = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
+    return extract_model_state(ckpt, checkpoint_path)
+
+
+def resolve_model_variant(requested_variant: str, state: dict[str, torch.Tensor]) -> str:
+    if requested_variant != "auto":
+        return requested_variant
+    inferred_variant = infer_model_variant_from_state(state)
+    print(f"[vis_video] Auto-detected model_variant={inferred_variant} from checkpoint tensor shapes", flush=True)
+    return inferred_variant
+
+
+def load_model_weights(model: torch.nn.Module, state: dict[str, torch.Tensor]) -> None:
     model.load_state_dict(state, strict=True)
 
 
 def load_model(args: argparse.Namespace, device: torch.device) -> torch.nn.Module:
+    state = load_checkpoint_state(args.checkpoint)
+    model_variant = resolve_model_variant(args.model_variant, state)
+    args.model_variant = model_variant
     model = create_d4rt(
-        variant="base",
+        variant=model_variant,
         decoder_depth=6,
         img_size=args.resolution,
         temporal_size=args.num_frames,
@@ -151,8 +214,10 @@ def load_model(args: argparse.Namespace, device: torch.device) -> torch.nn.Modul
         query_patch_size=9,
         videomae_model="/data1/zbf/pretrained/videomae-base",
         patch_provider=args.patch_provider,
+        encoder_pretrained=False,
     ).to(device)
-    load_model_weights(model, args.checkpoint, device)
+    load_model_weights(model, state)
+    del state
     model.eval()
     return model
 
@@ -369,6 +434,13 @@ def compute_predictions(
     pred_2d_norm = outputs["tracks_2d"][0].detach().float().cpu().numpy()
     pred_3d = outputs["tracks_3d"][0].detach().float().cpu().numpy()
     pred_vis = outputs["visibility"][0].detach().float().cpu().numpy()
+    pred_conf_tensor = outputs.get("confidence_weight")
+    if pred_conf_tensor is None:
+        pred_conf = np.ones_like(pred_vis, dtype=np.float32)
+    else:
+        pred_conf = pred_conf_tensor[0].detach().float().cpu().numpy()
+        if pred_conf.ndim == 3 and pred_conf.shape[-1] == 1:
+            pred_conf = pred_conf[..., 0]
 
     pred_2d_px = pred_2d_norm * np.array(
         [max(display_size - 1, 1), max(display_size - 1, 1)],
@@ -380,6 +452,7 @@ def compute_predictions(
         "pred_2d_px": pred_2d_px,
         "pred_3d_cam": pred_3d,
         "pred_vis": pred_vis,
+        "pred_conf": pred_conf,
     }
 
 
@@ -389,6 +462,7 @@ def compute_dense_reference_sequence(
     reference_frame: int,
     stride: int,
     vis_threshold: float,
+    confidence_percentile: float,
     batch_size: int,
     orig_width: int,
     orig_height: int,
@@ -429,6 +503,7 @@ def compute_dense_reference_sequence(
     for frame_id in range(T):
         points_list: list[np.ndarray] = []
         vis_list: list[np.ndarray] = []
+        conf_list: list[np.ndarray] = []
         total_points = int(coords_torch.shape[0])
 
         for start in range(0, total_points, batch_size):
@@ -452,13 +527,24 @@ def compute_dense_reference_sequence(
 
             points_list.append(outputs["pos_3d"][0].detach().float().cpu().numpy())
             vis_list.append(torch.sigmoid(outputs["visibility"][0].squeeze(-1)).detach().float().cpu().numpy())
+            conf_tensor = outputs.get("confidence_weight")
+            if conf_tensor is None:
+                conf_list.append(np.ones((chunk_size,), dtype=np.float32))
+            else:
+                conf_list.append(conf_tensor[0].squeeze(-1).detach().float().cpu().numpy())
 
         points_ref = np.concatenate(points_list, axis=0)
         visibility = np.concatenate(vis_list, axis=0)
+        confidence = np.concatenate(conf_list, axis=0)
         frame_colors = reference_colors
 
         keep = visibility > vis_threshold
         keep &= np.isfinite(points_ref).all(axis=-1)
+        visible_before_confidence = int(keep.sum())
+        confidence_threshold = math.nan
+        if confidence_percentile > 0.0 and keep.sum() > 0:
+            confidence_threshold = float(np.percentile(confidence[keep], confidence_percentile))
+            keep &= confidence >= confidence_threshold
 
         points_ref = maybe_flip_y(points_ref[keep], flip_y)
         frame_colors = frame_colors[keep]
@@ -470,7 +556,10 @@ def compute_dense_reference_sequence(
                 "colors": frame_colors,
                 "point_ids": np.flatnonzero(keep).astype(np.int32),
                 "visible_points": int(keep.sum()),
+                "visible_before_confidence": visible_before_confidence,
                 "total_points": total_points,
+                "confidence_threshold": confidence_threshold,
+                "mean_confidence": float(np.mean(confidence[keep])) if keep.any() else math.nan,
             }
         )
     return dense_frames
@@ -730,6 +819,10 @@ def set_axes_limits(ax, center: np.ndarray, radius: float) -> None:
     ax.set_zlim(center[2] - radius, center[2] + radius)
 
 
+def set_camera_view(ax) -> None:
+    ax.view_init(elev=CAMERA_VIEW_ELEV, azim=CAMERA_VIEW_AZIM)
+
+
 def _extract_reference_3d_points(
     pred: dict[str, np.ndarray],
     colors: np.ndarray,
@@ -782,7 +875,7 @@ def plot_reference_3d(
         s=4.0,
         alpha=0.9,
     )
-    ax.view_init(elev=24, azim=-62)
+    set_camera_view(ax)
     ax.set_xlabel("X")
     ax.set_ylabel("Y")
     ax.set_zlabel("Z")
@@ -837,7 +930,6 @@ def write_reference_3d_turntable_gif(
 
     frames_rgb: list[np.ndarray] = []
     for frame_idx in range(num_frames):
-        azim = -62.0 + (360.0 * frame_idx / max(num_frames, 1))
         fig = plt.figure(figsize=(7.2, 6.4), constrained_layout=True)
         ax = fig.add_subplot(1, 1, 1, projection="3d")
         ax.scatter(
@@ -848,14 +940,14 @@ def write_reference_3d_turntable_gif(
             s=4.0,
             alpha=0.9,
         )
-        ax.view_init(elev=24, azim=azim)
+        set_camera_view(ax)
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
         _set_equal_3d_axes(ax, points_vis)
-        title = f"Predicted 3D points @ reference frame {reference_frame}\nturntable view {frame_idx + 1}/{num_frames}"
+        title = f"Predicted 3D points @ reference frame {reference_frame}\ncamera view frame {frame_idx + 1}/{num_frames}"
         if normalize_3d:
-            title = title.replace("\nturntable", " (normalized)\nturntable")
+            title = title.replace("\ncamera", " (normalized)\ncamera")
         fig.suptitle(title, fontsize=13)
         frames_rgb.append(figure_to_rgb(fig))
         plt.close(fig)
@@ -883,9 +975,11 @@ def plot_dense_reference_static(
             s=0.45,
             alpha=0.9,
         )
-        ax.view_init(elev=20, azim=-62)
+        set_camera_view(ax)
         ax.set_title(
-            f"frame {frame_id}\nvisible={frame['visible_points']} / {frame['total_points']}",
+            f"frame {frame_id}\nkept={frame['visible_points']} "
+            f"pre_conf={frame.get('visible_before_confidence', frame['visible_points'])} "
+            f"total={frame['total_points']}",
             fontsize=10,
         )
         ax.set_xlabel("X")
@@ -898,9 +992,16 @@ def plot_dense_reference_static(
     plt.close(fig)
 
     visible_counts = np.array([frame["visible_points"] for frame in dense_frames], dtype=np.float32)
+    pre_conf_counts = np.array(
+        [frame.get("visible_before_confidence", frame["visible_points"]) for frame in dense_frames],
+        dtype=np.float32,
+    )
+    mean_conf = np.array([frame.get("mean_confidence", math.nan) for frame in dense_frames], dtype=np.float32)
     return {
         "dense_pred_mean_visible_points": float(np.mean(visible_counts)),
         "dense_pred_max_visible_points": float(np.max(visible_counts)),
+        "dense_pred_mean_visible_before_confidence": float(np.mean(pre_conf_counts)),
+        "dense_pred_mean_confidence": float(np.nanmean(mean_conf)) if np.isfinite(mean_conf).any() else math.nan,
     }
 
 
@@ -924,14 +1025,16 @@ def write_dense_reference_gif(
             s=0.45,
             alpha=0.9,
         )
-        ax.view_init(elev=20, azim=-62)
+        set_camera_view(ax)
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
         set_axes_limits(ax, center, radius)
         fig.suptitle(
             f"{title_prefix}\nframe={frame['frame_id']}  "
-            f"visible={frame['visible_points']} / {frame['total_points']}",
+            f"kept={frame['visible_points']} "
+            f"pre_conf={frame.get('visible_before_confidence', frame['visible_points'])} "
+            f"total={frame['total_points']}",
             fontsize=12,
         )
         frames_rgb.append(figure_to_rgb(fig))
@@ -1025,7 +1128,10 @@ def filter_dense_frames_by_ids(
                 "colors": frame["colors"][mask],
                 "point_ids": frame["point_ids"][mask],
                 "visible_points": int(mask.sum()),
+                "visible_before_confidence": int(mask.sum()),
                 "total_points": selected_total,
+                "confidence_threshold": frame.get("confidence_threshold", math.nan),
+                "mean_confidence": frame.get("mean_confidence", math.nan),
             }
         )
 
@@ -1040,6 +1146,17 @@ def summarize_predictions(
     vis_mask = pred["pred_vis"] > 0.5
     visible_ratio = float(vis_mask.mean())
     visible_ratio_ref = float(vis_mask[:, reference_frame].mean())
+    pred_conf = pred.get("pred_conf")
+    if pred_conf is not None and np.isfinite(pred_conf).any():
+        confidence_stats = {
+            "pred_mean_confidence": float(np.nanmean(pred_conf)),
+            "pred_mean_visible_confidence": float(np.nanmean(pred_conf[vis_mask])) if vis_mask.any() else math.nan,
+        }
+    else:
+        confidence_stats = {
+            "pred_mean_confidence": math.nan,
+            "pred_mean_visible_confidence": math.nan,
+        }
 
     src = query_points_px[:, None, :]
     displacement = np.linalg.norm(pred["pred_2d_px"] - src, axis=-1)
@@ -1060,6 +1177,7 @@ def summarize_predictions(
     return {
         "pred_visible_ratio": visible_ratio,
         "pred_visible_ratio_ref": visible_ratio_ref,
+        **confidence_stats,
         **motion_stats,
     }
 
@@ -1071,6 +1189,10 @@ def main() -> None:
     if not (0.0 <= args.dense_motion_percentile <= 100.0):
         raise ValueError(
             f"dense-motion-percentile must be in [0, 100], got {args.dense_motion_percentile}"
+        )
+    if not (0.0 <= args.dense_confidence_percentile <= 100.0):
+        raise ValueError(
+            f"dense-confidence-percentile must be in [0, 100], got {args.dense_confidence_percentile}"
         )
 
     input_path = Path(args.input_path)
@@ -1191,6 +1313,7 @@ def main() -> None:
         reference_frame=reference_frame,
         stride=args.dense_point_cloud_stride,
         vis_threshold=args.dense_vis_threshold,
+        confidence_percentile=args.dense_confidence_percentile,
         batch_size=args.dense_query_batch_size,
         orig_width=orig_w,
         orig_height=orig_h,
@@ -1251,6 +1374,7 @@ def main() -> None:
         "input_kind": input_kind,
         "checkpoint": args.checkpoint,
         "device": str(device),
+        "model_variant": args.model_variant,
         "patch_provider": args.patch_provider,
         "resolution": int(args.resolution),
         "num_frames": int(args.num_frames),
@@ -1269,6 +1393,7 @@ def main() -> None:
         "query_margin": float(args.query_margin),
         "dense_point_cloud_stride": int(args.dense_point_cloud_stride),
         "dense_vis_threshold": float(args.dense_vis_threshold),
+        "dense_confidence_percentile": float(args.dense_confidence_percentile),
         "dense_motion_percentile": float(args.dense_motion_percentile),
         "num_query_points": int(len(query_points_norm)),
         "num_display_points": int(len(display_ids)),

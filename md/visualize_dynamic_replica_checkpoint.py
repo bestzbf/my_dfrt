@@ -26,7 +26,13 @@ if str(REPO_ROOT) not in sys.path:
 
 from datasets.factory import create_training_dataset
 from models import create_d4rt
+from utils.camera import compute_relative_pose_error, sim3_alignment
+from utils.metrics import compute_pose_auc, compute_pose_metrics
 from utils.visualization import save_point_cloud_ply
+
+
+CAMERA_VIEW_ELEV = -90
+CAMERA_VIEW_AZIM = -90
 
 
 def parse_args() -> argparse.Namespace:
@@ -63,6 +69,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--start-index", type=int, default=0, help="从哪个 validation index 开始找样本。")
     parser.add_argument("--max-search", type=int, default=200, help="最多向后扫描多少个 validation index 来凑够样本。")
     parser.add_argument(
+        "--sample-indices",
+        type=str,
+        default="",
+        help="逗号分隔的显式 validation indices。设置后优先使用这些 index，而不是连续扫描 start-index。",
+    )
+    parser.add_argument(
         "--reference-frame",
         type=int,
         default=-1,
@@ -76,6 +88,16 @@ def parse_args() -> argparse.Namespace:
         help="2D 对比静态图和 GIF 中实际绘制多少个稀疏 query 点。",
     )
     parser.add_argument("--gif-fps", type=int, default=8, help="输出 GIF 的播放帧率。")
+    parser.add_argument("--static-only", action="store_true", help="只输出静态图/PLY/summary，跳过 GIF 渲染以加速批量可视化。")
+    parser.add_argument("--camera-pose-grid-h", type=int, default=6, help="相机位姿估计使用的 query 网格高度。")
+    parser.add_argument("--camera-pose-grid-w", type=int, default=6, help="相机位姿估计使用的 query 网格宽度。")
+    parser.add_argument(
+        "--camera-pose-confidence-threshold",
+        type=float,
+        default=0.5,
+        help="相机位姿估计中保留 3D 对应点的 confidence 阈值。",
+    )
+    parser.add_argument("--skip-camera-visualization", action="store_true", help="跳过相机轨迹/内参可视化。")
     parser.add_argument(
         "--dense-gt-max-points",
         type=int,
@@ -127,8 +149,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dense-pred-vis-threshold",
         type=float,
-        default=0.5,
+        default=0.3,
         help="稠密预测点云保留点的 visibility 阈值。",
+    )
+    parser.add_argument(
+        "--dense-pred-confidence-percentile",
+        type=float,
+        default=10.0,
+        help="稠密预测点云在 visibility 过滤后丢弃最低 N%% confidence 的点。默认 10；0 表示关闭。",
     )
     parser.add_argument(
         "--dense-pred-query-batch-size",
@@ -146,10 +174,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--dense-pred-query-depth-percentile",
         type=float,
-        default=50.0,
+        default=100.0,
         help=(
             "在 reference frame 上对格点预测深度（Z轴），只保留最近 N%% 的格点作为 query。"
-            "默认 50，即只取前景/近处一半的格点；设为 100 则不过滤。"
+            "默认 100，即不过滤；设为 50 则只取前景/近处一半的格点。"
         ),
     )
     parser.add_argument("--flip-y-axis", action="store_true", help="对所有 3D 输出和导出的 PLY 执行 Y 轴翻转。")
@@ -242,7 +270,21 @@ def load_model(args: argparse.Namespace, device: torch.device) -> torch.nn.Modul
 def load_val_dataset(config_path: str, split: str = "val"):
     with open(config_path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f)
+    if config.get("planned_mode", False):
+        config["planned_start_immediately"] = False
     return create_training_dataset(config, split=split)
+
+
+def parse_sample_indices(raw: str) -> list[int]:
+    raw = raw.strip()
+    if not raw:
+        return []
+    indices: list[int] = []
+    for item in raw.split(","):
+        token = item.strip()
+        if token:
+            indices.append(int(token))
+    return indices
 
 
 def load_transform_result(dataset, index: int, allow_no_tracks: bool = False):
@@ -296,6 +338,33 @@ def find_samples(dataset, start_index: int, count: int, max_search: int, allow_n
         checked += 1
     if len(found) < count:
         raise RuntimeError(f"Only found {len(found)} trackable samples within {max_search} val indices")
+    return found
+
+
+def find_samples_by_indices(dataset, indices: list[int], allow_no_tracks: bool = False):
+    found: list[dict[str, Any]] = []
+    for idx in indices:
+        try:
+            dataset.mixture_sampler.reset_locality_state()
+            result, dataset_idx, sequence_name, frame_indices = load_transform_result(
+                dataset,
+                idx,
+                allow_no_tracks=allow_no_tracks,
+            )
+            print(f"[vis] find_samples: found explicit sample {len(found)} at idx={idx} seq={sequence_name}", flush=True)
+            found.append(
+                {
+                    "sample_index": idx,
+                    "dataset_idx": dataset_idx,
+                    "sequence_name": sequence_name,
+                    "frame_indices": frame_indices,
+                    "result": result,
+                }
+            )
+        except Exception as exc:  # noqa: BLE001
+            print(f"[vis] find_samples: skip explicit idx={idx}: {exc}", flush=True)
+    if not found:
+        raise RuntimeError(f"No valid samples found from explicit indices: {indices}")
     return found
 
 
@@ -446,12 +515,21 @@ def project_world_to_pixels(points_world: np.ndarray, intrinsics: np.ndarray, ex
 
 
 def result_has_track_gt(result) -> bool:
-    return (
-        bool(result.metadata.get("has_tracks", False))
-        and result.trajs_2d is not None
-        and result.trajs_3d_world is not None
-        and result.visibs is not None
-    )
+    if not bool(result.metadata.get("has_tracks", False)):
+        return False
+    if result.trajs_2d is None or result.trajs_3d_world is None or result.visibs is None:
+        return False
+
+    trajs_2d = np.asarray(result.trajs_2d)
+    trajs_3d = np.asarray(result.trajs_3d_world)
+    visibs = np.asarray(result.visibs)
+    if trajs_2d.ndim < 3 or trajs_3d.ndim < 3 or visibs.ndim < 2:
+        return False
+    if trajs_2d.shape[1] == 0 or trajs_3d.shape[1] == 0 or visibs.shape[1] == 0:
+        return False
+    if not np.isfinite(trajs_2d).any() or not np.isfinite(trajs_3d).any():
+        return False
+    return bool(np.asarray(visibs, dtype=bool).any())
 
 
 def choose_gt_source(result, requested: str) -> tuple[str, str]:
@@ -629,6 +707,17 @@ def save_point_cloud_ply_allow_empty(
         save_point_cloud_ply(str(output_path), points, colors=colors)
         return
     save_point_cloud_ply(str(output_path), points, colors=None)
+
+
+def apply_confidence_percentile_filter(
+    keep: np.ndarray,
+    confidence: np.ndarray,
+    percentile: float,
+) -> tuple[np.ndarray, float]:
+    if percentile <= 0.0 or not keep.any():
+        return keep, math.nan
+    threshold = float(np.percentile(confidence[keep], percentile))
+    return keep & (confidence >= threshold), threshold
 
 
 def compute_track_predictions(
@@ -1141,6 +1230,7 @@ def compute_dense_pred_reference_sequence(
     patch_provider: str,
     depth_percentile: float = 100.0,
     query_depth_percentile: float = 50.0,
+    confidence_percentile: float = 40.0,
 ) -> list[dict[str, Any]]:
     if stride <= 0:
         raise ValueError(f"dense-pred-point-cloud-stride must be positive, got {stride}")
@@ -1215,6 +1305,7 @@ def compute_dense_pred_reference_sequence(
     for frame_id in range(total_frames):
         points_list: list[np.ndarray] = []
         vis_list: list[np.ndarray] = []
+        conf_list: list[np.ndarray] = []
 
         for start in range(0, total_points, batch_size):
             end = min(start + batch_size, total_points)
@@ -1238,11 +1329,15 @@ def compute_dense_pred_reference_sequence(
 
             points_list.append(outputs["pos_3d"][0].detach().float().cpu().numpy())
             vis_list.append(torch.sigmoid(outputs["visibility"][0].squeeze(-1)).detach().float().cpu().numpy())
+            conf_list.append(outputs["confidence_weight"][0].squeeze(-1).detach().float().cpu().numpy())
 
         points_ref = np.concatenate(points_list, axis=0)
         visibility = np.concatenate(vis_list, axis=0)
+        confidence = np.concatenate(conf_list, axis=0)
         keep = visibility > vis_threshold
         keep &= np.isfinite(points_ref).all(axis=-1)
+        visible_before_confidence = int(keep.sum())
+        keep, confidence_threshold = apply_confidence_percentile_filter(keep, confidence, confidence_percentile)
         if depth_percentile < 100.0 and keep.sum() > 0:
             dists = np.linalg.norm(points_ref[keep], axis=-1)
             threshold = np.percentile(dists, depth_percentile)
@@ -1261,7 +1356,10 @@ def compute_dense_pred_reference_sequence(
                 "colors": reference_colors[keep],
                 "point_ids": np.flatnonzero(keep).astype(np.int32),
                 "visible_points": int(keep.sum()),
+                "visible_before_confidence": visible_before_confidence,
                 "total_points": total_points,
+                "confidence_threshold": confidence_threshold,
+                "mean_confidence": float(np.mean(confidence[keep])) if keep.any() else math.nan,
             }
         )
 
@@ -1278,6 +1376,7 @@ def compute_dense_canonical_sequence(
     device: torch.device,
     flip_y: bool,
     patch_provider: str,
+    confidence_percentile: float = 40.0,
 ) -> list[dict[str, Any]]:
     """每帧独立重建到参考坐标系：t_src=t, t_tgt=t, t_cam=reference_frame。
 
@@ -1321,6 +1420,7 @@ def compute_dense_canonical_sequence(
 
         points_list: list[np.ndarray] = []
         vis_list: list[np.ndarray] = []
+        conf_list: list[np.ndarray] = []
         for start in range(0, total_points, batch_size):
             end = min(start + batch_size, total_points)
             coords_chunk = coords_torch[start:end].unsqueeze(0)
@@ -1340,20 +1440,27 @@ def compute_dense_canonical_sequence(
                         t_tgt,
                         t_cam,
                         transform_metadata=transform_metadata,
-                    )
+            )
             points_list.append(outputs["pos_3d"][0].detach().float().cpu().numpy())
             vis_list.append(torch.sigmoid(outputs["visibility"][0].squeeze(-1)).detach().float().cpu().numpy())
+            conf_list.append(outputs["confidence_weight"][0].squeeze(-1).detach().float().cpu().numpy())
 
         points_ref = np.concatenate(points_list, axis=0)
         visibility = np.concatenate(vis_list, axis=0)
+        confidence = np.concatenate(conf_list, axis=0)
         keep = (visibility > vis_threshold) & np.isfinite(points_ref).all(axis=-1)
+        visible_before_confidence = int(keep.sum())
+        keep, confidence_threshold = apply_confidence_percentile_filter(keep, confidence, confidence_percentile)
 
         dense_frames.append({
             "frame_id": frame_id,
             "points_ref": maybe_flip_y(points_ref[keep], flip_y),
             "colors": frame_colors[keep],
             "visible_points": int(keep.sum()),
+            "visible_before_confidence": visible_before_confidence,
             "total_points": total_points,
+            "confidence_threshold": confidence_threshold,
+            "mean_confidence": float(np.mean(confidence[keep])) if keep.any() else math.nan,
         })
 
     return dense_frames
@@ -1382,6 +1489,10 @@ def set_axes_limits(ax, center: np.ndarray, radius: float) -> None:
     ax.set_zlim(center[2] - radius, center[2] + radius)
 
 
+def set_camera_view(ax) -> None:
+    ax.view_init(elev=CAMERA_VIEW_ELEV, azim=CAMERA_VIEW_AZIM)
+
+
 def plot_dense_gt_static(
     result,
     dense_frames: list[dict[str, Any]],
@@ -1399,10 +1510,10 @@ def plot_dense_gt_static(
             frame["points_world"][:, 1],
             frame["points_world"][:, 2],
             c=frame["colors"],
-            s=0.45,
+            s=1.2,
             alpha=0.9,
         )
-        ax.view_init(elev=20, azim=-62)
+        set_camera_view(ax)
         ax.set_title(
             f"frame {frame_id}\n"
             f"selected={frame['selected_points']} rendered={frame['rendered_points']}",
@@ -1441,10 +1552,10 @@ def write_dense_gt_gif(
             frame["points_world"][:, 1],
             frame["points_world"][:, 2],
             c=frame["colors"],
-            s=0.45,
+            s=1.2,
             alpha=0.9,
         )
-        ax.view_init(elev=20, azim=-62)
+        set_camera_view(ax)
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
@@ -1480,10 +1591,10 @@ def plot_dense_pred_reference_static(
             s=0.45,
             alpha=0.9,
         )
-        ax.view_init(elev=20, azim=-62)
+        set_camera_view(ax)
         ax.set_title(
             f"frame {frame_id}\n"
-            f"visible={frame['visible_points']} / {frame['total_points']}",
+            f"kept={frame['visible_points']} pre_conf={frame['visible_before_confidence']} total={frame['total_points']}",
             fontsize=10,
         )
         ax.set_xlabel("X")
@@ -1525,14 +1636,14 @@ def write_dense_pred_reference_gif(
             s=0.45,
             alpha=0.9,
         )
-        ax.view_init(elev=20, azim=-62)
+        set_camera_view(ax)
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
         set_axes_limits(ax, center, radius)
         fig.suptitle(
             f"{result.sequence_name}  Pred dense reference point cloud  frame {frame['frame_id']}\n"
-            f"visible={frame['visible_points']} / {frame['total_points']}",
+            f"kept={frame['visible_points']} pre_conf={frame['visible_before_confidence']} total={frame['total_points']}",
             fontsize=13,
         )
         frames_rgb.append(figure_to_rgb(fig))
@@ -1547,19 +1658,17 @@ def plot_dense_pred_world_static(
     dense_gt_frames: list[dict[str, Any]],
     output_path: Path,
 ) -> dict[str, float]:
-    """GT vs Pred 并排对比，3 个视角（正面/侧面/俯视），4 帧。"""
+    """GT vs Pred 并排对比，固定相机视角。"""
     frame_ids = make_frame_ids(len(dense_pred_frames), num_frames=4)
 
     # 合并两者点云计算统一坐标轴范围，保证 GT 和 Pred 坐标轴对齐
     combined = [{"points_world": f["points_world"]} for f in dense_pred_frames + dense_gt_frames if len(f["points_world"]) > 0]
     center, radius = dense_axis_limits(combined, points_key="points_world")
 
-    VIEWS = [(20, -62), (0, 0), (90, 0)]
-    VIEW_LABELS = ["front (elev=20)", "side (elev=0)", "top (elev=90)"]
-    # 行布局：GT(front), Pred(front), Pred(side), Pred(top)
-    nrows = 4
+    # 行布局：GT camera view, Pred camera view
+    nrows = 2
     ncols = len(frame_ids)
-    row_labels = [f"GT {VIEW_LABELS[0]}", f"Pred {VIEW_LABELS[0]}", f"Pred {VIEW_LABELS[1]}", f"Pred {VIEW_LABELS[2]}"]
+    row_labels = ["GT camera view", "Pred camera view"]
 
     fig = plt.figure(figsize=(4.5 * ncols, 5.0 * nrows), constrained_layout=True)
 
@@ -1573,17 +1682,19 @@ def plot_dense_pred_world_static(
             if row_idx == 0:
                 pts = gt_frame["points_world"]
                 cols = gt_frame["colors"]
-                elev, azim = VIEWS[0]
                 info = f"sel={gt_frame['selected_points']}"
             else:
                 pts = pred_frame["points_world"]
                 cols = pred_frame["colors"]
-                elev, azim = VIEWS[row_idx - 1]
-                info = f"vis={pred_frame['visible_points']}/{pred_frame['total_points']}"
+                info = (
+                    f"kept={pred_frame['visible_points']} "
+                    f"pre={pred_frame['visible_before_confidence']} "
+                    f"total={pred_frame['total_points']}"
+                )
 
             if len(pts) > 0:
                 ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=cols, s=1.5, alpha=0.9)
-            ax.view_init(elev=elev, azim=azim)
+            set_camera_view(ax)
             set_axes_limits(ax, center, radius)
             ax.set_xlabel("X", fontsize=7)
             ax.set_ylabel("Y", fontsize=7)
@@ -1610,7 +1721,7 @@ def write_dense_pred_world_gif(
     fps: int,
     reference_frame_id: int = -1,
 ) -> None:
-    """位移颜色编码的动态 GIF：动态点高亮（plasma colormap），视角缓慢旋转。"""
+    """位移颜色编码的动态 GIF：动态点高亮（plasma colormap），固定相机视角。"""
     center, radius = dense_axis_limits(dense_frames, points_key="points_world")
     total_frames = len(dense_frames)
 
@@ -1643,10 +1754,7 @@ def write_dense_pred_world_gif(
     cmap = plt.cm.plasma
     frames_rgb: list[np.ndarray] = []
 
-    for frame_idx, (frame, disps) in enumerate(zip(dense_frames, all_disps)):
-        # 视角缓慢旋转一圈
-        azim = -62 + frame_idx * 360.0 / max(total_frames, 1)
-
+    for frame, disps in zip(dense_frames, all_disps):
         fig = plt.figure(figsize=(7.0, 6.0), constrained_layout=True)
         ax = fig.add_subplot(1, 1, 1, projection="3d")
 
@@ -1660,14 +1768,15 @@ def write_dense_pred_world_gif(
             cbar = fig.colorbar(sm, ax=ax, fraction=0.025, pad=0.08, shrink=0.6)
             cbar.set_label("displacement (m)", fontsize=9)
 
-        ax.view_init(elev=20, azim=azim)
+        set_camera_view(ax)
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
         set_axes_limits(ax, center, radius)
         fig.suptitle(
             f"{result.sequence_name}  Pred dense world  frame {frame['frame_id']}\n"
-            f"vis={frame['visible_points']}/{frame['total_points']}  color=displacement from ref={reference_frame_id}",
+            f"kept={frame['visible_points']} pre_conf={frame['visible_before_confidence']} total={frame['total_points']}  "
+            f"color=displacement from ref={reference_frame_id}",
             fontsize=11,
         )
         frames_rgb.append(figure_to_rgb(fig))
@@ -1681,13 +1790,11 @@ def plot_dense_canonical_static(
     dense_frames: list[dict[str, Any]],
     output_path: Path,
 ) -> dict[str, float]:
-    """canonical 重建静态图：每帧独立重建到参考坐标系，4 个视角，4 帧。"""
+    """canonical 重建静态图：每帧独立重建到参考坐标系，固定相机视角。"""
     frame_ids = make_frame_ids(len(dense_frames), num_frames=4)
     center, radius = dense_axis_limits(dense_frames, points_key="points_ref")
 
-    VIEWS = [(-90, -90), (20, -62), (0, 0), (90, 0)]
-    VIEW_LABELS = ["camera view", "front (elev=20)", "side (elev=0)", "top (elev=90)"]
-    nrows = len(VIEWS)
+    nrows = 1
     ncols = len(frame_ids)
 
     fig = plt.figure(figsize=(4.5 * ncols, 5.0 * nrows), constrained_layout=True)
@@ -1695,17 +1802,21 @@ def plot_dense_canonical_static(
         frame = dense_frames[frame_id]
         pts = frame["points_ref"]
         cols = frame["colors"]
-        for row_idx, (elev, azim) in enumerate(VIEWS):
+        for row_idx in range(nrows):
             ax = fig.add_subplot(nrows, ncols, row_idx * ncols + col_idx + 1, projection="3d")
             if len(pts) > 0:
                 ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=cols, s=1.5, alpha=0.9)
-            ax.view_init(elev=elev, azim=azim)
+            set_camera_view(ax)
             set_axes_limits(ax, center, radius)
             ax.set_xlabel("X", fontsize=7)
             ax.set_ylabel("Y", fontsize=7)
             ax.set_zlabel("Z", fontsize=7)
-            row_label = f"{VIEW_LABELS[row_idx]}\n" if col_idx == 0 else ""
-            ax.set_title(f"{row_label}frame {frame_id}  vis={frame['visible_points']}/{frame['total_points']}", fontsize=9)
+            row_label = "camera view\n" if col_idx == 0 else ""
+            ax.set_title(
+                f"{row_label}frame {frame_id}  "
+                f"kept={frame['visible_points']} pre={frame['visible_before_confidence']} total={frame['total_points']}",
+                fontsize=9,
+            )
 
     fig.suptitle(
         f"{result.sequence_name}  Canonical reconstruction (t_src=t, t_cam=ref)\n"
@@ -1738,14 +1849,15 @@ def write_dense_canonical_gif(
         pts = frame["points_ref"]
         if len(pts) > 0:
             ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], c=frame["colors"], s=1.5, alpha=0.9)
-        ax.view_init(elev=-90, azim=-90)
+        set_camera_view(ax)
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
         set_axes_limits(ax, center, radius)
         fig.suptitle(
             f"{result.sequence_name}  Canonical  frame {frame['frame_id']}\n"
-            f"vis={frame['visible_points']}/{frame['total_points']}  (static=fixed, dynamic=moves)",
+            f"kept={frame['visible_points']} pre_conf={frame['visible_before_confidence']} total={frame['total_points']}  "
+            f"(static=fixed, dynamic=moves)",
             fontsize=11,
         )
         frames_rgb.append(figure_to_rgb(fig))
@@ -1908,7 +2020,7 @@ def plot_3d_scatter(
     ax_pd.set_title(f"Pred 3D @ frame {t_ref}", fontsize=11)
 
     for ax in (ax_gt, ax_pd):
-        ax.view_init(elev=24, azim=-62)
+        set_camera_view(ax)
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
@@ -1946,10 +2058,302 @@ def summarize_visibility(pred: dict[str, Any]) -> dict[str, float]:
     }
 
 
+def encode_video_for_camera(
+    model: torch.nn.Module,
+    result,
+    device: torch.device,
+    patch_provider: str,
+) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor] | None]:
+    video, aspect_ratio = to_video_tensor(result, device)
+    patch_frames = None
+    transform_metadata = None
+    if patch_provider == "sampled_highres":
+        patch_frames = to_patch_frames_tensor(result, device)
+        transform_metadata = build_transform_metadata(result, device)
+
+    with torch.no_grad():
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            encoder_features = model.encode(video, aspect_ratio)
+    frames_bcthw = model._prepare_query_frames(video, patch_frames)
+    return encoder_features, frames_bcthw, transform_metadata
+
+
+def estimate_relative_pose_for_camera(
+    model: torch.nn.Module,
+    encoder_features: torch.Tensor,
+    frames_bcthw: torch.Tensor,
+    frame_i: int,
+    frame_j: int,
+    grid_h: int,
+    grid_w: int,
+    confidence_threshold: float,
+    device: torch.device,
+    transform_metadata: dict[str, torch.Tensor] | None,
+) -> torch.Tensor:
+    u = torch.linspace(0.1, 0.9, grid_w, device=device)
+    v = torch.linspace(0.1, 0.9, grid_h, device=device)
+    grid_u, grid_v = torch.meshgrid(u, v, indexing="xy")
+    coords = torch.stack([grid_u, grid_v], dim=-1).reshape(1, -1, 2)
+    num_points = coords.shape[1]
+    t_i = torch.full((1, num_points), frame_i, device=device, dtype=torch.long)
+    t_j = torch.full((1, num_points), frame_j, device=device, dtype=torch.long)
+
+    with torch.no_grad():
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=device.type == "cuda"):
+            outputs_i = model.decode(
+                encoder_features,
+                frames_bcthw,
+                coords,
+                t_i,
+                t_i,
+                t_i,
+                transform_metadata=transform_metadata,
+            )
+            outputs_j = model.decode(
+                encoder_features,
+                frames_bcthw,
+                coords,
+                t_i,
+                t_i,
+                t_j,
+                transform_metadata=transform_metadata,
+            )
+
+    points_i = outputs_i["pos_3d"].squeeze(0).detach().float()
+    points_j = outputs_j["pos_3d"].squeeze(0).detach().float()
+    weights = (
+        outputs_i["confidence_weight"].squeeze(0).squeeze(-1).detach().float()
+        * outputs_j["confidence_weight"].squeeze(0).squeeze(-1).detach().float()
+    )
+    valid = (
+        torch.isfinite(points_i).all(dim=-1)
+        & torch.isfinite(points_j).all(dim=-1)
+        & torch.isfinite(weights)
+        & (weights > confidence_threshold)
+    )
+    if int(valid.sum().item()) < 4:
+        return torch.eye(4, dtype=torch.float32)
+
+    from utils.camera import umeyama_alignment
+
+    R, t, _ = umeyama_alignment(points_j[valid], points_i[valid], weights[valid], with_scale=False)
+    R_ij = R.T
+    t_ij = -R_ij @ t
+    pose = torch.eye(4, dtype=torch.float32)
+    pose[:3, :3] = R_ij.cpu()
+    pose[:3, 3] = t_ij.cpu()
+    return pose
+
+
+def apply_sim3_to_poses(pred_poses: torch.Tensor, gt_poses: torch.Tensor) -> torch.Tensor:
+    aligned = pred_poses.clone()
+    rotation, translation, scale = sim3_alignment(pred_poses, gt_poses)
+    aligned[:, :3, :3] = pred_poses[:, :3, :3] @ rotation.T
+    centers = pred_poses[:, :3, 3]
+    aligned[:, :3, 3] = scale * (centers @ rotation.T) + translation
+    return aligned
+
+
+def estimate_camera_trajectory_for_result(
+    model: torch.nn.Module,
+    result,
+    reference_frame: int,
+    grid_h: int,
+    grid_w: int,
+    confidence_threshold: float,
+    device: torch.device,
+    patch_provider: str,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+    encoder_features, frames_bcthw, transform_metadata = encode_video_for_camera(
+        model=model,
+        result=result,
+        device=device,
+        patch_provider=patch_provider,
+    )
+    gt_w2c = torch.from_numpy(np.asarray(result.extrinsics)).float()
+    gt_c2w = torch.linalg.inv(gt_w2c)
+    ref_w2c = gt_w2c[reference_frame]
+    pred_c2w_list: list[torch.Tensor] = []
+    rot_errors: list[torch.Tensor] = []
+    trans_errors: list[torch.Tensor] = []
+
+    for frame_idx in range(len(result.images)):
+        if frame_idx == reference_frame:
+            pred_w2c_rel = torch.eye(4, dtype=torch.float32)
+        else:
+            pred_w2c_rel = estimate_relative_pose_for_camera(
+                model=model,
+                encoder_features=encoder_features,
+                frames_bcthw=frames_bcthw,
+                frame_i=reference_frame,
+                frame_j=frame_idx,
+                grid_h=grid_h,
+                grid_w=grid_w,
+                confidence_threshold=confidence_threshold,
+                device=device,
+                transform_metadata=transform_metadata,
+            )
+            gt_w2c_rel = gt_w2c[frame_idx] @ torch.linalg.inv(ref_w2c)
+            rel_errors = compute_relative_pose_error(
+                pred_w2c_rel[:3, :3],
+                pred_w2c_rel[:3, 3],
+                gt_w2c_rel[:3, :3],
+                gt_w2c_rel[:3, 3],
+            )
+            rot_errors.append(rel_errors["rotation_error"])
+            trans_errors.append(rel_errors["translation_error"])
+        pred_c2w_list.append(torch.linalg.inv(pred_w2c_rel))
+
+    pred_c2w = torch.stack(pred_c2w_list)
+    aligned_pred = apply_sim3_to_poses(pred_c2w, gt_c2w)
+    pose_metrics = compute_pose_metrics(pred_c2w, gt_c2w, align=True)
+    if rot_errors:
+        pose_auc_30 = compute_pose_auc(torch.stack(rot_errors), torch.stack(trans_errors), threshold=30.0)
+    else:
+        pose_auc_30 = torch.tensor(float("nan"))
+    metrics = {
+        "camera_pose_ate": float(pose_metrics["ate"].item()),
+        "camera_pose_rpe_trans": float(pose_metrics["rpe_trans"].item()),
+        "camera_pose_rpe_rot": float(pose_metrics["rpe_rot"].item()),
+        "camera_pose_auc_30": float(pose_auc_30.item()),
+        "camera_pose_num_pairs": float(len(rot_errors)),
+    }
+    return gt_c2w.numpy(), aligned_pred.numpy(), metrics
+
+
+def _set_equal_camera_axes(ax, points: np.ndarray) -> None:
+    pts = points[np.isfinite(points).all(axis=-1)]
+    if len(pts) == 0:
+        return
+    mins = pts.min(axis=0)
+    maxs = pts.max(axis=0)
+    center = (mins + maxs) / 2.0
+    radius = max(float((maxs - mins).max()) / 2.0, 1e-4)
+    ax.set_xlim(center[0] - radius, center[0] + radius)
+    ax.set_ylim(center[1] - radius, center[1] + radius)
+    ax.set_zlim(center[2] - radius, center[2] + radius)
+
+
+def draw_camera_frustum(ax, pose_c2w: np.ndarray, color: str, scale: float) -> None:
+    center = pose_c2w[:3, 3]
+    rotation = pose_c2w[:3, :3]
+    corners_cam = np.array(
+        [[-0.6, -0.4, 1.0], [0.6, -0.4, 1.0], [0.6, 0.4, 1.0], [-0.6, 0.4, 1.0]],
+        dtype=np.float32,
+    ) * scale
+    corners = (rotation @ corners_cam.T).T + center[None]
+    for corner in corners:
+        ax.plot([center[0], corner[0]], [center[1], corner[1]], [center[2], corner[2]], color=color, linewidth=0.7, alpha=0.45)
+    loop = np.concatenate([corners, corners[:1]], axis=0)
+    ax.plot(loop[:, 0], loop[:, 1], loop[:, 2], color=color, linewidth=0.9, alpha=0.75)
+
+
+def plot_camera_trajectory(result, gt_c2w: np.ndarray, pred_c2w: np.ndarray, output_path: Path) -> None:
+    gt_centers = gt_c2w[:, :3, 3]
+    pred_centers = pred_c2w[:, :3, 3]
+    all_centers = np.concatenate([gt_centers, pred_centers], axis=0)
+    travel = np.linalg.norm(np.diff(gt_centers, axis=0), axis=-1).sum()
+    frustum_scale = max(float(travel) / max(len(gt_centers), 1), 1e-3) * 2.0
+
+    fig = plt.figure(figsize=(8.0, 6.8), constrained_layout=True)
+    ax = fig.add_subplot(1, 1, 1, projection="3d")
+    ax.plot(gt_centers[:, 0], gt_centers[:, 1], gt_centers[:, 2], color="#1f77b4", linewidth=2.0, label="GT")
+    ax.plot(pred_centers[:, 0], pred_centers[:, 1], pred_centers[:, 2], color="#d62728", linewidth=2.0, label="Pred aligned")
+    step = max(len(gt_c2w) // 6, 1)
+    for idx in range(0, len(gt_c2w), step):
+        draw_camera_frustum(ax, gt_c2w[idx], "#1f77b4", frustum_scale)
+        draw_camera_frustum(ax, pred_c2w[idx], "#d62728", frustum_scale)
+    ax.scatter(gt_centers[[0, -1], 0], gt_centers[[0, -1], 1], gt_centers[[0, -1], 2], c=["#2ca02c", "#1f77b4"], s=40)
+    _set_equal_camera_axes(ax, all_centers)
+    ax.set_xlabel("X")
+    ax.set_ylabel("Y")
+    ax.set_zlabel("Z")
+    ax.legend(loc="best")
+    fig.suptitle(f"{result.sequence_name} camera trajectory: GT vs predicted (Sim3 aligned)", fontsize=13)
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+
+
+def plot_camera_intrinsics(result, output_path: Path) -> dict[str, float]:
+    intrinsics = np.asarray(result.intrinsics, dtype=np.float32)
+    fx = intrinsics[:, 0, 0]
+    fy = intrinsics[:, 1, 1]
+    cx = intrinsics[:, 0, 2]
+    cy = intrinsics[:, 1, 2]
+    frames = np.arange(len(intrinsics))
+    fig, axes = plt.subplots(2, 1, figsize=(8.0, 5.8), constrained_layout=True, sharex=True)
+    axes[0].plot(frames, fx, label="fx")
+    axes[0].plot(frames, fy, label="fy")
+    axes[0].set_ylabel("focal length")
+    axes[0].legend()
+    axes[1].plot(frames, cx, label="cx")
+    axes[1].plot(frames, cy, label="cy")
+    axes[1].set_xlabel("clip frame")
+    axes[1].set_ylabel("principal point")
+    axes[1].legend()
+    fig.suptitle(f"{result.sequence_name} camera intrinsics", fontsize=13)
+    fig.savefig(output_path, dpi=180)
+    plt.close(fig)
+    return {
+        "camera_fx_mean": float(np.mean(fx)),
+        "camera_fy_mean": float(np.mean(fy)),
+        "camera_cx_mean": float(np.mean(cx)),
+        "camera_cy_mean": float(np.mean(cy)),
+        "camera_fx_std": float(np.std(fx)),
+        "camera_fy_std": float(np.std(fy)),
+    }
+
+
+def visualize_camera_parameters(
+    model: torch.nn.Module,
+    result,
+    reference_frame: int,
+    args: argparse.Namespace,
+    device: torch.device,
+    camera_trajectory_path: Path,
+    intrinsics_path: Path,
+) -> tuple[dict[str, float], dict[str, str]]:
+    if args.skip_camera_visualization or result.extrinsics is None or result.intrinsics is None:
+        return {}, {}
+    camera_metrics: dict[str, float] = {}
+    artifacts: dict[str, str] = {}
+    try:
+        gt_c2w, pred_c2w, pose_metrics = estimate_camera_trajectory_for_result(
+            model=model,
+            result=result,
+            reference_frame=reference_frame,
+            grid_h=args.camera_pose_grid_h,
+            grid_w=args.camera_pose_grid_w,
+            confidence_threshold=args.camera_pose_confidence_threshold,
+            device=device,
+            patch_provider=args.patch_provider,
+        )
+        plot_camera_trajectory(result, gt_c2w, pred_c2w, camera_trajectory_path)
+        camera_metrics.update(pose_metrics)
+        artifacts["camera_trajectory_gt_pred"] = str(camera_trajectory_path)
+    except Exception as exc:  # noqa: BLE001
+        camera_metrics["camera_pose_failed"] = 1.0
+        print(f"[vis]   camera trajectory visualization failed: {exc}", flush=True)
+    try:
+        camera_metrics.update(plot_camera_intrinsics(result, intrinsics_path))
+        artifacts["camera_intrinsics"] = str(intrinsics_path)
+    except Exception as exc:  # noqa: BLE001
+        camera_metrics["camera_intrinsics_failed"] = 1.0
+        print(f"[vis]   camera intrinsics visualization failed: {exc}", flush=True)
+    return camera_metrics, artifacts
+
+
 def main() -> None:
     args = parse_args()
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    for name, value in (
+        ("dense-pred-confidence-percentile", args.dense_pred_confidence_percentile),
+        ("dense-pred-depth-percentile", args.dense_pred_depth_percentile),
+        ("dense-pred-query-depth-percentile", args.dense_pred_query_depth_percentile),
+    ):
+        if not (0.0 <= value <= 100.0):
+            raise ValueError(f"{name} must be in [0, 100], got {value}")
 
     device = select_device(args.device)
     print(f"[vis] Loading dataset from {args.config} (split={args.split}) ...", flush=True)
@@ -1959,14 +2363,23 @@ def main() -> None:
     model = load_model(args, device)
     print(f"[vis] Model loaded on {device} (variant={args.model_variant})", flush=True)
 
-    print(f"[vis] Finding {args.num_samples} samples (start={args.start_index}, max_search={args.max_search}) ...", flush=True)
-    samples = find_samples(
-        dataset=dataset,
-        start_index=args.start_index,
-        count=args.num_samples,
-        max_search=args.max_search,
-        allow_no_tracks=args.allow_no_tracks or args.gt_source in {"auto", "depth"},
-    )
+    sample_indices = parse_sample_indices(args.sample_indices)
+    if sample_indices:
+        print(f"[vis] Finding explicit samples: {sample_indices}", flush=True)
+        samples = find_samples_by_indices(
+            dataset=dataset,
+            indices=sample_indices,
+            allow_no_tracks=args.allow_no_tracks or args.gt_source in {"auto", "depth"},
+        )
+    else:
+        print(f"[vis] Finding {args.num_samples} samples (start={args.start_index}, max_search={args.max_search}) ...", flush=True)
+        samples = find_samples(
+            dataset=dataset,
+            start_index=args.start_index,
+            count=args.num_samples,
+            max_search=args.max_search,
+            allow_no_tracks=args.allow_no_tracks or args.gt_source in {"auto", "depth"},
+        )
 
     summary: dict[str, Any] = {
         "config": args.config,
@@ -1979,6 +2392,7 @@ def main() -> None:
         "depth_gt_max_depth": args.depth_gt_max_depth,
         "dense_pred_point_cloud_stride": args.dense_pred_point_cloud_stride,
         "dense_pred_vis_threshold": args.dense_pred_vis_threshold,
+        "dense_pred_confidence_percentile": args.dense_pred_confidence_percentile,
         "dense_pred_query_batch_size": args.dense_pred_query_batch_size,
         "device": str(device),
         "num_samples": len(samples),
@@ -2017,7 +2431,37 @@ def main() -> None:
                     reference_frame=t_ref,
                 )
             except RuntimeError:
-                has_tracks = False
+                if (
+                    args.gt_source == "auto"
+                    and gt_source != "depth"
+                    and result.depths is not None
+                    and len(result.depths) > 0
+                ):
+                    print(
+                        "[vis]   Track sampling failed; falling back to depth-derived GT for this sample.",
+                        flush=True,
+                    )
+                    gt_source = "depth"
+                    gt_source_reason = "track_sampling_failed"
+                    result = build_depth_gt_result(
+                        result=result,
+                        reference_frame=t_ref,
+                        num_points=args.num_points,
+                        seed=args.seed + sample_index,
+                        max_depth=args.depth_gt_max_depth,
+                    )
+                    has_tracks = result_has_track_gt(result)
+                    try:
+                        t_ref, point_indices, query_points, query_frames, _ = sample_query_points(
+                            result=result,
+                            num_points=args.num_points,
+                            seed=args.seed + sample_index,
+                            reference_frame=t_ref,
+                        )
+                    except RuntimeError:
+                        has_tracks = False
+                else:
+                    has_tracks = False
         if has_tracks:
             pred = compute_track_predictions(
                 model=model,
@@ -2056,6 +2500,8 @@ def main() -> None:
         canonical_static_path = sample_dir / "canonical_static.png"
         canonical_gif_path = sample_dir / "canonical.gif"
         canonical_ref_ply_path = sample_dir / f"canonical_frame_{t_ref:03d}.ply"
+        camera_trajectory_path = sample_dir / "camera_trajectory_gt_pred.png"
+        camera_intrinsics_path = sample_dir / "camera_intrinsics.png"
 
         if has_tracks:
             metrics_2d = plot_2d_overlay(
@@ -2071,13 +2517,14 @@ def main() -> None:
                 display_ids=display_ids,
                 output_path=compare_static_path,
             )
-            write_2d_compare_gif(
-                result=result,
-                pred=pred,
-                display_ids=display_ids,
-                output_path=compare_gif_path,
-                fps=args.gif_fps,
-            )
+            if not args.static_only:
+                write_2d_compare_gif(
+                    result=result,
+                    pred=pred,
+                    display_ids=display_ids,
+                    output_path=compare_gif_path,
+                    fps=args.gif_fps,
+                )
             metrics_3d = plot_3d_scatter(
                 result=result,
                 pred=pred,
@@ -2114,12 +2561,13 @@ def main() -> None:
             dense_frames=dense_gt_frames,
             output_path=dense_gt_static_path,
         )
-        write_dense_gt_gif(
-            result=result,
-            dense_frames=dense_gt_frames,
-            output_path=dense_gt_gif_path,
-            fps=args.gif_fps,
-        )
+        if not args.static_only:
+            write_dense_gt_gif(
+                result=result,
+                dense_frames=dense_gt_frames,
+                output_path=dense_gt_gif_path,
+                fps=args.gif_fps,
+            )
         dense_ref_frame = dense_gt_frames[t_ref]
         save_point_cloud_ply_allow_empty(
             dense_gt_ref_ply_path,
@@ -2139,18 +2587,20 @@ def main() -> None:
             patch_provider=args.patch_provider,
             depth_percentile=args.dense_pred_depth_percentile,
             query_depth_percentile=args.dense_pred_query_depth_percentile,
+            confidence_percentile=args.dense_pred_confidence_percentile,
         )
         dense_pred_metrics = plot_dense_pred_reference_static(
             result=result,
             dense_frames=dense_pred_frames,
             output_path=dense_pred_static_path,
         )
-        write_dense_pred_reference_gif(
-            result=result,
-            dense_frames=dense_pred_frames,
-            output_path=dense_pred_gif_path,
-            fps=args.gif_fps,
-        )
+        if not args.static_only:
+            write_dense_pred_reference_gif(
+                result=result,
+                dense_frames=dense_pred_frames,
+                output_path=dense_pred_gif_path,
+                fps=args.gif_fps,
+            )
         dense_pred_ref_frame = dense_pred_frames[t_ref]
         save_point_cloud_ply_allow_empty(
             dense_pred_ref_ply_path,
@@ -2164,13 +2614,14 @@ def main() -> None:
             dense_gt_frames=dense_gt_frames,
             output_path=dense_pred_world_static_path,
         )
-        write_dense_pred_world_gif(
-            result=result,
-            dense_frames=dense_pred_frames,
-            output_path=dense_pred_world_gif_path,
-            fps=args.gif_fps,
-            reference_frame_id=t_ref,
-        )
+        if not args.static_only:
+            write_dense_pred_world_gif(
+                result=result,
+                dense_frames=dense_pred_frames,
+                output_path=dense_pred_world_gif_path,
+                fps=args.gif_fps,
+                reference_frame_id=t_ref,
+            )
         dense_pred_world_ref_frame = dense_pred_frames[t_ref]
         save_point_cloud_ply_allow_empty(
             dense_pred_world_ref_ply_path,
@@ -2189,49 +2640,66 @@ def main() -> None:
             device=device,
             flip_y=args.flip_y_axis,
             patch_provider=args.patch_provider,
+            confidence_percentile=args.dense_pred_confidence_percentile,
         )
         canonical_metrics = plot_dense_canonical_static(
             result=result,
             dense_frames=canonical_frames,
             output_path=canonical_static_path,
         )
-        write_dense_canonical_gif(
-            result=result,
-            dense_frames=canonical_frames,
-            output_path=canonical_gif_path,
-            fps=args.gif_fps,
-        )
+        if not args.static_only:
+            write_dense_canonical_gif(
+                result=result,
+                dense_frames=canonical_frames,
+                output_path=canonical_gif_path,
+                fps=args.gif_fps,
+            )
         canonical_ref_frame = canonical_frames[t_ref]
         save_point_cloud_ply_allow_empty(
             canonical_ref_ply_path,
             canonical_ref_frame["points_ref"],
             colors=canonical_ref_frame["colors"],
         )
+        print(f"[vis]   Step: visualize_camera_parameters ...", flush=True)
+        camera_metrics, camera_artifacts = visualize_camera_parameters(
+            model=model,
+            result=result,
+            reference_frame=t_ref,
+            args=args,
+            device=device,
+            camera_trajectory_path=camera_trajectory_path,
+            intrinsics_path=camera_intrinsics_path,
+        )
         vis_metrics = summarize_visibility(pred) if has_tracks else {"vis_acc": math.nan, "gt_vis_ratio": math.nan, "pred_vis_ratio": math.nan}
 
         artifacts = {
             "gt_dense_dynamic_world_static": str(dense_gt_static_path),
-            "gt_dense_dynamic_world_gif": str(dense_gt_gif_path),
             "gt_dense_world_reference_ply": str(dense_gt_ref_ply_path),
             "pred_dense_reference_static": str(dense_pred_static_path),
-            "pred_dense_reference_gif": str(dense_pred_gif_path),
             "pred_dense_reference_ply": str(dense_pred_ref_ply_path),
             "pred_dense_world_static": str(dense_pred_world_static_path),
-            "pred_dense_world_gif": str(dense_pred_world_gif_path),
             "pred_dense_world_ply": str(dense_pred_world_ref_ply_path),
             "canonical_static": str(canonical_static_path),
-            "canonical_gif": str(canonical_gif_path),
             "canonical_ply": str(canonical_ref_ply_path),
         }
+        if not args.static_only:
+            artifacts.update({
+                "gt_dense_dynamic_world_gif": str(dense_gt_gif_path),
+                "pred_dense_reference_gif": str(dense_pred_gif_path),
+                "pred_dense_world_gif": str(dense_pred_world_gif_path),
+                "canonical_gif": str(canonical_gif_path),
+            })
+        artifacts.update(camera_artifacts)
         if has_tracks:
             artifacts.update({
                 "tracks_2d_overlay": str(overlay_path),
                 "tracks_2d_compare_static": str(compare_static_path),
-                "tracks_2d_compare_gif": str(compare_gif_path),
                 "tracks_3d_scatter": str(scatter_path),
                 "pred_3d_points_ply": str(pred_ply_path),
                 "gt_3d_points_ply": str(gt_ply_path),
             })
+            if not args.static_only:
+                artifacts["tracks_2d_compare_gif"] = str(compare_gif_path)
 
         sample_summary = {
             "sample_rank": sample_rank,
@@ -2244,6 +2712,7 @@ def main() -> None:
             "dense_gt_point_source": args.dense_gt_point_source,
             "dense_gt_depth_stride": args.dense_gt_depth_stride,
             "depth_gt_max_depth": args.depth_gt_max_depth,
+            "dense_pred_confidence_percentile": float(args.dense_pred_confidence_percentile),
             "has_tracks": has_tracks,
             "num_query_points": int(len(point_indices)) if has_tracks else 0,
             "num_display_points": int(len(display_ids)) if has_tracks else 0,
@@ -2253,6 +2722,7 @@ def main() -> None:
             **dense_pred_metrics,
             **dense_pred_world_metrics,
             **canonical_metrics,
+            **camera_metrics,
             **vis_metrics,
             "artifacts": artifacts,
         }
@@ -2274,14 +2744,28 @@ def main() -> None:
         "dense_pred_world_max_visible",
         "canonical_mean_visible_points",
         "canonical_max_visible_points",
+        "camera_pose_ate",
+        "camera_pose_rpe_trans",
+        "camera_pose_rpe_rot",
+        "camera_pose_auc_30",
+        "camera_fx_mean",
+        "camera_fy_mean",
+        "camera_cx_mean",
+        "camera_cy_mean",
         "vis_acc",
         "gt_vis_ratio",
         "pred_vis_ratio",
     ]
-    summary["mean_metrics"] = {
-        key: float(np.mean([s[key] for s in summary["samples"]]))
-        for key in mean_keys
-    }
+    mean_metrics: dict[str, float] = {}
+    for key in mean_keys:
+        values = [
+            float(s[key])
+            for s in summary["samples"]
+            if key in s and np.isfinite(float(s[key]))
+        ]
+        if values:
+            mean_metrics[key] = float(np.mean(values))
+    summary["mean_metrics"] = mean_metrics
 
     summary_path = out_dir / "summary.json"
     with open(summary_path, "w", encoding="utf-8") as f:

@@ -437,11 +437,17 @@ def compute_pointcloud_l1_for_clip(
     pred_points, gt_points = _subsample_paired_points(pred_points, gt_points, max_points=max_points, seed=seed)
 
     pred_aligned, gt_aligned = mean_shift_align_points(pred_points, gt_points)
-    l1 = paired_coordinate_l1(pred_aligned, gt_aligned)
+    l1_meanshift = paired_coordinate_l1(pred_aligned, gt_aligned)
+
+    R_sim3, t_sim3, s_sim3 = umeyama_alignment(pred_points, gt_points, with_scale=True)
+    pred_sim3 = s_sim3 * (pred_points @ R_sim3.T) + t_sim3
+    l1_sim3 = paired_coordinate_l1(pred_sim3, gt_points)
 
     return {
         "pointcloud_num_points": float(pred_points.shape[0]),
-        "pointcloud_l1": float(l1.item()),
+        "pointcloud_l1": float(l1_meanshift.item()),
+        "pointcloud_l1_sim3": float(l1_sim3.item()),
+        "pointcloud_sim3_scale": float(s_sim3.item()),
     }
 
 

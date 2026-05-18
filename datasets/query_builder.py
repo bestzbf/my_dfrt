@@ -294,6 +294,47 @@ def _normalize_crop_coords(xy: np.ndarray, crop_w: int, crop_h: int) -> np.ndarr
     return np.clip(xy.astype(np.float32) / norm, 0.0, 1.0)
 
 
+def _hw_pair(value: object) -> Optional[tuple[float, float]]:
+    if value is None:
+        return None
+    try:
+        seq = list(value)  # type: ignore[arg-type]
+    except TypeError:
+        return None
+    if len(seq) != 2:
+        return None
+    try:
+        h = float(seq[0])
+        w = float(seq[1])
+    except (TypeError, ValueError):
+        return None
+    if h <= 0.0 or w <= 0.0:
+        return None
+    return h, w
+
+
+def _native_equivalent_aspect_ratio(result: TransformResult) -> float:
+    """Return width/height of the crop in the original RGB coordinate system."""
+    crop = result.crop
+    ratio = float(crop.crop_w) / max(float(crop.crop_h), 1.0)
+
+    # Some adapters, notably ScanNet++, resize RGB/depth/tracks to a target
+    # plane before the generic crop -> square-resize transform.  The model's
+    # aspect token is meant to describe the pre-square view, so map target-plane
+    # crop ratio back to native RGB when the adapter exposes both planes.
+    metadata = result.metadata or {}
+    rgb_hw = _hw_pair(metadata.get("rgb_hw"))
+    target_hw = _hw_pair(metadata.get("target_hw"))
+    if rgb_hw is None or target_hw is None:
+        return ratio
+
+    native_h, native_w = rgb_hw
+    target_h, target_w = target_hw
+    target_ratio = target_w / target_h
+    native_ratio = native_w / native_h
+    return ratio * native_ratio / max(target_ratio, 1e-6)
+
+
 # ---------------------------------------------------------------------------
 # Per-dataset camera-space Z thresholds for mask_3d gating
 # ---------------------------------------------------------------------------
@@ -488,6 +529,7 @@ class D4RTQueryBuilder:
         sample_metadata["query_semantics"] = (
             "full_temporal" if has_tracks else "static_reconstruction"
         )
+        aspect_ratio_value = _native_equivalent_aspect_ratio(result)
 
         # ---- 转 tensor（video / depth / normal） ----
         video = torch.stack(
@@ -676,7 +718,7 @@ class D4RTQueryBuilder:
             local_patches=local_patches,
             transform_metadata=transform_metadata,
             aspect_ratio=torch.tensor(
-                [float(crop.crop_w) / max(float(crop.crop_h), 1.0)],
+                [aspect_ratio_value],
                 dtype=torch.float32,
             ),
             dataset_name=result.dataset_name,

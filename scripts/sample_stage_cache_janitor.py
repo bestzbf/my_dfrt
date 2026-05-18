@@ -126,6 +126,9 @@ def main() -> None:
     )
 
     last_work_cleanup_s = 0.0
+    cleanup_log = os.getenv(
+        "D4RT_SAMPLE_STAGE_JANITOR_CLEANUP_LOG", ""
+    ).strip().lower() in {"1", "true", "yes", "on"}
     while True:
         if not _pid_alive(args.parent_pid):
             print(
@@ -155,7 +158,7 @@ def main() -> None:
                 _cleanup_stale_work_dirs(
                     Path(args.stage_root),
                     args.work_stale_min,
-                    emit_log=True,
+                    emit_log=cleanup_log,
                 )
             except Exception as exc:
                 print(

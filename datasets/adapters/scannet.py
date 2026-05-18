@@ -295,7 +295,10 @@ class ScanNetAdapter(BaseAdapter):
             import hashlib, json as _json
             cache_key = {
                 "dataset": self.dataset_name,
-                "cache_schema": 1,
+                "root": str(self.root),
+                "scans_dir": str(self._scans_dir),
+                "precompute_root": str(self.precompute_root),
+                "cache_schema": 2,
             }
             suffix = hashlib.sha1(
                 _json.dumps(cache_key, sort_keys=True).encode()
@@ -728,6 +731,22 @@ class ScanNetAdapter(BaseAdapter):
         depth_dir = processed_dir / "depth"
         pose_dir = processed_dir / "pose"
         precomputed_h5 = processed_dir / "precomputed.h5"
+        precomputed_npz = processed_dir / "precomputed.npz"
+        precomputed_path = precomputed_h5 if precomputed_h5.exists() else precomputed_npz
+        if not scene_dir.is_dir():
+            raise FileNotFoundError(f"Missing scene_dir: {scene_dir}")
+        for label, path in (
+            ("processed_dir", processed_dir),
+            ("images_dir", image_dir),
+            ("depth_dir", depth_dir),
+            ("pose_dir", pose_dir),
+        ):
+            if not path.exists():
+                raise FileNotFoundError(f"Missing {label}: {path}")
+        if not precomputed_path.exists():
+            raise FileNotFoundError(
+                f"Missing precomputed cache: {precomputed_h5} or {precomputed_npz}"
+            )
         return _SequenceRecord(
             scene_id=scene_id,
             scene_dir=scene_dir,
@@ -735,7 +754,7 @@ class ScanNetAdapter(BaseAdapter):
             image_dir=image_dir,
             depth_dir=depth_dir,
             pose_dir=pose_dir,
-            precomputed_path=precomputed_h5,
+            precomputed_path=precomputed_path,
             mesh_path=None,
             num_frames=num_frames,
             color_hw=(968, 1296),

@@ -132,13 +132,7 @@ def compute_depth_metrics(
         return _nan_metric_dict(DEPTH_METRIC_KEYS, reference=pred)
 
     if shift_invariant:
-        # Scale-and-shift is a superset of scale-only; take the better result
-        # to avoid cases where the extra shift degree of freedom hurts.
-        pred_ss = _apply_depth_scale_and_shift_alignment(pred_flat, target_flat)
-        pred_s = _apply_depth_scale_only_alignment(pred_flat, target_flat)
-        err_ss = (torch.abs(pred_ss - target_flat) / target_flat).mean()
-        err_s = (torch.abs(pred_s - target_flat) / target_flat).mean()
-        pred_flat = pred_ss if err_ss <= err_s else pred_s
+        pred_flat = _apply_depth_scale_and_shift_alignment(pred_flat, target_flat)
     elif scale_invariant:
         pred_flat = _apply_depth_scale_only_alignment(pred_flat, target_flat)
 
@@ -283,15 +277,19 @@ def compute_point_cloud_metrics(
     We also return a Chamfer distance for quick qualitative debugging.
     """
 
-    pred_aligned = mean_shift_align_points(pred_points, gt_points) if align else pred_points
+    if align:
+        pred_aligned, gt_aligned = mean_shift_align_points(pred_points, gt_points)
+    else:
+        pred_aligned = pred_points
+        gt_aligned = gt_points
 
-    if pred_aligned.shape[0] == gt_points.shape[0]:
-        l1 = paired_coordinate_l1(pred_aligned, gt_points)
+    if pred_aligned.shape[0] == gt_aligned.shape[0]:
+        l1 = paired_coordinate_l1(pred_aligned, gt_aligned)
     else:
         l1 = pred_points.new_tensor(float("nan"))
 
-    dist_pred_to_gt = torch.cdist(pred_aligned, gt_points).min(dim=1)[0]
-    dist_gt_to_pred = torch.cdist(gt_points, pred_aligned).min(dim=1)[0]
+    dist_pred_to_gt = torch.cdist(pred_aligned, gt_aligned).min(dim=1)[0]
+    dist_gt_to_pred = torch.cdist(gt_aligned, pred_aligned).min(dim=1)[0]
     chamfer = (dist_pred_to_gt.mean() + dist_gt_to_pred.mean()) / 2
 
     return {"l1": l1, "chamfer": chamfer}

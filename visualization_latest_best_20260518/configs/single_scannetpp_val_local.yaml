@@ -1,0 +1,28 @@
+mode: single
+name: scannetpp
+root: /data3/dataset/scannetpp_val/data
+
+adapter_kwargs:
+  splits_dir: /data3/dataset/scannetpp_val/splits
+  strict: false
+  target_hw: [256, 256]
+  precomputed_read_mode: auto
+
+clip_len: 48
+img_size: 256
+num_queries: 512
+use_augs: false
+boundary_ratio: 0.3
+t_tgt_eq_t_cam_ratio: 0.4
+seed: 42
+
+allow_track_fallback: true
+epoch_size: 2000
+precompute_patches: false
+precompute_from_highres: false
+return_highres_video: false
+store_video_uint8: false
+store_auxiliary_tensors: true
+
+index_cache_dir: /data/zbf/openclaw/d4rt/.index_cache_eval
+index_workers: 8

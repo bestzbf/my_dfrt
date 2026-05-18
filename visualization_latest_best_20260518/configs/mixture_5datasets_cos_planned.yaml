@@ -1,0 +1,137 @@
+mode: mixture
+datasets:
+  - name: pointodyssey
+    root: /data2/d4rt/datasets/PointOdyssey
+    weight: 0.15
+    adapter_kwargs:
+      fast_root: null
+      require_tracks: true
+      load_normals: false
+  - name: kubric
+    root: /data3/Kubric
+    weight: 0.20
+  - name: dynamic_replica
+    # NFS-mounted copy tested faster for DynamicReplica than COS staging.
+    # Do not move ScanNet++/PointOdyssey/BlendedMVS to /data5 by default; their
+    # NFS small-file reads were slower in the 6-rank probe.
+    root: /data5/d4rt_dataset/Dynamic_Replica
+    weight: 0.20
+    val_split: valid
+    adapter_kwargs:
+      # Track-supervised DynamicReplica samples already get RGB + 2D/3D tracks
+      # from trajectory .pth files. Skipping depth avoids 48 extra COS objects
+      # per 48-frame sample. This also disables the depth-map validity check in
+      # _sample_with_tracks for DynamicReplica; measured mask3d impact was tiny,
+      # while local /data5 load cost roughly doubled on slow 48-frame clips.
+      skip_depth_when_tracks: true
+      # Prefer uploaded compact trajectory npz files. They omit duplicated RGB,
+      # so RGB is read from image PNG while trajectory traffic is much smaller
+      # than staging the legacy per-frame pth archive.
+      prefer_trajectory_npz: true
+      # Small per-sample thread pool for local PNG/npz decode after staging.
+      # Keep this modest because planned mode already runs many builders.
+      io_workers: 4
+  - name: co3dv2
+    root: /data_cos/hdu_datasets/Co3Dv2
+    weight: 0.20
+    adapter_kwargs:
+      subset_name: fewview_train
+      categories: null
+      require_precomputed: false
+      require_pointcloud: true
+      load_normals: false
+      frame_cache_items: 384
+      io_workers: 4
+      sequence_denylist: /data/zbf/openclaw/d4rt/configs/co3dv2_denylist_degenerate_clips_20260422.txt
+  - name: blendedmvs
+    root: /data2/d4rt/datasets/BlendedMVS
+    weight: 0.10
+    adapter_kwargs:
+      use_masked: false
+      load_normals: false
+  - name: scannetpp
+    root: /data_cos/hdu_datasets/scannetpp/data
+    weight: 0.15
+    adapter_kwargs:
+      splits_dir: /data_cos/hdu_datasets/scannetpp/splits
+      strict: false
+      scenes_record: /data_cos/hdu_datasets/scannetpp/scenes_record.json
+      target_hw: [256, 256]
+      precomputed_cos_timeout_s: 12
+      precomputed_cos_range_retries: 1
+      precomputed_cos_range_workers: 16
+      precomputed_cos_range_merge_gap_bytes: 67108864
+      precomputed_cos_range_max_span_bytes: 2097152
+
+epoch_size: 500000
+clip_len: 48
+img_size: 256
+num_queries: 2048
+# Limit dense track candidates before transform/query. The model still samples
+# 2048 queries; this keeps CPU work bounded on ScanNet++/DynamicReplica/Co3D.
+max_track_points: 4096
+use_augs: true
+boundary_ratio: 0.3
+use_motion_boundaries: true
+t_tgt_eq_t_cam_ratio: 0.4
+seed: 42
+allow_track_fallback: true
+dataset_locality_size: 48
+# Planned mode shards global locality blocks across 6 ranks and then balances
+# each rank's batches by dataset.  A larger sequence locality and tighter frame
+# radius keep expensive COS-backed datasets concentrated enough that
+# DynamicReplica/Co3D/ScanNet++ reuse staged frames across nearby batches.
+sequence_locality_size: 96
+frame_locality_radius: 12
+
+# Fast default: sample local patches on the GPU from the same 256x256 RGB frames
+# that feed the encoder. This removes CPU builder patch extraction while keeping
+# resized-patch semantics. If switching back to high-res patches, set:
+#   precompute_from_highres: true
+#   color_aug_after_resize: false
+#   keep_cropped_images: true
+# High-res patches need the augmented high-res crop; otherwise video and patch
+# RGB no longer share the same photometric augmentation.
+precompute_patches: false
+precompute_from_highres: false
+return_highres_video: false
+store_video_uint8: true
+store_auxiliary_tensors: false
+color_aug_after_resize: true
+keep_cropped_images: false
+motion_boundary_on_resized: true
+
+index_cache_dir: /data/zbf/openclaw/d4rt/.index_cache_5datasets_local
+index_workers: 16
+
+planned_mode: true
+planned_start_immediately: true
+planned_initial_epoch: 0
+builder_workers: 18
+prefetch_depth: 960
+max_spool_bytes: 32212254720
+
+sample_stage_backend: cos_sdk
+sample_stage_root: /data1/zbf/d4rt_sample_stage
+sample_stage_sdk_workers: 2
+# CO3D/ScanNet++ read many small COS objects per sample. Bound per-object tail
+# latency; a requeued sample is cheaper than blocking a builder for 20s+.
+sample_stage_request_timeout_s: 5
+sample_stage_request_retries: 1
+sample_stage_cache_max_bytes: 399431958528
+sample_stage_cache_low_watermark_ratio: 0.85
+sample_stage_cache_touch_interval_s: 30
+sample_stage_cache_scan_interval_s: 30
+sample_stage_eviction_mode: external
+sample_stage_window_radius: 0
+sample_stage_datasets:
+  - pointodyssey
+  - kubric
+  - co3dv2
+  - blendedmvs
+  - scannetpp
+sample_stage_scene_prefetch_datasets: []
+sample_stage_mount_root: /data_cos
+sample_stage_bucket: hd-ai-data-1251882982
+sample_stage_region: ap-beijing
+sample_stage_passwd_file: /etc/passwd-s3fs-data_cos
